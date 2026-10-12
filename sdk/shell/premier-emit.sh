@@ -9,6 +9,20 @@ if [[ -z "${PREMIER_COLLECTOR_URL:-}" || -z "${PREMIER_COLLECTOR_TOKEN:-}" ]]; t
   exit 1
 fi
 
+usage() {
+  echo "usage: premier-emit.sh '{\"kind\":\"agent.spawn\",...}'" >&2
+  echo "   or: echo '{...}' | premier-emit.sh -" >&2
+  echo "   or: install premier and use: premier emit --kind ..." >&2
+}
+
+# A JSON body (or `-` for stdin) is the whole event: nothing may follow it,
+# because anything that did would be dropped without a word.
+if [[ $# -gt 1 && ( "$1" == "-" || "$1" == \{* ) ]]; then
+  echo "premier-emit: a JSON event takes no further arguments (got: ${*:2})" >&2
+  usage
+  exit 1
+fi
+
 if command -v premier >/dev/null 2>&1; then
   if [[ $# -eq 0 || "$1" == "-" ]]; then
     exec premier emit --json -
@@ -25,9 +39,7 @@ if [[ $# -eq 0 || "$1" == "-" ]]; then
 elif [[ "$1" == \{* ]]; then
   BODY="$1"
 else
-  echo "usage: premier-emit.sh '{\"kind\":\"agent.spawn\",...}'" >&2
-  echo "   or: echo '{...}' | premier-emit.sh -" >&2
-  echo "   or: install premier and use: premier emit --kind ..." >&2
+  usage
   exit 1
 fi
 
@@ -59,15 +71,23 @@ if [[ "$HOST" == localhost || "$HOST" == *.localhost ||
 fi
 shopt -u nocasematch
 
+# The bearer token and the event body are kept off curl's command line, where
+# every local user could read them in a process listing: the Authorization
+# header is given in a curl config read from stdin (-K -), and the body is
+# read from file descriptor 3, which also lifts the argument-size limit.
+TOKEN="${PREMIER_COLLECTOR_TOKEN//\\/\\\\}"
+TOKEN="${TOKEN//\"/\\\"}"
+
 # The status code is appended on its own line so a rejected event (401/400/500)
 # fails this script instead of printing the error body and exiting 0.
 # (The `+` expansion keeps an empty array valid under `set -u` on bash 3.2.)
-if ! OUTPUT="$(curl -sS ${NOPROXY[@]+"${NOPROXY[@]}"} --max-time "$TIMEOUT" \
-  -w '\n%{http_code}' \
-  -X POST "$PREMIER_COLLECTOR_URL" \
-  -H "Authorization: Bearer $PREMIER_COLLECTOR_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data-raw "$BODY")"; then
+if ! OUTPUT="$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
+  curl -sS ${NOPROXY[@]+"${NOPROXY[@]}"} --max-time "$TIMEOUT" \
+    -w '\n%{http_code}' \
+    -X POST "$PREMIER_COLLECTOR_URL" \
+    -K - \
+    -H "Content-Type: application/json" \
+    --data-binary @/dev/fd/3 3<<<"$BODY")"; then
   echo "premier-emit: failed to POST event to the Premier collector" >&2
   exit 1
 fi

@@ -624,6 +624,120 @@ fn child_process_can_emit_via_premier_emit_cli() {
 }
 
 #[test]
+fn premier_emit_flags_carry_causality_and_default_the_payload_to_an_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("emit-flags.atrace");
+    let premier = env!("CARGO_BIN_EXE_premier");
+    let bin_dir = std::path::Path::new(premier)
+        .parent()
+        .expect("cargo bin dir");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // The request names the id `emit` printed for the spawn; the decision
+    // names the request. No payload is given anywhere.
+    let script = r#"set -e
+spawned="$(premier emit --kind agent.spawn --actor researcher --actor-type subagent --status running)"
+request="$(premier emit --kind approval.request --actor researcher --status pending \
+  --parent-event "$spawned" --correlation approve-1 --timestamp 2026-01-02T03:04:05Z)"
+premier emit --kind approval.decision --actor brad --actor-type human --status approved \
+  --parent-event "$request" --correlation approve-1 --link "$spawned" --link "$request" --duration-ms 1500
+premier emit --kind agent.result --actor researcher --actor-type subagent --status ok --parent-event "$spawned"
+"#;
+    let recorded = Command::new(premier)
+        .args(["record", "--output"])
+        .arg(&trace)
+        .args(["sh", "-c", script])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        recorded.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&recorded.stdout),
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let events = read_events(&trace).unwrap();
+    let find = |kind: &str| {
+        events
+            .iter()
+            .find(|event| event.kind == kind)
+            .unwrap_or_else(|| panic!("{kind} event"))
+    };
+    let spawned = find("agent.spawn");
+    let request = find("approval.request");
+    let decision = find("approval.decision");
+    assert_eq!(spawned.payload(), serde_json::json!({}));
+    assert_eq!(request.parent_event_id, spawned.event_id);
+    assert_eq!(request.correlation_id, "approve-1");
+    assert_eq!(
+        request.payload()["producer_timestamp"],
+        "2026-01-02T03:04:05Z"
+    );
+    assert_eq!(decision.parent_event_id, request.event_id);
+    assert_eq!(decision.correlation_id, "approve-1");
+    assert_eq!(
+        decision.links,
+        vec![spawned.event_id.clone(), request.event_id.clone()]
+    );
+    assert_eq!(decision.duration_ms, 1500);
+    assert_eq!(find("agent.result").parent_event_id, spawned.event_id);
+
+    let verified = Command::new(premier)
+        .arg("verify")
+        .arg(&trace)
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&verified.stdout);
+    assert!(
+        report.contains("0 semantic diagnostics"),
+        "flag-built events must satisfy the validator: {report}"
+    );
+
+    // --json sends the body as given, so the new field flags conflict too.
+    for flag in [
+        ["--parent-event", "x"],
+        ["--correlation", "x"],
+        ["--link", "x"],
+        ["--duration-ms", "1"],
+        ["--timestamp", "2026-01-02T03:04:05Z"],
+    ] {
+        let output = Command::new(premier)
+            .args(["emit", "--json", "{\"kind\":\"agent.spawn\"}"])
+            .args(flag)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag:?}");
+    }
+}
+
+#[test]
+fn build_info_reports_version_target_and_viewer_for_release_packaging() {
+    let output = Command::new(env!("CARGO_BIN_EXE_premier"))
+        .arg("build-info")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report = String::from_utf8_lossy(&output.stdout);
+    let value = |key: &str| {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("{key} missing from {report}"))
+            .to_owned()
+    };
+    assert_eq!(value("version"), env!("CARGO_PKG_VERSION"));
+    let target = value("target");
+    assert!(
+        target.contains(std::env::consts::ARCH) && target.matches('-').count() >= 2,
+        "target triple: {target}"
+    );
+    assert!(["embedded", "placeholder"].contains(&value("viewer").as_str()));
+}
+
+#[test]
 fn demo_creates_a_verifiable_multi_agent_trace() {
     let temp = tempfile::tempdir().unwrap();
     let trace = temp.path().join("demo.atrace");

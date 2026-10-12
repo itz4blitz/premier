@@ -13,7 +13,7 @@
   <a href="https://www.npmjs.com/package/@premierstudio/premier"><img src="https://img.shields.io/npm/v/%40premierstudio%2Fpremier?style=flat-square&color=7c83ff" alt="npm version" /></a>
   <a href="https://github.com/PremierStudio/premier/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/PremierStudio/premier/ci.yml?branch=main&style=flat-square&label=build" alt="build status" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-6d7cff?style=flat-square" alt="Apache 2.0 license" /></a>
-  <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-supported-111827?style=flat-square" alt="macOS and Linux" />
+  <img src="https://img.shields.io/badge/macOS%20%7C%20Linux%20(glibc)-supported-111827?style=flat-square" alt="macOS and glibc Linux" />
 </p>
 
 <p align="center">
@@ -50,6 +50,8 @@ npx premier record -- npm test
 
 Premier is script-free: installation does not run lifecycle scripts or download executables from arbitrary URLs. The npm launcher selects the native package for your platform, published through npm trusted publishing with provenance.
 
+Native packages are published for macOS (Apple silicon and Intel) and glibc Linux (x64 and arm64). Alpine (musl) and Windows are not: there `premier` says so and exits; use a glibc image, WSL 2, or [build from source](CONTRIBUTING.md#build-order). [Platforms and what the launcher checks →](packages/premier-cli/README.md#supported-platforms)
+
 ## Works with the agents you already use
 
 | Agent | Native structured capture when run with |
@@ -70,7 +72,7 @@ premier record --adapter claude -- claude -p --output-format stream-json "fix th
 premier record --pty -- your-interactive-agent
 ```
 
-Unknown harness? Premier can record any process immediately, then accept typed evidence through its JavaScript SDK, CLI emitter, shell helper, or local HTTP collector.
+Unknown harness? Premier can record any process immediately, then accept typed evidence through its JavaScript SDK, CLI emitter (`premier emit`), local HTTP collector, or, where only `bash` and `curl` are available, the [`premier-emit.sh` helper](docs/collector.md#sdkshellpremier-emitsh) shipped in every release archive.
 
 ## Evidence, not vibes
 

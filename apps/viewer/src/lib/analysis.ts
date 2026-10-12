@@ -380,8 +380,11 @@ export function traceTimeBounds(input: TraceEvent[]): { start: number; span: num
   return { start, span: Math.max(1, end - start) };
 }
 
+/** Kinds the recorder writes for raw output: pipes, and one PTY stream under `record --pty`. */
+export const PROCESS_OUTPUT_KINDS = ['process.stdout', 'process.stderr', 'process.terminal'];
+
 export function isProcessNoise(event: TraceEvent): boolean {
-  return ['process.stdout', 'process.stderr'].includes(event.kind) && !isIssue(event);
+  return PROCESS_OUTPUT_KINDS.includes(event.kind) && !isIssue(event);
 }
 
 export function materialEvent(events: TraceEvent[]): TraceEvent | null {

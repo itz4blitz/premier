@@ -401,17 +401,22 @@ Emit a typed agent event to the active local collector (`PREMIER_COLLECTOR_*`)
 Usage: premier emit [OPTIONS]
 
 Options:
-      --json <JSON>                Full JSON event body. Use `-` to read from stdin. The body is sent as given, so it cannot be combined with the field options
-      --key-file <PATH>            Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
-      --kind <KIND>                Event kind (e.g. agent.spawn, model.response, tool.execution)
-      --actor <ACTOR>              Actor identity for this event
-      --actor-type <ACTOR_TYPE>    [default: agent]
-      --span <SPAN>                
-      --parent-span <PARENT_SPAN>  
-      --status <STATUS>            
-      --payload <PAYLOAD>          Payload as a JSON object string
-      --source <SOURCE>            Source label written on the event (default: premier-emit) [default: premier-emit]
-  -h, --help                       Print help
+      --json <JSON>                  Full JSON event body. Use `-` to read from stdin. The body is sent as given, so it cannot be combined with the field options
+      --key-file <PATH>              Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --kind <KIND>                  Event kind (e.g. agent.spawn, model.response, tool.execution)
+      --actor <ACTOR>                Actor identity for this event
+      --actor-type <ACTOR_TYPE>      [default: agent]
+      --span <SPAN>                  
+      --parent-span <PARENT_SPAN>    
+      --parent-event <PARENT_EVENT>  Event id of the event this one follows (`parent_event_id`), as printed by an earlier `premier emit`
+      --correlation <CORRELATION>    Correlation id shared by the records of one call or workstream
+      --link <LINK>                  Event id of a related event (`links`). Repeat for several
+      --duration-ms <DURATION_MS>    How long the recorded work took, in whole milliseconds
+      --timestamp <TIMESTAMP>        Producer time (RFC 3339), kept as `payload.producer_timestamp`
+      --status <STATUS>              
+      --payload <PAYLOAD>            Payload as a JSON object string (default: `{}`)
+      --source <SOURCE>              Source label written on the event (default: premier-emit) [default: premier-emit]
+  -h, --help                         Print help
 ```
 
 ```sh
@@ -419,15 +424,42 @@ premier emit --kind tool.execution --actor coder --status ok --payload '{"tool":
 echo '{"kind":"agent.message","actor_id":"a","status":"ok","payload":{}}' | premier emit --json -
 ```
 
+The flags and the event fields they set:
+
+| Flag | Field | Notes |
+| --- | --- | --- |
+| `--kind` | `kind` | Required unless `--json` is given. |
+| `--actor` | `actor_id` | |
+| `--actor-type` | `actor_type` | Default `agent`. |
+| `--status` | `status` | |
+| `--span` | `span_id` | |
+| `--parent-span` | `parent_span_id` | |
+| `--parent-event` | `parent_event_id` | An event id, as printed by an earlier `premier emit`. |
+| `--correlation` | `correlation_id` | |
+| `--link` | `links` | Repeat the flag for several links. |
+| `--duration-ms` | `duration_ms` | A whole number of milliseconds. |
+| `--timestamp` | `timestamp` | RFC 3339 producer time, kept as `payload.producer_timestamp`. |
+| `--payload` | `payload` | A JSON object. Default `{}`. |
+| `--source` | `source` | Default `premier-emit`. |
+
+`emit` prints the stored event's id, so a script can pair a request with its
+answer without building JSON:
+
+```sh
+request="$(premier emit --kind approval.request --actor coder --status pending --payload '{"operation":"write"}')"
+premier emit --kind approval.decision --actor brad --actor-type human --status approved \
+  --parent-event "$request" --duration-ms 4200
+```
+
 - Requires `PREMIER_COLLECTOR_URL` and `PREMIER_COLLECTOR_TOKEN`, which
   `premier record` sets for the recorded process. Outside a recording `emit`
   exits `1`.
 - Provide `--json` or `--kind`. With `--json` the body is sent as given, and
-  combining it with a field option (`--kind`, `--actor`, `--actor-type`,
-  `--span`, `--parent-span`, `--status`, `--payload`, `--source`) is a usage
-  error (exit `2`) rather than the option being ignored. The flags cannot set
-  `parent_event_id`, `correlation_id`, `links`, `duration_ms`, or
-  `timestamp`; use `--json` for those.
+  combining it with any field option in the table above is a usage error
+  (exit `2`) rather than the option being ignored.
+- With `--kind`, a payload is always sent: `{}` when `--payload` is omitted,
+  because an event without an object payload is reported as
+  `payload_not_object`. A body given with `--json` is not completed this way.
 - On success prints the new event id and exits `0`.
 - Exits `1` when the collector is unreachable, does not answer in time, or
   rejects the event. The message includes the HTTP status and response body.

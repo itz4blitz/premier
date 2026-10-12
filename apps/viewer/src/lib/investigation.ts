@@ -1,6 +1,6 @@
 import { actorId, eventSummary, isIssue, runHealth } from './analysis';
 import { modelCallUsage } from './modelUsage';
-import { isAbandoned } from './types';
+import { eventPayload, isAbandoned } from './types';
 import type { TraceEvent, TraceManifest } from './types';
 
 export type EvidenceConfidence = 'high' | 'medium' | 'low';
@@ -275,6 +275,22 @@ function gapsFor(trace: TraceManifest, events: TraceEvent[]): EvidenceGap[] {
       severity: 'medium',
       label: lifecycle ? 'Recorded lifecycle evidence is incomplete' : 'Recorded evidence needs review',
       detail: diagnostic.message
+    });
+  }
+  // Provider output the adapter could not use is evidence that was lost, and it is recorded only
+  // as `warning` events that are not issues: without this gap nothing in the summary mentions it.
+  const unreadLines = events.filter((event) => event.kind === 'adapter.diagnostic').length;
+  const adapterSummary = events.find((event) => event.kind === 'adapter.summary');
+  if (unreadLines || adapterSummary) {
+    const counted = Number(adapterSummary ? eventPayload(adapterSummary).rejected_lines : Number.NaN);
+    const lines = Number.isFinite(counted) && counted > 0 ? counted : unreadLines;
+    add({
+      id: 'adapter-lines',
+      severity: 'medium',
+      label: 'Provider output was not fully captured',
+      detail: lines > 0
+        ? `${lines} line${lines === 1 ? '' : 's'} of provider output could not be read as native events. Whatever ${lines === 1 ? 'it' : 'they'} reported is missing from this trace; filter the timeline by adapter.diagnostic to see ${lines === 1 ? 'it' : 'them'}.`
+        : 'The adapter reported that not all provider output was read as native events. See the adapter.summary event.'
     });
   }
   if (!events.length) add({ id: 'no-events', severity: 'high', label: 'No events captured', detail: 'Instrument the run before relying on its outcome or architecture.' });

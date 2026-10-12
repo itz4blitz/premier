@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actorInventory, awaitingApprovals, categoryOf, countByCategory, eventSummary, filterEvents, isIssue, runHealth, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
+import { actorInventory, awaitingApprovals, categoryOf, countByCategory, eventSummary, filterEvents, isIssue, isProcessNoise, materialEvent, runHealth, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
 import type { TraceEvent, TraceManifest } from './types';
 
 function event(sequence: number, actor: string, kind: string, status = 'ok'): TraceEvent {
@@ -20,6 +20,19 @@ const events = [
 ];
 
 describe('agent trace analysis', () => {
+  it('treats PTY output like piped output when collapsing noise and choosing the material event', () => {
+    const terminal = event(1, 'root', 'process.terminal');
+    const tool = event(2, 'coder', 'tool.execution');
+    for (const kind of ['process.stdout', 'process.stderr', 'process.terminal']) {
+      expect(isProcessNoise(event(1, 'root', kind)), kind).toBe(true);
+    }
+    expect(isProcessNoise(tool)).toBe(false);
+    // Output that is itself an issue is never hidden as noise.
+    expect(isProcessNoise(event(3, 'root', 'process.terminal', 'error'))).toBe(false);
+    expect(materialEvent([terminal, event(3, 'root', 'process.exit')])?.kind).toBe('process.exit');
+    expect(materialEvent([terminal, tool])).toBe(tool);
+  });
+
   it('summarizes independent agent lanes and failures', () => {
     const agents = summarizeAgents(events);
     expect(agents.map((agent) => agent.id)).toEqual(['root', 'researcher', 'coder', 'reviewer']);

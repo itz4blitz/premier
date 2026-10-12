@@ -210,7 +210,7 @@
               {#if (event.depth || 0) > 0}<span class="depth-badge" title={`Causal depth ${event.depth}`}>d{event.depth}</span>{/if}
             </span>
             <small class:expanded={expandedEvents.has(event.event_id)}>{eventSummary(event)}</small>
-            {#if processed.counts.has(event.event_id)}<span class="process-group">{processed.counts.get(event.event_id)} consecutive {event.kind === 'process.stderr' ? 'stderr' : 'stdout'} lines collapsed</span>{/if}
+            {#if processed.counts.has(event.event_id)}<span class="process-group">{processed.counts.get(event.event_id)} consecutive {event.kind === 'process.stderr' ? 'stderr lines' : event.kind === 'process.terminal' ? 'terminal chunks' : 'stdout lines'} collapsed</span>{/if}
             {#if !virtualized && eventSummary(event).length > 108}
               <button type="button" class="summary-toggle" aria-expanded={expandedEvents.has(event.event_id)} onclick={(clickEvent) => { clickEvent.stopPropagation(); toggleSummary(event.event_id); }}>
                 {expandedEvents.has(event.event_id) ? 'Show less' : 'Read full summary'}

@@ -246,7 +246,8 @@ test("helpers pass emit options through", async () => {
 
 test("lifecycle helpers emit the completing half of each pair", async () => {
   const bodies = [];
-  const options = { env: ACTIVE_ENV, fetch: recordingFetch(bodies) };
+  // A trace of its own: helpers remember what each actor of a trace spawned.
+  const options = { env: { ...ACTIVE_ENV, PREMIER_TRACE_ID: "tr-lifecycle" }, fetch: recordingFetch(bodies) };
   await premier.delegation("coordinator", { delegates: ["researcher"] }, {}, options);
   await premier.message("researcher", { to: ["coordinator"], finding: "x" }, {}, options);
   await premier.approvalDecision("brad", { receipt: "apr_01J" }, {}, options);

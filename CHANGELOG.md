@@ -263,6 +263,47 @@ integrations may depend on.
 - Viewer: navigation by span and link, search by event and span id, and a
   masked export that states it is best effort and unverified.
 - Reference documentation under `docs/`.
+- SDK: `premier.result`, `premier.join`, and `premier.approvalDecision` name
+  the event they complete on their own. With no causality field in `extra`,
+  `result` is linked to the same actor's open `spawn`, `join` to the same
+  actor's open `delegation`, and `approvalDecision` to the open `approval`
+  when exactly one is open. A helper also accepts the event the new one
+  follows in place of `extra`. See
+  [sdk/js/README.md](sdk/js/README.md#causality).
+- SDK: `span(actor, init?)` returns helpers bound to one actor and span, which
+  carry `actor_type`, `span_id`, and the parent's ids on every event;
+  `newId()` generates span and correlation ids.
+- SDK: `flush()` waits for emits that were not awaited, for use before
+  `process.exit()`. `premierStats()` reports how many events this process
+  delivered, dropped, and truncated.
+- SDK: an event over the collector's 2 MiB limit is sent with its longest
+  payload strings shortened and a `payload.premier_truncated` note, instead of
+  being rejected whole. `MAX_EVENT_BYTES` is exported.
+- SDK: `kind` is typed `PremierKind`, which offers the known kinds and accepts
+  any string. The package's `exports` has a `default` condition, and its type
+  declarations no longer need `@types/node`.
+- `premier emit --parent-event`, `--correlation`, `--link` (repeatable),
+  `--duration-ms`, and `--timestamp`, so a shell script can pair a result with
+  its start and record latency without building JSON.
+- Release archives contain `share/premier/premier-emit.sh`, the shell helper,
+  and the installer puts it in `<prefix>/share/premier/`.
+- Releases include `premier-install.sh`, a single-file installer for a signed
+  archive that needs no source checkout
+  ([docs/releasing.md](docs/releasing.md#install-from-a-signed-archive)).
+- `scripts/update.sh` and `scripts/install.sh --force` keep the binary they
+  replace as `<prefix>/bin/premier.previous`. `--allow-downgrade` permits
+  replacing a newer installed version.
+- The installer prints a note when `<prefix>/bin` is not on `PATH`.
+- `scripts/uninstall.sh` also removes `premier.previous` and the shell helper,
+  and lists what it leaves alone: recorded traces, key files, and copies
+  installed through npm or cargo.
+- Viewer: a run whose adapter could not read some provider output
+  (`adapter.diagnostic`, `adapter.summary`) lists "Provider output was not
+  fully captured" under missing evidence, with the number of lines.
+- The npm launcher's errors on an unsupported system say what is published
+  and what to do instead (a glibc image, WSL 2, or a source build).
+- Linux release metadata records the glibc the binary requires (`GLIBC_MIN`),
+  and the launcher refuses a system with an older glibc, naming both versions.
 
 ### Changed
 
@@ -523,6 +564,54 @@ integrations may depend on.
   SIGINT and SIGQUIT) to the native binary instead of leaving it running.
 - `premier demo --output` replaces a directory only when it is recognisably a
   Premier trace, and never the current directory or one of its ancestors.
+- **Breaking: SDK helpers keep an actor's `actor_type`.** After
+  `premier.spawn(actor)`, `premier.model`, `premier.tool`, `premier.message`,
+  and the other helpers write that actor with the type it was spawned with
+  (`subagent` by default) instead of their own default `agent`. Pass
+  `actor_type` in `extra` to override.
+- **Breaking: the SDK sends `payload: {}` when no payload is given**, and
+  `premier emit --kind ...` does too. An event without an object payload was
+  stored with `null` and reported as `payload_not_object`.
+- **Breaking: the SDK sends the `run` object only when a run variable is
+  set** (`PREMIER_RUN_NAME`, `PREMIER_REPOSITORY`, `PREMIER_BRANCH`,
+  `PREMIER_ENVIRONMENT`, `PREMIER_STARTED_AT`), with only the ones that are.
+  The local collector stores none of it.
+- The SDK README no longer describes a hosted "Premier Cloud" ingestion
+  endpoint; nothing in this repository implements one.
+- **Breaking: `premier-emit.sh` refuses arguments after a JSON event or `-`**
+  (exit `1`). They used to be dropped.
+- **Breaking: the npm launcher refuses a platform package whose version is
+  not its own** (exit `1`), instead of running whatever Node.js resolved.
+- **Breaking: `scripts/update.sh` refuses an archive older than the installed
+  version** unless `--allow-downgrade` is given, and
+  `scripts/version-check.sh` reports such an archive as a downgrade, not as
+  `update available`. A missing install is reported as `not installed`.
+- **Breaking: `scripts/verify-release.sh` fails on a file the signed manifest
+  does not cover.** The manifest now lists the SBOMs and `premier-install.sh`
+  as well as the archives.
+- **Breaking: `scripts/install.sh` refuses a destination that is not a
+  regular file**, and `scripts/uninstall.sh` a prefix that is not an absolute
+  path.
+- `scripts/install.sh` reports `publisher signature verified` only for the
+  pinned release identity. With `--verification-key` or a caller-supplied
+  identity or issuer it names what was used instead.
+- `scripts/install.sh` with no `--archive` picks the highest version in
+  `./dist`, not the last file name, and `./dist` is ignored by git.
+- `scripts/package-release.sh` runs the binary it packages
+  (`premier build-info`) and refuses one whose version, target, or embedded
+  viewer is not what the metadata will say. A binary it cannot run is recorded
+  as `VIEWER=unverified`.
+- Release workflow: the CI suite runs on the tagged commit first; the viewer
+  is built and checked before the release build, which fails rather than
+  embed the placeholder page; the GitHub release is a draft until npm has
+  every package; a prerelease tag is published as a prerelease with the npm
+  dist-tag `next`; SBOMs and the installer are covered by the signed manifest
+  and the attestations; the npm packages are packed, inspected, and the
+  host's one executed before publishing. See
+  [docs/releasing.md](docs/releasing.md#signed-public-release-workflow).
+- The Rust toolchain is pinned in `rust-toolchain.toml`.
+- Viewer: `process.terminal` output (recorded with `--pty`) is collapsed like
+  stdout and stderr, and is no longer chosen as a run's material event.
 
 ### Fixed
 
@@ -572,6 +661,13 @@ integrations may depend on.
   traces, and adapter payloads that were not read.
 - The release signer identity checked by the install and verification scripts
   matches the release workflow.
+- The examples in `sdk/js/README.md` produced validator diagnostics
+  (`missing_causal_link`, `payload_not_object`). They no longer do, and the
+  SDK's tests run every example under `premier record` and `premier verify`.
+- `scripts/install.sh --force` onto a directory moved the binary inside it
+  and reported success; a failed install could leave `.premier.install.<pid>`
+  behind.
+- The release version gate failed without saying which manifest disagreed.
 
 ### Security
 
@@ -613,3 +709,11 @@ integrations may depend on.
 - The collector token is not sent through an HTTP proxy for a loopback
   collector.
 - `premier encrypt` refuses to re-seal a trace that fails verification.
+- `premier-emit.sh` no longer puts the collector token or the event body on
+  `curl`'s command line, where other local users could read them in a process
+  listing.
+- The installer requires an archive's signature to come from the release tag
+  of the version the archive says it is.
+- macOS release binaries are ad hoc signed and not notarized. The release
+  workflow signs and notarizes them when an Apple Developer ID is configured
+  ([docs/releasing.md](docs/releasing.md#macos-signing)); none is yet.

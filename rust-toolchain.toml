@@ -1,0 +1,6 @@
+# The Rust toolchain every build of Premier uses: local, CI, and release.
+# .github/workflows/*.yml install the same version (checked by
+# scripts/tests/release-config.test.mjs). Raise both together.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

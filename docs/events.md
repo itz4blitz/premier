@@ -165,7 +165,8 @@ Notes:
   reference to a later or unknown event is reported as `unknown_parent_event`.
 - If you only track spans, set `span_id` and `parent_span_id` and leave
   `parent_event_id` empty. `premier emit --span/--parent-span` works this
-  way. The native adapters set spans and, where an earlier stored event is
+  way; `--parent-event`, `--correlation`, and `--link` set the other
+  causality fields. The native adapters set spans and, where an earlier stored event is
   the cause, `parent_event_id` as well.
 - The viewer's search box matches `event_id`, `span_id`, `parent_span_id`, and
   `correlation_id` as well as kind, source, actor, status, and payload text.
@@ -289,7 +290,10 @@ Consequences worth knowing:
 
 - A non-zero exit makes `process.exit` an issue, and so does a recovered
   `session.interrupted`.
-- `adapter.diagnostic` has status `warning` and is not an issue.
+- `adapter.diagnostic` has status `warning` and is not an issue. The viewer
+  reports it as missing evidence instead: a run with `adapter.diagnostic` or
+  `adapter.summary` events lists "Provider output was not fully captured",
+  with the number of lines that were not read.
 - Manifest diagnostics are not issues. They are reported separately as
   missing evidence.
 - `premier query --status error` filters on the exact status only. It is not

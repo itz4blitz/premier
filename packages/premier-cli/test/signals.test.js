@@ -42,7 +42,11 @@ function installFixture(t) {
   fs.mkdirSync(launcherDir, { recursive: true });
   fs.mkdirSync(path.join(nativeDir, 'bin'), { recursive: true });
   fs.copyFileSync(path.join(__dirname, '..', 'bin', 'premier.js'), path.join(launcherDir, 'premier.js'));
-  fs.writeFileSync(path.join(nativeDir, 'package.json'), JSON.stringify({ name: platformPackage, version: '0.0.0' }));
+  // The launcher refuses a platform package of another version than its own.
+  const manifest = path.join(__dirname, '..', 'package.json');
+  const { version } = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+  fs.copyFileSync(manifest, path.join(scope, 'premier', 'package.json'));
+  fs.writeFileSync(path.join(nativeDir, 'package.json'), JSON.stringify({ name: platformPackage, version }));
   fs.writeFileSync(path.join(nativeDir, 'bin', 'premier'), FAKE_BINARY, { mode: 0o755 });
   return {
     launcher: path.join(launcherDir, 'premier.js'),

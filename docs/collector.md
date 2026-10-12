@@ -288,10 +288,15 @@ premier emit --json '{"kind":"agent.message","actor_id":"researcher","status":"o
 jq -n '{kind:"tool.execution",actor_id:"coder",status:"ok",payload:{tool:"rg"}}' | premier emit --json -
 ```
 
-- Flag form: `--kind` is required. `--actor-type` defaults to `agent` and
-  `--source` to `premier-emit`. `--payload` must be valid JSON. If `--status`
-  or `--payload` is omitted the field is not sent, which triggers the
-  diagnostics described above for the validated kinds.
+- Flag form: `--kind` is required. `--actor-type` defaults to `agent`,
+  `--source` to `premier-emit`, and `--payload` to `{}`; a given `--payload`
+  must be valid JSON. If `--status` is omitted the field is not sent, which
+  triggers `missing_status` for the validated kinds.
+- `--parent-event`, `--correlation`, `--link` (repeatable), `--duration-ms`,
+  and `--timestamp` set `parent_event_id`, `correlation_id`, `links`,
+  `duration_ms`, and `timestamp`. `--parent-event "$id"` with the id an
+  earlier `premier emit` printed is how a shell script pairs a result with
+  its start.
 - `--json` sends the given body unchanged and cannot be combined with the
   field flags (a usage error, exit `2`). The collector's default `source`
   (`sdk`) applies if the body has none.
@@ -308,7 +313,17 @@ The full flag list is in [cli.md](cli.md#emit).
 ## `sdk/shell/premier-emit.sh`
 
 A bash fallback for environments where the `premier` binary may not be on
-`PATH` inside the recorded process.
+`PATH` inside the recorded process. It needs `bash` and `curl` and is one
+file, which you can get in three ways:
+
+- `sdk/shell/premier-emit.sh` in this repository;
+- `share/premier/premier-emit.sh` in every release archive;
+- `<prefix>/share/premier/premier-emit.sh` after `scripts/install.sh` or the
+  standalone `premier-install.sh` installed an archive (see
+  [releasing.md](releasing.md#consumer-workflow)).
+
+The npm packages do not carry it: they put `premier` itself on `PATH`, and
+`premier emit` does everything the helper does.
 
 ```sh
 sdk/shell/premier-emit.sh '{"kind":"agent.spawn","actor_id":"researcher","status":"running","payload":{}}'
@@ -320,13 +335,24 @@ echo '{"kind":"agent.result","actor_id":"researcher","status":"ok","payload":{}}
   stdin, and anything else is passed through as `premier emit` flags.
 - Otherwise it uses `curl` and accepts only a JSON body, as the first argument
   or on stdin. Flags are not supported in this mode.
-- In `curl` mode it prints the collector's response body on success.
+- A JSON body, or `-`, is the whole event. Anything after it is refused with
+  `premier-emit: a JSON event takes no further arguments` and exit `1`, in
+  both modes, and nothing is sent.
+- In `curl` mode it prints the collector's response body on success. The body
+  is sent as given: unlike `premier emit --kind`, a missing `payload` is not
+  filled in, so include `"payload":{}`.
+- In `curl` mode neither the bearer token nor the event body is put on
+  `curl`'s command line, where other local users could read them in a process
+  listing. The `Authorization` header is passed in a `curl` config on stdin
+  and the body on a separate file descriptor, so a body may also be larger
+  than the system's argument limit (up to the collector's 2 MiB).
 
 Failure behaviour, in both modes:
 
 | Situation | Result |
 | --- | --- |
 | Collector variables not set | Message on stderr, exit `1` |
+| Arguments after a JSON event or `-` | Message and usage on stderr, exit `1` |
 | Collector unreachable, or no answer within `PREMIER_EMIT_TIMEOUT` seconds (default `10`) | Message on stderr, exit `1` |
 | Collector answers with a non-2xx status | `premier-emit: collector rejected event (<status>): <body>` on stderr, exit `1` |
 

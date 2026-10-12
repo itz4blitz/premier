@@ -3,6 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Text only the placeholder page contains; `embedded_viewer_ready` in
+/// src/lib.rs looks for the same words.
+const FALLBACK_MARKER: &str = "Premier viewer assets missing";
+
 const FALLBACK_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -40,6 +44,13 @@ fn main() -> io::Result<()> {
 
     println!("cargo:rerun-if-changed={}", monorepo_dist.display());
     println!("cargo:rerun-if-changed={}", assets.display());
+    println!("cargo:rerun-if-env-changed=PREMIER_REQUIRE_VIEWER");
+    // Reported by the hidden `premier build-info`, which release packaging
+    // runs to check the binary it is about to describe.
+    println!(
+        "cargo:rustc-env=PREMIER_BUILD_TARGET={}",
+        env::var("TARGET").unwrap_or_default()
+    );
 
     if monorepo_dist.join("index.html").is_file() {
         if assets.exists() {
@@ -57,6 +68,18 @@ fn main() -> io::Result<()> {
             "cargo:warning=Premier viewer dist not found at {}; embedding fallback HTML. Run `npm run build` then rebuild for the full viewer.",
             monorepo_dist.display()
         );
+    }
+
+    // A release build must never ship the placeholder page. With
+    // PREMIER_REQUIRE_VIEWER=1 (set by scripts/package-release.sh and the
+    // release workflow) embedding it is a build error, not a warning.
+    let required = env::var("PREMIER_REQUIRE_VIEWER").is_ok_and(|value| value == "1");
+    let embedded = fs::read_to_string(assets.join("index.html")).unwrap_or_default();
+    if required && (embedded.is_empty() || embedded.contains(FALLBACK_MARKER)) {
+        return Err(io::Error::other(format!(
+            "PREMIER_REQUIRE_VIEWER=1 but no viewer build was found at {}; run `npm run build` first",
+            monorepo_dist.display()
+        )));
     }
 
     Ok(())

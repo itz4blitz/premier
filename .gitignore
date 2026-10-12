@@ -9,6 +9,7 @@
 /apps/docs/.astro/
 /crates/premier-cli/assets/
 /sdk/js/dist/
+/dist/
 /.premier/
 **/.premier/
 /.tmp/

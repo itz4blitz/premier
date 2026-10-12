@@ -24,10 +24,48 @@ Node.js 18 or later, on:
 | Linux (glibc) | `arm64` | `@premierstudio/premier-linux-arm64-gnu` |
 | Linux (glibc) | `x64` | `@premierstudio/premier-linux-x64-gnu` |
 
-Windows and musl-based Linux (for example Alpine) are not published. On an
-unsupported platform, or when the optional native package was not installed
-(for example with `npm install --omit=optional`), `premier` prints the reason
-and exits `1`.
+Not published: Windows, and Linux with a C library other than glibc (musl, as
+on Alpine). `npm install` still succeeds there, because the launcher itself
+runs anywhere Node.js does; the first `premier` command then exits `1` and
+says why:
+
+| System | What `premier` prints | What to do |
+| --- | --- | --- |
+| musl Linux (Alpine) | `Premier publishes Linux binaries for glibc only` | Use a glibc-based image (`node:22-slim` rather than `node:22-alpine`), or build from source. |
+| Windows | `Premier does not publish a binary for win32-<arch>` | Run Premier inside WSL 2. |
+| Any other platform or architecture | `Premier does not publish a binary for <platform>-<arch>`, with the list of published ones | Build from source. |
+| glibc older than the binary needs | `This Premier binary needs glibc <x.y> or later; this system has glibc <a.b>` | Use a newer distribution or image, or build from source. |
+| Native package not installed (`npm install --omit=optional`) | `The optional package <name> is missing` | Reinstall without omitting optional dependencies. |
+
+Building from source needs Rust and Node.js; the steps are in
+[CONTRIBUTING.md](https://github.com/PremierStudio/premier/blob/main/CONTRIBUTING.md#build-order).
+
+The Linux binaries are built on Ubuntu 24.04 (glibc 2.39) and may need a glibc
+as new as that. The exact requirement of a release is recorded in its Linux
+packages (`premier.glibc` in their `package.json`), which is what the launcher
+compares against.
+
+## What the launcher checks
+
+Before it starts the native binary the launcher:
+
+1. picks the platform package for this operating system, architecture and C
+   library, as above;
+2. resolves it the way Node.js resolves any package, and reads its
+   `package.json`;
+3. requires that package's version to equal the launcher's own. The two are
+   published together, and the launcher pins the exact version, but a stale
+   lockfile entry or a hoisted copy from another install can still put a
+   different one in the way. That is refused
+   (`<name> is version X, but this launcher (@premierstudio/premier) is Y`)
+   rather than run;
+4. on Linux, compares the system's glibc with the package's `premier.glibc`.
+
+It does not verify a signature or digest of the binary. What protects the
+binary is npm's integrity check of the package at install time and its
+provenance attestation (`npm audit signatures`). macOS binaries are ad hoc
+signed and not notarized; see
+[docs/releasing.md](https://github.com/PremierStudio/premier/blob/main/docs/releasing.md#macos-signing).
 
 ## The launcher
 

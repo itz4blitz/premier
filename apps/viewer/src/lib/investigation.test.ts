@@ -210,6 +210,27 @@ describe('buildInvestigationSummary', () => {
     expect(result.gaps.map((gap) => gap.id)).toEqual(expect.arrayContaining(['causal-links', 'completion-event']));
   });
 
+  it('reports provider output the adapter could not read as missing evidence', () => {
+    const exit = event(9, 'process.exit', { actor_id: 'root' });
+    const clean = buildInvestigationSummary(trace({ exit_code: 0 }), [event(1, 'agent.turn'), exit]);
+    expect(clean.gaps.map((gap) => gap.id)).not.toContain('adapter-lines');
+
+    const diagnostic = (sequence: number) => event(sequence, 'adapter.diagnostic', { source: 'adapter', status: 'warning', payload_json: '{"message":"malformed line"}' });
+    const one = buildInvestigationSummary(trace({ exit_code: 0 }), [event(1, 'agent.turn'), diagnostic(2), exit]);
+    expect(one.gaps.find((gap) => gap.id === 'adapter-lines')).toMatchObject({
+      severity: 'medium',
+      label: 'Provider output was not fully captured',
+      detail: expect.stringContaining('1 line of provider output')
+    });
+
+    // The closing summary counts the lines whose diagnostics were suppressed too.
+    const summary = event(8, 'adapter.summary', { source: 'adapter', status: 'warning', payload_json: '{"rejected_lines":57,"suppressed_diagnostics":37}' });
+    const many = buildInvestigationSummary(trace({ exit_code: 0 }), [event(1, 'agent.turn'), diagnostic(2), diagnostic(3), summary, exit]);
+    const gaps = many.gaps.filter((gap) => gap.id === 'adapter-lines');
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].detail).toContain('57 lines of provider output');
+  });
+
   it('surfaces recorder semantic diagnostics as missing-evidence findings', () => {
     const result = buildInvestigationSummary(trace({
       diagnostics: [{ severity: 'warning', code: 'missing_lifecycle_result', message: 'agent.spawn has no matching agent.result', event_id: 'event-1', sequence: 1 }]

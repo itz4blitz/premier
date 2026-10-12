@@ -20,7 +20,9 @@ keep the secret scan green. The reference documentation is indexed in
 ## Requirements
 
 - Node.js 22.12 or later (`engines` in `package.json`; CI uses Node 24).
-- A stable Rust toolchain.
+- The Rust toolchain pinned in `rust-toolchain.toml`; `rustup` installs it on
+  the first `cargo` command. CI and the release workflow install the same
+  version, so raise all three together.
 - For the end-to-end tests, Playwright's Chromium:
   `npx playwright install chromium`.
 
@@ -49,6 +51,12 @@ every command that does not need the viewer works, but `premier open`,
 `premier serve`, and `premier record --open` refuse to start without
 `--viewer-dir`. Run `npm run build` and build again; the build script reruns
 when `apps/viewer/dist` changes.
+
+A release never ships that page: with `PREMIER_REQUIRE_VIEWER=1` the build
+script fails instead of embedding it, and `scripts/package-release.sh` runs
+`premier build-info` (hidden; prints `version=`, `target=`, and
+`viewer=embedded` or `viewer=placeholder`) and refuses a placeholder. See
+[docs/releasing.md](docs/releasing.md#what-packaging-checks-first).
 
 To work on the viewer without rebuilding the binary, serve it from disk:
 
@@ -85,7 +93,7 @@ Each suite on its own:
 | Viewer components | `npm run test:components` | Vitest. |
 | Viewer coverage | `npm run test:coverage` | Vitest with coverage. `types.ts`, `traceLoad.ts`, `api.ts`, `deepLink.ts`, and `causal.ts` in `apps/viewer/src/lib` are held to 100% lines, functions, branches, and statements. |
 | Type checks and launcher | `npm run check` | `svelte-check` for the viewer, `tsc --noEmit` for the SDK, then the launcher tests. |
-| SDK | `npm run test:sdk` | Builds the SDK first; the tests import `dist`. |
+| SDK | `npm run test:sdk` | Builds the SDK first; the tests import `dist`. `test/readme.test.js` runs every example in `sdk/js/README.md`, and the SDK and `premier emit` examples in `README.md`, `docs/collector.md` and `docs/cli.md`, under `premier record`, and requires `premier verify` to report no diagnostics. It needs a built binary (`PREMIER_BIN`, or `target/debug/premier` under `CARGO_TARGET_DIR` or the repository root) and skips those cases without one; CI sets `PREMIER_REQUIRE_CLI=1`, which turns the skip into a failure. |
 | npm launcher | `npm run test:launcher` | `node --test` on `packages/premier-cli/test`. |
 | npm distribution | `npm run test:npm-distribution` | `scripts/test-npm-distribution.mjs`. |
 | End to end | `npm run test:e2e` | Runs `npm run build`, then Playwright. Playwright starts `scripts/e2e-server.mjs`, which builds the viewer, records two traces into `.tmp/e2e-traces`, and serves them on `127.0.0.1:4318` (`PREMIER_E2E_PORT` changes the port). |
@@ -96,10 +104,25 @@ CI also runs these, which `npm run test:all` does not:
 npm audit --audit-level=low
 cargo audit
 npm run security:secrets
+node scripts/check-release-versions.mjs
+shellcheck -x scripts/*.sh scripts/lib/*.sh scripts/tests/*.sh sdk/shell/premier-emit.sh
 ./scripts/tests/distribution.sh
 ./scripts/tests/premier-emit.sh
 node scripts/tests/preflight-npm-trusted-publishing.test.mjs
+node --test scripts/tests/release-config.test.mjs scripts/tests/npm-staging.test.mjs
 ```
+
+| Command | Covers |
+| --- | --- |
+| `scripts/check-release-versions.mjs` | One version in `Cargo.toml`, `Cargo.lock`, every `package.json`, and the launcher's platform pins. |
+| `scripts/tests/distribution.sh` | Packaging, the installer and its standalone form, update, uninstall, version check, and release verification, with a stand-in `cosign`. |
+| `scripts/tests/premier-emit.sh` | The shell helper's `curl` mode against stub collectors. |
+| `scripts/tests/release-config.test.mjs` | The workflows' pins and the order of the release build. The workflows themselves cannot be run locally. |
+| `scripts/tests/npm-staging.test.mjs` | `stage-npm-packages.sh` and `verify-staged-npm.mjs`. Needs `npm` on `PATH`. |
+
+CI also has a macOS job that runs the Rust suite, the launcher tests, and the
+two shell suites, because the recorder's PTY and signal handling differ by
+platform.
 
 `npm run security:audit` runs the first three together. `cargo audit` needs
 `cargo install cargo-audit`.

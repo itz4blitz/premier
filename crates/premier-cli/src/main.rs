@@ -149,7 +149,8 @@ enum Commands {
         #[arg(
             long,
             conflicts_with_all = [
-                "kind", "actor", "actor_type", "span", "parent_span", "status", "payload", "source"
+                "kind", "actor", "actor_type", "span", "parent_span", "parent_event",
+                "correlation", "link", "duration_ms", "timestamp", "status", "payload", "source"
             ]
         )]
         json: Option<String>,
@@ -165,15 +166,35 @@ enum Commands {
         span: Option<String>,
         #[arg(long = "parent-span")]
         parent_span: Option<String>,
+        /// Event id of the event this one follows (`parent_event_id`), as
+        /// printed by an earlier `premier emit`.
+        #[arg(long = "parent-event")]
+        parent_event: Option<String>,
+        /// Correlation id shared by the records of one call or workstream.
+        #[arg(long)]
+        correlation: Option<String>,
+        /// Event id of a related event (`links`). Repeat for several.
+        #[arg(long = "link")]
+        link: Vec<String>,
+        /// How long the recorded work took, in whole milliseconds.
+        #[arg(long = "duration-ms")]
+        duration_ms: Option<u64>,
+        /// Producer time (RFC 3339), kept as `payload.producer_timestamp`.
+        #[arg(long)]
+        timestamp: Option<String>,
         #[arg(long)]
         status: Option<String>,
-        /// Payload as a JSON object string.
+        /// Payload as a JSON object string (default: `{}`).
         #[arg(long)]
         payload: Option<String>,
         /// Source label written on the event (default: premier-emit).
         #[arg(long, default_value = "premier-emit")]
         source: String,
     },
+    /// Print what this binary was built as: version, target and whether the
+    /// viewer is embedded. Release packaging checks it before writing metadata.
+    #[command(name = "build-info", hide = true)]
+    BuildInfo,
     /// Verify a finalized trace's digest, event chain, manifest seal, and signature.
     /// Without a signature a trace is only internally consistent (docs/trace-format.md).
     /// Given a `premier export` file instead, recompute that export's own digest
@@ -484,6 +505,19 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Demo { output, force } => demo(output, force),
+        Commands::BuildInfo => {
+            println!("version={}", env!("CARGO_PKG_VERSION"));
+            println!("target={}", env!("PREMIER_BUILD_TARGET"));
+            println!(
+                "viewer={}",
+                if embedded_viewer_ready() {
+                    "embedded"
+                } else {
+                    "placeholder"
+                }
+            );
+            Ok(())
+        }
         Commands::Emit {
             json,
             kind,
@@ -491,6 +525,11 @@ async fn main() -> Result<()> {
             actor_type,
             span,
             parent_span,
+            parent_event,
+            correlation,
+            link,
+            duration_ms,
+            timestamp,
             status,
             payload,
             source,
@@ -502,6 +541,11 @@ async fn main() -> Result<()> {
                 actor_type,
                 span,
                 parent_span,
+                parent_event,
+                correlation,
+                link,
+                duration_ms,
+                timestamp,
                 status,
                 payload,
                 source,
@@ -1691,7 +1735,7 @@ fn resolve_viewer_dir(viewer_dir: Option<PathBuf>) -> Result<Option<PathBuf>> {
         None => {
             if !embedded_viewer_ready() {
                 bail!(
-                    "this premier binary was built without the full viewer; reinstall with `./scripts/install.sh` or pass --viewer-dir apps/viewer/dist after `npm run build`"
+                    "this premier binary was built without the full viewer; reinstall a release build (`npm install --global @premierstudio/premier`, or `./scripts/install.sh` from a source checkout), or pass --viewer-dir apps/viewer/dist after `npm run build`"
                 );
             }
             Ok(None)
@@ -1860,6 +1904,11 @@ struct EmitArgs {
     actor_type: String,
     span: Option<String>,
     parent_span: Option<String>,
+    parent_event: Option<String>,
+    correlation: Option<String>,
+    link: Vec<String>,
+    duration_ms: Option<u64>,
+    timestamp: Option<String>,
     status: Option<String>,
     payload: Option<String>,
     source: String,
@@ -1900,10 +1949,29 @@ async fn emit_event(args: EmitArgs) -> Result<()> {
         if let Some(status) = args.status {
             event["status"] = json!(status);
         }
-        if let Some(payload) = args.payload {
-            event["payload"] =
-                serde_json::from_str(&payload).context("invalid JSON for --payload")?;
+        if let Some(parent_event) = args.parent_event {
+            event["parent_event_id"] = json!(parent_event);
         }
+        if let Some(correlation) = args.correlation {
+            event["correlation_id"] = json!(correlation);
+        }
+        if !args.link.is_empty() {
+            event["links"] = json!(args.link);
+        }
+        if let Some(duration_ms) = args.duration_ms {
+            event["duration_ms"] = json!(duration_ms);
+        }
+        if let Some(timestamp) = args.timestamp {
+            event["timestamp"] = json!(timestamp);
+        }
+        // An event without a payload is reported by `premier verify` as
+        // `payload_not_object`, so the flag form always sends an object.
+        event["payload"] = match args.payload {
+            Some(payload) => {
+                serde_json::from_str(&payload).context("invalid JSON for --payload")?
+            }
+            None => json!({}),
+        };
         event
     };
 
