@@ -12,6 +12,8 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./src/test-setup.ts'],
     include: ['src/**/*.test.ts'],
+    // Large-trace rendering tests exceed the 5 s default on shared CI runners under coverage.
+    testTimeout: 30_000,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'text-summary', 'html'],

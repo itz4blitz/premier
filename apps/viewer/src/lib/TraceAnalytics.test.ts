@@ -69,7 +69,10 @@ describe('TraceAnalytics', () => {
     expect(screen.getByText('Event latency p95').parentElement).toHaveTextContent('400 ms');
     const mix = screen.getByRole('list', { name: 'Event category distribution' });
     expect(mix).toHaveTextContent('Agent20%');
-    expect(mix).toHaveTextContent('Issue20%');
+    // A failed tool call is still a tool call: the mix files it under Tool, as the run header and the
+    // filter tabs do, and the issue rate above reports that it failed.
+    expect(mix).toHaveTextContent('Tool40%');
+    expect(mix).not.toHaveTextContent('Issue');
     expect(screen.getByRole('button', { name: /Issue at \+3\.0 s/i })).toBeInTheDocument();
   });
 

@@ -1,6 +1,6 @@
 //! Integrity assessment for traces shown by the viewer and CLI.
 
-use crate::{read_manifest, verify};
+use crate::{Protection, read_manifest, verify_trace};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -10,10 +10,18 @@ use std::path::Path;
 pub enum IntegrityStatus {
     /// Recording is still open (no finalized journal).
     Live,
-    /// Finalized journal matches the manifest digest and structural checks.
+    /// No finalized journal and the recorder is gone; `premier recover` finalizes it.
+    Abandoned,
+    /// Finalized journal passed every check its format version supports. What
+    /// that is worth is stated by [`IntegrityReport::protection`].
     Verified,
     /// Finalized or readable trace failed verification.
     Invalid,
+    /// Encrypted, and no usable key was supplied: the evidence is sealed, not damaged.
+    Locked,
+    /// Written in a later trace format than this build reads: it needs a
+    /// newer Premier, and nothing here says it is damaged.
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +29,27 @@ pub struct IntegrityReport {
     pub status: IntegrityStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// What a `Verified` trace is protected by: digest only (v1), an unsigned
+    /// seal (self-consistent, not proof against a deliberate rewrite), or a
+    /// signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection: Option<Protection>,
+    /// Fingerprint of the key that signed the seal. The key comes from the
+    /// trace itself, so this identifies the signer without vouching for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+}
+
+impl IntegrityReport {
+    /// Report without protection details (live, abandoned or invalid traces).
+    pub fn new(status: IntegrityStatus, detail: Option<String>) -> Self {
+        Self {
+            status,
+            detail,
+            protection: None,
+            signer: None,
+        }
+    }
 }
 
 /// Assess integrity of the trace at `root` without panicking on bad input.
@@ -29,34 +58,27 @@ pub fn assess_integrity(root: impl AsRef<Path>) -> IntegrityReport {
     let manifest = match read_manifest(root) {
         Ok(manifest) => manifest,
         Err(error) => {
-            return IntegrityReport {
-                status: IntegrityStatus::Invalid,
-                detail: Some(error.to_string()),
-            };
+            return IntegrityReport::new(IntegrityStatus::Invalid, Some(error.to_string()));
         }
     };
     if manifest.journal.is_none() {
-        return IntegrityReport {
-            status: IntegrityStatus::Live,
-            detail: None,
-        };
+        return IntegrityReport::new(IntegrityStatus::Live, None);
     }
-    match verify(root) {
-        Ok(_) => IntegrityReport {
+    match verify_trace(root, None) {
+        Ok(verified) => IntegrityReport {
             status: IntegrityStatus::Verified,
             detail: None,
+            protection: Some(verified.protection),
+            signer: verified.signer.map(|key| key.fingerprint()),
         },
-        Err(error) => IntegrityReport {
-            status: IntegrityStatus::Invalid,
-            detail: Some(error.to_string()),
-        },
+        Err(error) => IntegrityReport::new(IntegrityStatus::Invalid, Some(error.to_string())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EventInput, TraceWriter};
+    use crate::{EventInput, SigningKey, TraceWriter};
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -68,6 +90,15 @@ mod tests {
         let report = assess_integrity(&root);
         assert_eq!(report.status, IntegrityStatus::Live);
         assert!(report.detail.is_none());
+    }
+
+    #[test]
+    fn abandoned_is_a_distinct_wire_state() {
+        assert_eq!(
+            serde_json::to_string(&IntegrityStatus::Abandoned).unwrap(),
+            "\"abandoned\""
+        );
+        assert_ne!(IntegrityStatus::Abandoned, IntegrityStatus::Live);
     }
 
     #[test]
@@ -84,6 +115,24 @@ mod tests {
         writer.finish(0).unwrap();
         let report = assess_integrity(&root);
         assert_eq!(report.status, IntegrityStatus::Verified);
+        assert_eq!(report.protection, Some(Protection::Sealed));
+        assert_eq!(report.signer, None);
+    }
+
+    #[test]
+    fn signed_traces_report_the_signer_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("signed.atrace");
+        let key = SigningKey::generate();
+        let mut writer = TraceWriter::create(&root, vec!["true".into()]).unwrap();
+        writer.set_signing_key(key.clone());
+        writer.finish(0).unwrap();
+        let report = assess_integrity(&root);
+        assert_eq!(report.status, IntegrityStatus::Verified);
+        assert_eq!(report.protection, Some(Protection::Signed));
+        assert_eq!(report.signer, Some(key.public_key().fingerprint()));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["protection"], "signed");
     }
 
     #[test]

@@ -1,2 +1,8 @@
-{"role":"assistant","content":[{"type":"text","text":"checking"}],"tool_calls":[{"id":"call-1","type":"function","function":{"name":"Read","arguments":"{}"}}]}
-{"role":"tool","tool_call_id":"call-1","content":"ok"}
+{"role":"assistant","content":[{"type":"text","text":"I will read the ledger module."}],"tool_calls":[{"id":"call-1","type":"function","function":{"name":"ReadFile","arguments":"{\"path\":\"src/ledger.rs\"}"}}]}
+{"role":"tool","tool_call_id":"call-1","content":"fn round_credit(value: i64) -> i64 { value / 100 }"}
+{"role":"assistant","content":[{"type":"text","text":"Now I will run the tests."}],"tool_calls":[{"id":"call-2","type":"function","function":{"name":"Shell","arguments":"{\"command\":\"cargo test\"}"}}]}
+{"role":"tool","tool_call_id":"call-2","content":"<system>ERROR: Command failed with exit code: 101.</system>\ntest parser::rounding ... FAILED"}
+{"role":"assistant","content":[{"type":"text","text":"I will check the call sites too."}],"tool_calls":[{"id":"call-3","type":"function","function":{"name":"Grep","arguments":"{\"pattern\":\"round_credit\"}"}},{"id":"call-4","type":"function","function":{"name":"ReadFile","arguments":"{\"path\":\"src/invoice.rs\"}"}}]}
+{"role":"tool","tool_call_id":"call-3","content":"src/invoice.rs:88:    round_credit(total)"}
+{"role":"tool","tool_call_id":"call-4","content":"<system>ERROR: `src/invoice.rs` is not readable.</system>","is_error":true}
+{"role":"assistant","content":[{"type":"text","text":"round_credit truncates negative credits."}]}

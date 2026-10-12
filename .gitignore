@@ -9,6 +9,10 @@
 /apps/docs/.astro/
 /crates/premier-cli/assets/
 /sdk/js/dist/
+/dist/
+# Copied in from the repository root when the npm packages are staged.
+/npm/platforms/*/THIRD_PARTY_NOTICES.md
+/packages/premier-cli/THIRD_PARTY_NOTICES.md
 /.premier/
 **/.premier/
 /.tmp/

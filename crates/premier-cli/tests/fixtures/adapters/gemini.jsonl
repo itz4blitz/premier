@@ -1,2 +1,9 @@
-{"type":"init","session_id":"gemini-session"}
-{"type":"tool_result","tool_use_id":"tool-1","name":"read_file","status":"success"}
+{"type":"init","timestamp":"2026-03-04T10:15:00.120Z","session_id":"gemini-session","model":"gemini-fixture"}
+{"type":"message","timestamp":"2026-03-04T10:15:00.180Z","role":"user","content":"Why does the rounding test fail?"}
+{"type":"message","timestamp":"2026-03-04T10:15:01.402Z","role":"assistant","content":"I will read the ledger module.","delta":true}
+{"type":"tool_use","timestamp":"2026-03-04T10:15:01.650Z","tool_name":"read_file","tool_id":"read_file-1","parameters":{"file_path":"src/ledger.rs"}}
+{"type":"tool_result","timestamp":"2026-03-04T10:15:01.701Z","tool_id":"read_file-1","status":"success","output":"fn round_credit(value: i64) -> i64 { value / 100 }"}
+{"type":"tool_use","timestamp":"2026-03-04T10:15:02.310Z","tool_name":"run_shell_command","tool_id":"run_shell_command-2","parameters":{"command":"cargo test"}}
+{"type":"tool_result","timestamp":"2026-03-04T10:15:06.944Z","tool_id":"run_shell_command-2","status":"error","output":"test parser::rounding ... FAILED","error":{"type":"tool_execution_error","message":"Command exited with code 101"}}
+{"type":"message","timestamp":"2026-03-04T10:15:08.015Z","role":"assistant","content":"round_credit truncates negative credits.","delta":true}
+{"type":"result","timestamp":"2026-03-04T10:15:08.090Z","status":"success","stats":{"total_tokens":1530,"input_tokens":1400,"output_tokens":130,"duration_ms":7970,"tool_calls":2}}

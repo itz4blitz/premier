@@ -31,8 +31,16 @@ if [[ -x "$PREFIX/bin/premier" ]]; then
 fi
 echo "installed: $INSTALLED"
 echo "available: $AVAILABLE"
-if [[ "$INSTALLED" == "$AVAILABLE" ]]; then
-  echo "status: current"
-else
-  echo "status: update available"
-fi
+# An archive older than the installed binary is not an update.
+case "$(distribution_version_compare "$AVAILABLE" "$INSTALLED" 2>/dev/null || true)" in
+  eq) echo "status: current" ;;
+  gt) echo "status: update available" ;;
+  lt) echo "status: installed version is newer than this archive (installing it would downgrade)" ;;
+  *)
+    if [[ "$INSTALLED" == "not installed" ]]; then
+      echo "status: not installed"
+    else
+      echo "status: versions cannot be compared"
+    fi
+    ;;
+esac

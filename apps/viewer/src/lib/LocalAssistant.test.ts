@@ -1,10 +1,10 @@
 import { render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import LocalAssistant from './LocalAssistant.svelte';
+import LocalAssistant, { resetAssistantSessions } from './LocalAssistant.svelte';
 import type { TraceEvent } from './types';
 
-const mocks = vi.hoisted(() => ({ assistants: vi.fn(), askAssistant: vi.fn() }));
+const mocks = vi.hoisted(() => ({ assistants: vi.fn(), askAssistant: vi.fn(), previewAssistant: vi.fn() }));
 vi.mock('./api', () => ({ api: mocks }));
 
 const selectedEvent: TraceEvent = {
@@ -20,8 +20,18 @@ const providers = [
   { provider: 'opencode', label: 'OpenCode', installed: true, available: false, reason: 'No verified tool-deny mode.' }
 ];
 
+/** A run of 300 events of which the newest 40 fit the prompt. */
+const windowed = { scope: 'run' as const, total_events: 300, included_events: 40, first_sequence: 261, last_sequence: 300, history_messages: 0, prompt_chars: 18250 };
+
+/** Tick the consent box for the provider that is selected now. */
+async function consent(user: ReturnType<typeof userEvent.setup>, vendor: string): Promise<void> {
+  await user.click(screen.getByRole('checkbox', { name: `Send redacted trace content to ${vendor}` }));
+}
+
 describe('LocalAssistant', () => {
   beforeEach(() => {
+    resetAssistantSessions();
+    mocks.previewAssistant.mockReset().mockResolvedValue({ context: windowed, prompt: 'TRACE OUTCOME (JSON):\n{"exit_code":1}\n\nUSER QUESTION:\n' });
     mocks.assistants.mockReset().mockResolvedValue(providers);
     mocks.askAssistant.mockReset().mockResolvedValue({ provider: 'claude', answer: 'The compiler failed in worker.', elapsed_ms: 125 });
   });
@@ -30,7 +40,7 @@ describe('LocalAssistant', () => {
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
 
     expect(screen.getByText('Discovering installed CLIs…')).toBeInTheDocument();
-    const provider = await screen.findByRole('button', { name: 'Local provider' });
+    const provider = await screen.findByRole('button', { name: 'Provider CLI' });
     await userEvent.click(provider);
     expect(screen.getByRole('option', { name: /Claude/ })).toBeInTheDocument();
     expect(screen.getByRole('option', { name: /Codex/ })).toBeInTheDocument();
@@ -39,23 +49,57 @@ describe('LocalAssistant', () => {
     expect(screen.getByText('No verified tool-deny mode.')).toBeInTheDocument();
   });
 
+  it('states what the selected CLI can do while answering before consent is given', async () => {
+    const user = userEvent.setup();
+    mocks.assistants.mockResolvedValue([
+      { provider: 'claude', label: 'Claude', installed: true, available: true, containment: 'no_tools', containment_summary: 'Claude Code runs with every tool switched off.' },
+      { provider: 'codex', label: 'Codex', installed: true, available: true, containment: 'read_only_sandbox', containment_summary: 'Codex can run shell commands in its read-only sandbox.' },
+      { provider: 'opencode', label: 'OpenCode', installed: true, available: false, containment: 'provider_default', reason: 'this server requires read_only_sandbox containment or stronger' }
+    ]);
+    render(LocalAssistant, { props: { traceId: 'trace-1' } });
+
+    // The strongest tier: stated, with no warning about what trace text could set off.
+    const strongest = await screen.findByTestId('assistant-containment');
+    expect(strongest).toHaveTextContent('What the CLI can do while it answers: Claude Code runs with every tool switched off.');
+    expect(strongest).toHaveAttribute('data-containment', 'no_tools');
+    expect(strongest).not.toHaveTextContent('untrusted input');
+    expect(screen.getByRole('checkbox', { name: 'Send redacted trace content to Anthropic' })).not.toBeChecked();
+
+    // A weaker tier is disclosed where consent is asked, before the box is ticked.
+    await user.click(screen.getByRole('button', { name: 'Provider CLI' }));
+    await user.click(screen.getByRole('option', { name: /Codex/ }));
+    const weaker = screen.getByTestId('assistant-containment');
+    expect(weaker).toHaveTextContent('Codex can run shell commands in its read-only sandbox.');
+    expect(weaker).toHaveTextContent('Trace content is untrusted input to it');
+    expect(weaker).toHaveAttribute('data-containment', 'read_only_sandbox');
+    const box = screen.getByRole('checkbox', { name: 'Send redacted trace content to OpenAI' });
+    expect(box).not.toBeChecked();
+    expect(weaker.compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Ask Codex/ })).toBeDisabled();
+
+    // A provider below the server's minimum is listed with the reason.
+    await user.click(screen.getByText('1 unavailable provider'));
+    expect(screen.getByText('this server requires read_only_sandbox containment or stronger')).toBeInTheDocument();
+  });
+
   it('uses starters to fill the composer without submitting', async () => {
     const user = userEvent.setup();
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
+    await screen.findByRole('button', { name: 'Provider CLI' });
 
     await user.click(screen.getByRole('button', { name: /Summarize the run/ }));
-    expect(screen.getByLabelText('Question for your local AI')).toHaveValue('Summarize the run and identify the highest-impact issue.');
+    expect(screen.getByLabelText('Question for the provider')).toHaveValue('Summarize the run and identify the highest-impact issue.');
     expect(mocks.askAssistant).not.toHaveBeenCalled();
   });
 
   it('sends real history and selected-event scope and renders the measured answer', async () => {
     const user = userEvent.setup();
     render(LocalAssistant, { props: { traceId: 'trace-1', selectedEvent } });
-    await user.click(await screen.findByRole('button', { name: 'Local provider' }));
+    await user.click(await screen.findByRole('button', { name: 'Provider CLI' }));
     await user.click(screen.getByRole('option', { name: /Codex/ }));
     await user.click(screen.getByRole('radio', { name: /Selected event/ }));
-    await user.type(screen.getByLabelText('Question for your local AI'), 'Why did this fail?');
+    await user.type(screen.getByLabelText('Question for the provider'), 'Why did this fail?');
+    await consent(user, 'OpenAI');
     mocks.askAssistant.mockResolvedValueOnce({ provider: 'codex', answer: 'Event 9 contains the compiler failure.', elapsed_ms: 240 });
     await user.click(screen.getByRole('button', { name: 'Ask Codex' }));
 
@@ -65,7 +109,7 @@ describe('LocalAssistant', () => {
     });
     expect(screen.getByText('240 ms')).toBeInTheDocument();
 
-    await user.type(screen.getByLabelText('Question for your local AI'), 'What next?');
+    await user.type(screen.getByLabelText('Question for the provider'), 'What next?');
     await user.click(screen.getByRole('button', { name: 'Ask Codex' }));
     await waitFor(() => expect(mocks.askAssistant).toHaveBeenCalledTimes(2));
     expect(mocks.askAssistant.mock.calls[1][1].history).toEqual([
@@ -82,8 +126,9 @@ describe('LocalAssistant', () => {
       elapsed_ms: 25_400
     });
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    await user.type(screen.getByLabelText('Question for your local AI'), 'Review the run');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    await user.type(screen.getByLabelText('Question for the provider'), 'Review the run');
+    await consent(user, 'Anthropic');
     await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
 
     expect(await screen.findByRole('heading', { level: 2, name: 'Highest-impact issue' })).toBeInTheDocument();
@@ -97,9 +142,10 @@ describe('LocalAssistant', () => {
     const user = userEvent.setup();
     mocks.askAssistant.mockRejectedValueOnce(new Error('Claude exited with status 1: login required'));
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    const input = screen.getByLabelText('Question for your local AI');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    const input = screen.getByLabelText('Question for the provider');
     await user.type(input, 'Diagnose this');
+    await consent(user, 'Anthropic');
     await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Claude exited with status 1: login required');
@@ -111,8 +157,9 @@ describe('LocalAssistant', () => {
     let resolveAnswer!: (value: { provider: string; answer: string; elapsed_ms: number }) => void;
     mocks.askAssistant.mockReturnValueOnce(new Promise((resolve) => { resolveAnswer = resolve; }));
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    await user.type(screen.getByLabelText('Question for your local AI'), 'Inspect latency');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    await user.type(screen.getByLabelText('Question for the provider'), 'Inspect latency');
+    await consent(user, 'Anthropic');
     await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
 
     expect(screen.getByRole('status')).toHaveTextContent('Claude is analyzing the trace');
@@ -127,8 +174,9 @@ describe('LocalAssistant', () => {
       provider: 'claude', answer: `Answer to ${body.prompt}`, elapsed_ms: 10
     }));
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    const input = screen.getByLabelText('Question for your local AI');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    const input = screen.getByLabelText('Question for the provider');
+    await consent(user, 'Anthropic');
     for (let index = 1; index <= 7; index += 1) {
       await user.type(input, `Question ${index}`);
       await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
@@ -145,10 +193,147 @@ describe('LocalAssistant', () => {
     ]);
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
 
-    const provider = await screen.findByRole('button', { name: 'Local provider' });
-    expect(provider).toHaveTextContent('No safe provider available');
+    const provider = await screen.findByRole('button', { name: 'Provider CLI' });
+    expect(provider).toHaveTextContent('No provider available');
     expect(provider).toBeDisabled();
-    expect(screen.getByLabelText('Question for your local AI')).toBeDisabled();
+    expect(screen.getByLabelText('Question for the provider')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Ask assistant' })).toBeDisabled();
+  });
+
+  it('says where trace content goes and sends nothing until the user agrees, per provider', async () => {
+    const user = userEvent.setup();
+    render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    expect(screen.getByRole('heading', { name: 'Ask an AI CLI installed here' })).toBeInTheDocument();
+    expect(screen.getByText(/Asking sends trace content off this machine/)).toHaveTextContent("Anthropic's model service");
+
+    await user.type(screen.getByLabelText('Question for the provider'), 'Summarize');
+    const ask = screen.getByRole('button', { name: 'Ask Claude' });
+    expect(ask).toBeDisabled();
+    await user.keyboard('{Control>}{Enter}{/Control}');
+    expect(mocks.askAssistant).not.toHaveBeenCalled();
+
+    await consent(user, 'Anthropic');
+    expect(ask).toBeEnabled();
+
+    // Agreeing to one provider is not agreeing to another.
+    await user.click(screen.getByRole('button', { name: 'Provider CLI' }));
+    await user.click(screen.getByRole('option', { name: /Codex/ }));
+    expect(screen.getByText(/Asking sends trace content off this machine/)).toHaveTextContent("OpenAI's model service");
+    expect(screen.getByRole('checkbox', { name: 'Send redacted trace content to OpenAI' })).not.toBeChecked();
+    expect(screen.getByRole('button', { name: 'Ask Codex' })).toBeDisabled();
+    expect(mocks.askAssistant).not.toHaveBeenCalled();
+  });
+
+  it('shows which events will be sent, and the exact text on request, before anything is asked', async () => {
+    const user = userEvent.setup();
+    render(LocalAssistant, { props: { traceId: 'trace-1', selectedEvent } });
+    const coverage = await screen.findByTestId('assistant-coverage');
+    await waitFor(() => expect(coverage).toHaveTextContent('events #261–#300 (the newest 40 of 300)'));
+    expect(coverage).toHaveTextContent('about 18,250 characters');
+    // A whole-run question would be answered from a window: say so before it is asked.
+    expect(coverage).toHaveTextContent('260 earlier events are not sent, so a question about the whole run is answered from this range only.');
+    // Working this out asks the local server only; no provider has been run.
+    expect(mocks.previewAssistant).toHaveBeenCalledWith('trace-1', { provider: 'claude', prompt: '', history: [] });
+    expect(mocks.askAssistant).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('assistant-prompt-preview')).not.toBeInTheDocument();
+
+    // The exact text includes the question as typed so far.
+    await user.type(screen.getByLabelText('Question for the provider'), 'Why?');
+    mocks.previewAssistant.mockResolvedValueOnce({ context: windowed, prompt: 'TRACE OUTCOME (JSON):\n{"exit_code":1}\n\nUSER QUESTION:\nWhy?' });
+    await user.click(screen.getByRole('button', { name: 'Show the exact text' }));
+    const text = await screen.findByTestId('assistant-prompt-preview');
+    await waitFor(() => expect(text.textContent).toBe('TRACE OUTCOME (JSON):\n{"exit_code":1}\n\nUSER QUESTION:\nWhy?'));
+    expect(mocks.previewAssistant).toHaveBeenLastCalledWith('trace-1', { provider: 'claude', prompt: 'Why?', history: [] });
+    await user.click(screen.getByRole('button', { name: 'Hide the exact text' }));
+    expect(screen.queryByTestId('assistant-prompt-preview')).not.toBeInTheDocument();
+
+    // Changing the scope asks again, for the selected event this time.
+    mocks.previewAssistant.mockResolvedValue({ context: { ...windowed, scope: 'event', selected_sequence: 9 }, prompt: 'p' });
+    await user.click(screen.getByRole('radio', { name: /Selected event/ }));
+    await waitFor(() => expect(coverage).toHaveTextContent('the selected event #9 and events #261–#300'));
+    expect(mocks.previewAssistant).toHaveBeenLastCalledWith('trace-1', expect.objectContaining({ selected_event_id: 'event-9' }));
+    expect(mocks.askAssistant).not.toHaveBeenCalled();
+  });
+
+  it('states the event range each answer was based on', async () => {
+    const user = userEvent.setup();
+    mocks.askAssistant.mockResolvedValueOnce({ provider: 'claude', answer: 'The last tool call failed.', elapsed_ms: 90, context: windowed });
+    render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    await user.type(screen.getByLabelText('Question for the provider'), 'Summarize the run');
+    await consent(user, 'Anthropic');
+    await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
+    const basis = await screen.findByTestId('assistant-answer-basis');
+    expect(basis).toHaveTextContent('Based on events #261–#300 (the newest 40 of 300). 260 earlier events were not sent to the model.');
+
+    // A run that fits entirely says so, with no caveat.
+    mocks.askAssistant.mockResolvedValueOnce({
+      provider: 'claude', answer: 'Second answer.', elapsed_ms: 80,
+      context: { scope: 'run', total_events: 3, included_events: 3, first_sequence: 1, last_sequence: 3, history_messages: 2, prompt_chars: 900 }
+    });
+    await user.type(screen.getByLabelText('Question for the provider'), 'And then?');
+    await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
+    await screen.findByText('Second answer.');
+    const all = screen.getAllByTestId('assistant-answer-basis');
+    expect(all).toHaveLength(2);
+    expect(all[1]).toHaveTextContent('Based on all 3 events (events #1–#3).');
+    expect(all[1]).not.toHaveTextContent('not sent');
+  });
+
+  it('keeps the conversation, the draft and an answer still on its way when the panel is closed', async () => {
+    const user = userEvent.setup();
+    let answer: (value: unknown) => void = () => undefined;
+    mocks.askAssistant.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+    const first = render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    await user.type(screen.getByLabelText('Question for the provider'), 'What failed?');
+    await consent(user, 'Anthropic');
+    await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
+    expect(await screen.findByText(/is analyzing the trace/)).toBeInTheDocument();
+    // Closed while the provider is still working.
+    first.unmount();
+    answer({ provider: 'claude', answer: 'The deploy step failed.', elapsed_ms: 300, context: windowed });
+
+    const second = render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    expect(await screen.findByText('What failed?')).toBeInTheDocument();
+    expect(await screen.findByText('The deploy step failed.')).toBeInTheDocument();
+    // Consent and the chosen provider are remembered for this page too.
+    expect(screen.getByRole('checkbox', { name: 'Send redacted trace content to Anthropic' })).toBeChecked();
+    await user.type(screen.getByLabelText('Question for the provider'), 'half a thought');
+    second.unmount();
+
+    render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    expect(screen.getByLabelText('Question for the provider')).toHaveValue('half a thought');
+    expect(screen.getByText('The deploy step failed.')).toBeInTheDocument();
+    expect(mocks.askAssistant).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps conversations of different traces apart', async () => {
+    const user = userEvent.setup();
+    const first = render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    await user.type(screen.getByLabelText('Question for the provider'), 'draft for one');
+    first.unmount();
+    render(LocalAssistant, { props: { traceId: 'trace-2' } });
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    expect(screen.getByLabelText('Question for the provider')).toHaveValue('');
+  });
+
+  it('explains an empty provider list and a provider these credentials may not use', async () => {
+    mocks.assistants.mockResolvedValueOnce([]);
+    const empty = render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    expect(await screen.findByText(/the assistant is turned off/)).toBeInTheDocument();
+    expect(mocks.previewAssistant).not.toHaveBeenCalled();
+    empty.unmount();
+
+    mocks.assistants.mockResolvedValueOnce([
+      { provider: 'claude', label: 'Claude', installed: true, available: false, reason: 'these credentials lack the assistant:use scope' }
+    ]);
+    render(LocalAssistant, { props: { traceId: 'trace-2' } });
+    expect(await screen.findByText('these credentials lack the assistant:use scope')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Ask assistant' })).toBeDisabled();
+    expect(mocks.previewAssistant).not.toHaveBeenCalled();
   });
 });

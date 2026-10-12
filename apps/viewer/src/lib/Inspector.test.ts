@@ -104,6 +104,37 @@ describe('Inspector', () => {
     expect(onnavigate).toHaveBeenNthCalledWith(2, 'evidence-1');
   });
 
+  it('follows span parents, span children, correlated events, and back-links in one click', async () => {
+    const onnavigate = vi.fn();
+    const base = { ...event, parent_event_id: '', links: [] as string[], correlation_id: '' };
+    const plan = { ...base, event_id: 'plan-1', sequence: 1, kind: 'agent.turn', span_id: 'plan', parent_span_id: '' };
+    const tool = { ...base, event_id: 'tool-1', sequence: 2, kind: 'tool.invocation', span_id: 'tool-span', parent_span_id: 'plan', correlation_id: 'call-1' };
+    const result = { ...base, event_id: 'result-1', sequence: 3, kind: 'tool.result', span_id: 'result-span', parent_span_id: 'tool-span', correlation_id: 'call-1' };
+    const peer = { ...base, event_id: 'peer-1', sequence: 4, kind: 'tool.progress', span_id: 'peer-span', parent_span_id: '', correlation_id: 'call-1' };
+    const note = { ...base, event_id: 'note-1', sequence: 5, kind: 'agent.message', span_id: 'note-span', parent_span_id: '', links: ['tool-1'] };
+    render(Inspector, { props: { event: tool, events: [plan, tool, result, peer, note], onnavigate } });
+    await userEvent.click(screen.getByRole('tab', { name: /Relations/ }));
+    expect(screen.queryByText(/not in journal/i)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /plan-1/ }));
+    await userEvent.click(screen.getByRole('button', { name: /result-1/ }));
+    await userEvent.click(screen.getByRole('button', { name: /peer-1/ }));
+    await userEvent.click(screen.getByRole('button', { name: /note-1/ }));
+    expect(onnavigate.mock.calls.map(([id]) => id)).toEqual(['plan-1', 'result-1', 'peer-1', 'note-1']);
+    expect(screen.getByText('Parent event').closest('div')).toHaveTextContent(/via span plan/);
+    expect(screen.getByText('Child event').closest('div')).toHaveTextContent(/tool\.result/);
+    expect(screen.getByText('Correlated event').closest('div')).toHaveTextContent(/tool\.progress/);
+    expect(screen.getByText('Linked from').closest('div')).toHaveTextContent(/agent\.message/);
+  });
+
+  it('flags a parent span that was never recorded', async () => {
+    const orphan = { ...event, parent_event_id: '', parent_span_id: 'ghost-span', links: [] as string[] };
+    render(Inspector, { props: { event: orphan, events: [orphan], onnavigate: vi.fn() } });
+    await userEvent.click(screen.getByRole('tab', { name: /Relations/ }));
+    expect(screen.getByText('Parent event').closest('div')).toHaveTextContent(/ghost-span/);
+    expect(screen.getByText('Parent event').closest('div')).toHaveTextContent(/not in journal/i);
+  });
+
   it('supports arrow-key navigation across evidence tabs', async () => {
     render(Inspector, { props: { event } });
     const overview = screen.getByRole('tab', { name: 'Overview' });
@@ -180,5 +211,66 @@ describe('Inspector', () => {
     await userEvent.click(toggle);
     expect(screen.getByText(longValue)).toBeInTheDocument();
     expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('counts only the relations it can open in the Relations badge', async () => {
+    // Own span, a parent span, a correlation id and a link, none of which resolves to another event.
+    const lonely = { ...event, parent_event_id: '', parent_span_id: 'ghost-span', correlation_id: 'solo', links: ['gone'] };
+    const { unmount } = render(Inspector, { props: { event: lonely, events: [lonely], onnavigate: vi.fn() } });
+    expect(screen.getByRole('tab', { name: /Relations/ }).querySelector('b')).toBeNull();
+    await userEvent.click(screen.getByRole('tab', { name: /Relations/ }));
+    // The identifiers are still listed, with what is wrong with them.
+    expect(screen.getAllByText('ghost-span').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/not in journal/i).length).toBeGreaterThan(0);
+    unmount();
+
+    const parent = { ...event, event_id: 'parent-1', sequence: 1, kind: 'agent.turn', parent_event_id: '', parent_span_id: '', correlation_id: '', links: [] as string[] };
+    const child = { ...event, event_id: 'child-1', sequence: 3, parent_event_id: 'event-1', parent_span_id: '', correlation_id: '', links: [] as string[] };
+    const current = { ...event, links: ['gone'], correlation_id: '' };
+    render(Inspector, { props: { event: current, events: [parent, current, child], onnavigate: vi.fn() } });
+    // parent-1 and child-1 open; the span ids and the unresolved link do not count.
+    expect(screen.getByRole('tab', { name: /Relations/ }).querySelector('b')).toHaveTextContent('2');
+  });
+
+  it('stays on Relations while hopping from one related event to the next', async () => {
+    const parent = { ...event, event_id: 'parent-1', sequence: 1, kind: 'agent.turn', parent_event_id: '', links: [] as string[] };
+    const current = { ...event, links: [] as string[] };
+    const onnavigate = vi.fn();
+    const { rerender } = render(Inspector, { props: { event: current, events: [parent, current], onnavigate } });
+    await userEvent.click(screen.getByRole('tab', { name: /Relations/ }));
+    await userEvent.click(screen.getByRole('button', { name: /parent-1/ }));
+    await rerender({ event: parent, events: [parent, current], onnavigate });
+    expect(screen.getByRole('tab', { name: /Relations/ })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('Child event')).toBeInTheDocument();
+    // Selecting something else the ordinary way starts at the overview again.
+    await rerender({ event: current, events: [parent, current], onnavigate });
+    expect(screen.getByRole('tab', { name: /Overview/ })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('shows a timestamp that is not a date as it was recorded', () => {
+    render(Inspector, { props: { event: { ...event, timestamp: 'tuesday-ish' } } });
+    expect(screen.getByText('Observed tuesday-ish')).toBeInTheDocument();
+    expect(screen.queryByText(/Invalid Date/)).not.toBeInTheDocument();
+  });
+
+  it('marks redacted values instead of showing the marker as ordinary content', async () => {
+    const redacted = { ...event, payload_json: JSON.stringify({ text: '[REDACTED]', command: 'curl -H "Authorization: [REDACTED]" https://example.test' }) };
+    render(Inspector, { props: { event: redacted } });
+    await userEvent.click(screen.getByRole('tab', { name: /Data/ }));
+    expect(screen.getByText('Redacted by Premier')).toBeInTheDocument();
+    expect(screen.getByText('Contains 1 value redacted by Premier')).toBeInTheDocument();
+  });
+
+  it('bounds the Raw tab for a multi-megabyte payload and still copies all of it', async () => {
+    const big = 'x'.repeat(450_000);
+    render(Inspector, { props: { event: { ...event, payload_json: JSON.stringify({ text: big }) } } });
+    await userEvent.click(screen.getByRole('tab', { name: /Raw/ }));
+    const rendered = () => [...document.querySelectorAll('.raw-section pre')].reduce((sum, pre) => sum + (pre.textContent?.length ?? 0), 0);
+    expect(rendered()).toBeLessThan(210_000);
+    expect(screen.getByRole('status')).toHaveTextContent('Showing the first 200,000 characters');
+    await userEvent.click(screen.getByRole('button', { name: /Copy payload/ }));
+    expect(String(vi.mocked(navigator.clipboard.writeText).mock.calls.at(-1)?.[0]).length).toBeGreaterThan(450_000);
+    await userEvent.click(screen.getByRole('button', { name: 'Show all' }));
+    expect(rendered()).toBeGreaterThan(450_000);
   });
 });

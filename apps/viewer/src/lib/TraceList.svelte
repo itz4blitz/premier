@@ -1,32 +1,38 @@
 <script lang="ts">
+  import { listHealth, type RunHealth } from './analysis';
   import { deriveRunIdentity } from './runIdentity';
-  import { listKey, type TraceManifest } from './types';
+  import { isAbandoned, isRecording, isUnreadable, listKey, type TraceManifest } from './types';
   import { PanelLeftOpen } from '@lucide/svelte';
 
   type RunFilter = 'all' | 'issues' | 'live';
 
-  let { traces, selectedId, onselect, compact = false, onrestore = () => undefined }: {
+  let { traces, selectedId, onselect, compact = false, onrestore = () => undefined, selectedHealth = null }: {
     traces: TraceManifest[];
     selectedId: string | null;
     onselect: (trace: TraceManifest) => void;
     compact?: boolean;
     onrestore?: () => void;
+    /** The open run's outcome as its header shows it, so its row never says something else. */
+    selectedHealth?: RunHealth | null;
   } = $props();
 
   let filter = $state<RunFilter>('all');
   let matchingTraces = $derived(traces.filter((trace) => {
     if (filter === 'issues') return ['error', 'warning'].includes(health(trace).tone);
-    if (filter === 'live') return trace.ended_at === null;
+    if (filter === 'live') return isRecording(trace);
     return true;
   }));
   let visibleTraces = $derived.by(() => {
-    const selected = traces.find((trace) => trace.trace_id === selectedId);
-    return selected && !matchingTraces.some((trace) => trace.trace_id === selected.trace_id)
+    const selected = traces.find((trace) => listKey(trace) === selectedId);
+    return selected && !matchingTraces.some((trace) => listKey(trace) === listKey(selected))
       ? [selected, ...matchingTraces]
       : matchingTraces;
   });
 
   function duration(trace: TraceManifest): string {
+    if (isAbandoned(trace)) return 'Abandoned — run premier recover';
+    // A locked, unsupported or damaged entry has no end time because it could not be read, not because it is running.
+    if (isUnreadable(trace)) return 'Not readable here';
     if (!trace.ended_at) return 'Live';
     const milliseconds = Math.max(0, Date.parse(trace.ended_at) - Date.parse(trace.started_at));
     if (milliseconds < 1000) return `${milliseconds} ms`;
@@ -53,12 +59,26 @@
     return trace.summary?.event_count ?? trace.journal?.event_count ?? null;
   }
 
+  /**
+   * A row's outcome. The open run's row shows the outcome its header shows (`selectedHealth`, computed
+   * from its events); every other row applies the same rules to the manifest and the server's summary.
+   */
   function health(trace: TraceManifest): { label: string; tone: 'success' | 'warning' | 'error' | 'live' } {
-    if (trace.integrity === 'invalid') return { label: 'Unverified', tone: 'error' };
-    if (trace.exit_code !== null && trace.exit_code !== 0) return { label: 'Failed', tone: 'error' };
-    if ((trace.summary?.issue_count ?? 0) > 0) return { label: 'Needs attention', tone: 'warning' };
-    if (!trace.ended_at || trace.integrity === 'live') return { label: 'Running', tone: 'live' };
-    return { label: 'Passed', tone: 'success' };
+    if (trace.integrity === 'invalid') return { label: isUnreadable(trace) ? 'Damaged' : 'Unverified', tone: 'error' };
+    if (trace.integrity === 'locked') return { label: 'Encrypted · key required', tone: 'warning' };
+    if (trace.integrity === 'unsupported') return { label: 'Needs a newer Premier', tone: 'warning' };
+    const shared = selectedHealth && listKey(trace) === selectedId ? selectedHealth : listHealth(trace);
+    return { label: shared.label, tone: shared.tone === 'running' ? 'live' : shared.tone };
+  }
+
+  /** Why an entry cannot be opened, in the server's words, with a fallback per state. */
+  function unreadableReason(trace: TraceManifest): string | null {
+    if (!isUnreadable(trace)) return null;
+    const detail = trace.integrity_detail?.trim();
+    if (detail) return detail;
+    if (trace.integrity === 'locked') return 'This trace is encrypted. Restart premier with --key-file to read it.';
+    if (trace.integrity === 'unsupported') return 'This trace was written by a newer Premier. Upgrade premier to read it.';
+    return 'This trace is damaged: its manifest or journal cannot be read.';
   }
 
   function outcome(trace: TraceManifest): string {
@@ -96,8 +116,8 @@
         <button
           type="button"
           class="rail-run"
-          class:active={trace.trace_id === selectedId}
-          aria-pressed={trace.trace_id === selectedId}
+          class:active={listKey(trace) === selectedId}
+          aria-pressed={listKey(trace) === selectedId}
           aria-label={`${title(trace)}. ${outcome(trace)}. ${eventCount(trace) ?? 0} events.`}
           title={`${title(trace)} · ${outcome(trace)}`}
           onclick={() => onselect(trace)}
@@ -117,8 +137,8 @@
     {#each visibleTraces as trace, index (listKey(trace))}
       <button
         class="trace-select"
-        class:active={trace.trace_id === selectedId}
-        aria-pressed={trace.trace_id === selectedId}
+        class:active={listKey(trace) === selectedId}
+        aria-pressed={listKey(trace) === selectedId}
         aria-label={`${title(trace)}. ${outcome(trace)}. ${eventCount(trace) ?? 0} events.`}
         onclick={() => onselect(trace)}
         onkeydown={(event) => selectByKeyboard(event, index)}
@@ -127,13 +147,18 @@
         <span class="run-copy">
           <span class="run-title-line">
             <strong>{title(trace)}</strong>
-            {#if !trace.ended_at}<span class="live-badge">Live</span>{/if}
-            {#if trace.trace_id === selectedId && !matchingTraces.some((item) => item.trace_id === trace.trace_id)}<span class="outside-badge">Pinned</span>{/if}
+            {#if isAbandoned(trace)}<span class="abandoned-badge" title={trace.integrity_detail || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.'}>Abandoned</span>
+            {:else if trace.integrity === 'locked'}<span class="abandoned-badge" title={trace.integrity_detail || 'This trace is encrypted. Restart premier with --key-file to read it.'}>Locked</span>
+            {:else if trace.integrity === 'unsupported'}<span class="abandoned-badge" title={trace.integrity_detail || 'This trace was written by a newer Premier. Upgrade premier to read it.'}>Newer format</span>
+            {:else if isUnreadable(trace)}<span class="abandoned-badge" title={unreadableReason(trace)}>Damaged</span>
+            {:else if isRecording(trace)}<span class="live-badge">Live</span>{/if}
+            {#if listKey(trace) === selectedId && !matchingTraces.some((item) => listKey(item) === listKey(trace))}<span class="outside-badge">Pinned</span>{/if}
           </span>
           <span class="run-outcome" data-tone={health(trace).tone}>{outcome(trace)}</span>
+          {#if unreadableReason(trace)}<span class="run-reason">{unreadableReason(trace)}</span>{/if}
           <span class="run-foot" title={new Date(trace.started_at).toLocaleString()}>
             <time datetime={trace.started_at}>{when(trace)}</time>
-            <span aria-hidden="true">·</span><span>{trace.ended_at ? `captured ${duration(trace)}` : duration(trace)}</span>
+            <span aria-hidden="true">·</span><span>{trace.ended_at && !isAbandoned(trace) ? `captured ${duration(trace)}` : duration(trace)}</span>
             {#if eventCount(trace) !== null}<span aria-hidden="true">·</span><span>{eventCount(trace)} events</span>{/if}
           </span>
         </span>
@@ -150,6 +175,7 @@
 </aside>
 
 <style>
+  .run-reason { display: block; margin-top: 3px; color: #c9a676; font-size: 10px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
   .trace-list { container-type: inline-size; display: grid; grid-template-rows: auto minmax(0, 1fr); background: #050505; }
   .trace-list.compact {
     width: 100%;
@@ -262,6 +288,7 @@
   .run-title-line { min-width: 0; display: flex; align-items: flex-start; gap: 7px; }
   .run-title-line strong { min-width: 0; flex: 1 1 auto; color: #f1f4f8; font-family: 'IBM Plex Sans Variable', 'IBM Plex Sans', sans-serif; font-size: 13px; font-weight: 700; line-height: 1.3; overflow-wrap: break-word; }
   .live-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid rgba(158,170,255,.38); border-radius: 3px; color: #b8c0ff; background: rgba(111,123,247,.13); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+  .abandoned-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid rgba(245,188,104,.38); border-radius: 3px; color: #f1c984; background: rgba(245,188,104,.08); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
   .outside-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid rgba(245,188,104,.38); border-radius: 3px; color: #f1c984; background: rgba(245,188,104,.08); font-size: 8px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
   .run-outcome { color: #aeb9c8; font-size: 11px; font-weight: 650; line-height: 1.35; }
   .run-outcome[data-tone='error'] { color: #ff9b98; }

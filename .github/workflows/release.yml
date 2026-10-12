@@ -22,12 +22,48 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - run: node scripts/preflight-npm-trusted-publishing.mjs
 
+  # The whole CI suite (audits, secret scan, Rust, viewer, SDK, launcher,
+  # distribution and shell tests, and the macOS job) on the tagged commit.
+  ci:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
+  # Built and tested without release permissions; the publish job only
+  # uploads the tarball this job packed.
+  sdk-package:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node scripts/check-release-versions.mjs "${GITHUB_REF_NAME#v}"
+      - run: npm run test:sdk
+      - name: Pack @premierstudio/trace
+        run: |
+          cp LICENSE sdk/js/LICENSE
+          mkdir npm-sdk
+          npm pack ./sdk/js --pack-destination npm-sdk
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-sdk
+          path: npm-sdk/*.tgz
+          if-no-files-found: error
+
   build:
+    needs: [ci]
     if: github.event_name == 'push'
     strategy:
       fail-fast: false
@@ -42,49 +78,61 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
+    env:
+      # Empty unless the repository has macOS signing configured
+      # (docs/releasing.md, "macOS signing").
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
+      # The version is the one in rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - run: npm ci
       - name: Require tag and workspace versions to match
+        run: node scripts/check-release-versions.mjs "${GITHUB_REF_NAME#v}"
+      - run: npm run build
+      - name: Require the viewer bundle before any Rust build
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          cargo_version="$(awk -F' *= *' '/^version = / { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
-          node_version="$(node -p "require('./package.json').version || '$cargo_version'")"
-          [[ "$version" == "$cargo_version" ]]
-          [[ "$node_version" == "$cargo_version" ]]
-          for manifest in \
-            packages/premier-cli/package.json \
-            sdk/js/package.json \
-            npm/platforms/*/package.json; do
-            [[ "$(node -p "require('./$manifest').version")" == "$version" ]]
-          done
-          node -e '
-            const expected = process.argv[1];
-            const pins = require("./packages/premier-cli/package.json").optionalDependencies ?? {};
-            for (const [name, pinned] of Object.entries(pins)) {
-              if (pinned !== expected) {
-                console.error(`launcher pins ${name}@${pinned}, expected ${expected}`);
-                process.exit(1);
-              }
-            }
-          ' "$version"
-      - run: npm run build
+          # crates/premier-cli/build.rs embeds a placeholder page when this
+          # file is missing; a release must never be built that way.
+          [[ -s apps/viewer/dist/index.html ]] || { echo "::error::apps/viewer/dist/index.html was not built"; exit 1; }
       - run: cargo test --workspace --locked
+      - name: Build the release binary
+        env:
+          # Makes embedding the placeholder page a build error.
+          PREMIER_REQUIRE_VIEWER: '1'
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p premier-cli
+      - name: Sign and notarize the macOS binary
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: ./scripts/macos-sign-notarize.sh "target/${{ matrix.target }}/release/premier"
+      - name: Note that the macOS binary is not notarized
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
+        run: echo "::notice::macOS signing secrets are not configured; this binary is ad hoc signed and not notarized."
       - name: Package reproducible release
         shell: bash
         run: |
+          # Runs the binary (`premier build-info`) and refuses to package one
+          # whose version, target or embedded viewer is not what the release
+          # metadata will say.
           ./scripts/package-release.sh \
             --target "${{ matrix.target }}" \
             --version "${GITHUB_REF_NAME#v}" \
-            --skip-viewer \
+            --binary "target/${{ matrix.target }}/release/premier" \
             --expect-sigstore
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
@@ -99,7 +147,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [build, verify-npm-trusted-publishing]
+    needs: [build, sdk-package, verify-npm-trusted-publishing]
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     environment: release
@@ -109,23 +157,34 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - name: Use npm 12 secure install and trusted-publishing behavior
-        run: npm install --global npm@12
+        run: npm install --global npm@12.2.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: premier-*
           path: release-assets
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-sdk
+          path: npm-sdk
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Build authenticated checksum manifest and sign every subject
         shell: bash
         run: |
+          # The single-file installer for people without a source checkout.
+          ./scripts/build-standalone-installer.sh release-assets/premier-install.sh
           cd release-assets
-          sha256sum -- ./*.tar.gz | sort -k2 > SHA256SUMS
+          # Archives, SBOMs and the installer are all listed, so all of them
+          # are covered by the one signature on SHA256SUMS.
+          sha256sum -- ./*.tar.gz ./*.spdx.json ./premier-install.sh | sort -k2 > SHA256SUMS
           cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
           for archive in ./*.tar.gz; do
             cosign sign-blob --yes --bundle "$archive.sigstore.json" "$archive"
@@ -135,66 +194,54 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               "$archive"
           done
+          # Refuse to publish a release that the consumer-side verifier, with
+          # its own pinned signer identity, would reject. It also fails on any
+          # file in this directory that the signed manifest does not cover.
+          "$GITHUB_WORKSPACE/scripts/verify-release.sh" --directory .
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: release-assets/*.tar.gz
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*.spdx.json
+            release-assets/premier-install.sh
+      # A draft until npm has every package: a failed npm stage must not leave
+      # a public release that npm does not have. Promoted in the last step.
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: release-assets/*
           fail_on_unmatched_files: true
           generate_release_notes: true
-          make_latest: true
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
       - name: Stage script-free npm packages from signed release archives
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          [[ "$(node -p "require('./package.json').version")" == "$version" ]]
-          [[ "$(node -p "require('./packages/premier-cli/package.json').version")" == "$version" ]]
-          [[ "$(node -p "require('./sdk/js/package.json').version")" == "$version" ]]
-          for manifest in npm/platforms/*/package.json; do
-            [[ "$(node -p "require('./$manifest').version")" == "$version" ]]
-          done
-          npm ci
-          npm run build --workspace @premierstudio/trace
-
-          cp LICENSE packages/premier-cli/LICENSE
-          cp LICENSE sdk/js/LICENSE
-          for directory in npm/platforms/*; do
-            cp LICENSE "$directory/LICENSE"
-          done
-
-          stage_platform() {
-            target="$1"
-            directory="$2"
-            package_root="premier-$version-$target"
-            archive="release-assets/$package_root.tar.gz"
-            destination="npm/platforms/$directory/bin/premier"
-            [[ -f "$archive" ]]
-            mkdir -p "$(dirname "$destination")"
-            tar -xOf "$archive" "$package_root/bin/premier" > "$destination"
-            chmod 0755 "$destination"
-          }
-
-          stage_platform aarch64-apple-darwin darwin-arm64
-          stage_platform x86_64-apple-darwin darwin-x64
-          stage_platform aarch64-unknown-linux-gnu linux-arm64-gnu
-          stage_platform x86_64-unknown-linux-gnu linux-x64-gnu
+          node scripts/check-release-versions.mjs "$version"
+          ./scripts/stage-npm-packages.sh --version "$version" --assets release-assets
+          # Packs each package (dry run), checks what would be uploaded and
+          # each binary's format and size, and runs the package for this host.
+          node scripts/verify-staged-npm.mjs --version "$version"
+          [[ -f "npm-sdk/premierstudio-trace-$version.tgz" ]] || { echo "::error::the SDK tarball for $version is missing"; exit 1; }
       - name: Publish npm packages through OIDC with provenance
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          # A prerelease (1.2.0-rc.1) must not become the version installed by default.
+          dist_tag=latest
+          [[ "$version" == *-* ]] && dist_tag=next
 
           publish_if_missing() {
             package="$1"
-            directory="$2"
+            source="$2"
             if npm view "$package@$version" version >/dev/null 2>&1; then
               echo "$package@$version already exists; skipping"
             else
-              # ./-prefix so npm parses the argument as a directory, never as a
+              # ./-prefix so npm parses the argument as a path, never as a
               # github:<owner>/<repo> shorthand (npm 12 refuses git specs).
-              npm publish "./$directory" --access public --provenance
+              npm publish "./$source" --access public --provenance --tag "$dist_tag"
             fi
           }
 
@@ -202,5 +249,15 @@ jobs:
           publish_if_missing @premierstudio/premier-darwin-x64 npm/platforms/darwin-x64
           publish_if_missing @premierstudio/premier-linux-arm64-gnu npm/platforms/linux-arm64-gnu
           publish_if_missing @premierstudio/premier-linux-x64-gnu npm/platforms/linux-x64-gnu
-          publish_if_missing @premierstudio/trace sdk/js
+          publish_if_missing @premierstudio/trace "npm-sdk/premierstudio-trace-$version.tgz"
           publish_if_missing @premierstudio/premier packages/premier-cli
+      - name: Publish the GitHub release now that npm has every package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

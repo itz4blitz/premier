@@ -4,7 +4,22 @@ export interface JournalFile {
   event_count: number;
 }
 
-export type IntegrityStatus = 'live' | 'verified' | 'invalid';
+/**
+ * `abandoned`: no finalized journal and the recorder is gone; `premier recover` finalizes it.
+ * `locked`: encrypted, and the server has no usable key; the evidence is sealed, not damaged.
+ */
+export type IntegrityStatus = 'live' | 'abandoned' | 'verified' | 'invalid' | 'locked' | 'unsupported';
+/** What a verified trace is protected by. Only `signed` resists a deliberate rewrite. */
+export type IntegrityProtection = 'digest_only' | 'sealed' | 'signed';
+
+/** Format v2 tamper evidence recorded in the manifest at finalization. */
+export interface ManifestSeal {
+  chain_head: string;
+  event_count: number;
+  recovered?: boolean;
+  digest: string;
+  signature?: { algorithm: string; public_key: string; signature: string };
+}
 
 export interface ProcessTermination {
   kind: 'exit' | 'signal' | 'interrupted';
@@ -37,10 +52,37 @@ export interface TraceManifest {
   artifact?: string;
   integrity?: IntegrityStatus;
   integrity_detail?: string | null;
+  integrity_protection?: IntegrityProtection;
+  /** Fingerprint of the signing key stored in the trace; identifies the signer without vouching for it. */
+  integrity_signer?: string;
+  seal?: ManifestSeal;
   /** Structured recorder termination metadata (available on newer artifacts). */
   termination?: ProcessTermination;
   /** Advisory semantic validation findings; unknown/custom event kinds remain valid. */
   diagnostics?: TraceDiagnostic[];
+  /** What the recorder was told to redact. Values it replaced read `[REDACTED]`. */
+  redaction?: RedactionProvenance | null;
+  /** Public encryption envelope; present when the trace is stored encrypted. */
+  encryption?: unknown;
+}
+
+export interface RedactionProvenance {
+  structured_defaults: boolean;
+  custom_fields?: string[];
+  terminal_literal_count?: number;
+  terminal_regex_count?: number;
+  terminal_multiline_regex_count?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * An entry the server lists but cannot serve events for: encrypted without a usable key, written in
+ * a later format, or damaged beyond reading its manifest. Its `integrity_detail` says which.
+ */
+export function isUnreadable(trace: Pick<TraceManifest, 'integrity' | 'journal' | 'format_version' | 'trace_id'>): boolean {
+  if (trace.integrity === 'locked' || trace.integrity === 'unsupported') return true;
+  return trace.integrity === 'invalid' && trace.journal === null
+    && (trace.format_version === 0 || trace.trace_id.startsWith('damaged:'));
 }
 
 export interface TraceListSummary {
@@ -67,6 +109,8 @@ export interface TraceEvent {
   status: string;
   duration_ms: number;
   links: string[];
+  /** Hash of the previous event's canonical bytes (format v2). */
+  prev_hash?: string;
 }
 
 /**
@@ -90,7 +134,25 @@ export function listKey(trace: Pick<TraceManifest, 'trace_id' | 'artifact'>): st
   return trace.artifact || trace.trace_id;
 }
 
-export type EventCategory = 'all' | 'agent' | 'model' | 'tool' | 'approval' | 'process' | 'error';
+/** The recorder stopped without finalizing this trace. */
+export function isAbandoned(trace: Pick<TraceManifest, 'integrity'>): boolean {
+  return trace.integrity === 'abandoned';
+}
+
+/** Still being written by a running recorder, so there is something to tail. */
+export function isRecording(
+  trace: Pick<TraceManifest, 'ended_at' | 'integrity'> & Partial<Pick<TraceManifest, 'journal' | 'format_version' | 'trace_id'>>
+): boolean {
+  // A locked, unsupported or damaged entry has no end time either, and nothing to tail.
+  const damaged = trace.integrity === 'invalid' && trace.journal === null
+    && (trace.format_version === 0 || Boolean(trace.trace_id?.startsWith('damaged:')));
+  return !trace.ended_at && !isAbandoned(trace)
+    && trace.integrity !== 'locked' && trace.integrity !== 'unsupported' && !damaged;
+}
+
+/** The family a kind is filed under; `other` is every kind the viewer has no tab for. */
+export type EventFamily = 'agent' | 'model' | 'tool' | 'approval' | 'process' | 'other';
+export type EventCategory = 'all' | EventFamily | 'error';
 
 export interface EventFilters {
   search: string;
@@ -106,8 +168,14 @@ export interface AssistantAvailability {
   label: string;
   installed: boolean;
   available: boolean;
+  /** How far the installed CLI is held back while it answers; strongest is `no_tools`. */
+  containment?: AssistantContainment;
+  /** One sentence saying what the CLI can do while it answers. */
+  containment_summary?: string;
   reason?: string;
 }
+
+export type AssistantContainment = 'no_tools' | 'read_only_sandbox' | 'provider_default';
 
 export type AssistantMessageRole = 'user' | 'assistant';
 
@@ -123,8 +191,29 @@ export interface AssistantRequest {
   history?: AssistantHistoryMessage[];
 }
 
+/** Which part of a trace an assistant prompt carries; see `AssistantContext` in premier-cli. */
+export interface AssistantContext {
+  scope: 'run' | 'event';
+  total_events: number;
+  /** Events sent in full: always the newest ones. */
+  included_events: number;
+  first_sequence?: number;
+  last_sequence?: number;
+  selected_sequence?: number;
+  history_messages: number;
+  prompt_chars: number;
+}
+
 export interface AssistantResponse {
   provider: string;
   answer: string;
   elapsed_ms: number;
+  /** What the answer was based on. Absent from servers that predate it. */
+  context?: AssistantContext;
+}
+
+/** The exact prompt a question would send, and what it covers. Nothing is sent to produce it. */
+export interface AssistantPreview {
+  context: AssistantContext;
+  prompt: string;
 }

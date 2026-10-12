@@ -30,35 +30,42 @@ const BRANDS: Record<ProviderBrand, Omit<BrandIdentity, 'brand'>> = {
   unknown: { label: 'Model', color: '#8BA4FF' }
 };
 
+/**
+ * Whole-word patterns, tried in order. Names are matched as words (`llama`, not the tail of
+ * `ollama`; `meta`, not the head of `metadata`), and a host such as Ollama, Bedrock or Vertex is
+ * never taken for the maker of the model it serves: the model name decides first.
+ */
+/** A family name as a word; a version may follow it directly (`llama3`, `gemma2`), letters may not. */
+const names = (...list: string[]) => new RegExp(`\\b(?:${list.join('|')})(?![a-z])`);
+const MODEL_PATTERNS: Array<[ProviderBrand, RegExp]> = [
+  ['anthropic', names('anthropic', 'claude', 'sonnet', 'opus', 'haiku')],
+  ['openai', new RegExp(`${names('openai', 'chatgpt', 'davinci', 'whisper', 'codex', 'gpt').source}|\\bo[134](?![a-z0-9])`)],
+  ['xai', names('xai', 'grok', 'spacexai')],
+  ['google', names('google', 'gemini', 'gemma', 'bard', 'palm')],
+  ['meta', names('meta', 'facebook', 'llama', 'codellama')],
+  ['mistral', names('mistral', 'mixtral', 'codestral', 'ministral', 'pixtral')],
+  ['amazon', names('amazon', 'titan', 'nova')],
+  ['cohere', names('cohere', 'command ?r')]
+];
+/** Hosts that only decide when the model name names no maker. */
+const HOST_PATTERNS: Array<[ProviderBrand, RegExp]> = [
+  ['google', names('vertex')],
+  ['amazon', names('bedrock')]
+];
+
+function matchBrand(text: string, patterns: Array<[ProviderBrand, RegExp]>): ProviderBrand | null {
+  // Separators become spaces so `claude-3`, `meta/llama` and `gpt_4` all present whole words.
+  const words = text.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+  return patterns.find(([, pattern]) => pattern.test(words))?.[0] ?? null;
+}
+
 export function resolveProviderBrand(
   provider?: string | null,
   model?: string | null
 ): BrandIdentity {
-  const haystack = `${provider ?? ''} ${model ?? ''}`.toLowerCase();
-
-  if (/anthropic|claude|sonnet|opus|haiku/.test(haystack)) {
-    return { brand: 'anthropic', ...BRANDS.anthropic };
-  }
-  if (/openai|gpt|o1|o3|o4|codex|chatgpt|davinci|whisper/.test(haystack)) {
-    return { brand: 'openai', ...BRANDS.openai };
-  }
-  if (/\bxai\b|grok|spacexai/.test(haystack)) {
-    return { brand: 'xai', ...BRANDS.xai };
-  }
-  if (/google|gemini|bard|palm|vertex/.test(haystack)) {
-    return { brand: 'google', ...BRANDS.google };
-  }
-  if (/meta|llama|llama-?3|facebook/.test(haystack)) {
-    return { brand: 'meta', ...BRANDS.meta };
-  }
-  if (/mistral|mixtral|codestral/.test(haystack)) {
-    return { brand: 'mistral', ...BRANDS.mistral };
-  }
-  if (/amazon|bedrock|titan|nova/.test(haystack)) {
-    return { brand: 'amazon', ...BRANDS.amazon };
-  }
-  if (/cohere|command-?r/.test(haystack)) {
-    return { brand: 'cohere', ...BRANDS.cohere };
-  }
-  return { brand: 'unknown', ...BRANDS.unknown };
+  const brand = matchBrand(model ?? '', MODEL_PATTERNS)
+    ?? matchBrand(provider ?? '', MODEL_PATTERNS)
+    ?? matchBrand(`${provider ?? ''} ${model ?? ''}`, HOST_PATTERNS)
+    ?? 'unknown';
+  return { brand, ...BRANDS[brand] };
 }

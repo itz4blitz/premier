@@ -2,7 +2,8 @@
   import { onDestroy, onMount } from 'svelte';
   import type { TraceEvent } from './types';
   import { eventPayload } from './types';
-  import { actorId, categoryOf, eventSummary } from './analysis';
+  import { actorId, categoryOf, eventSummary, isIssue } from './analysis';
+  import { payloadModel, payloadProvider, payloadTool } from './nativePayload';
   import { relatedSummary, resolveRelatedTarget } from './causal';
   import { parseInvestigationParams, serializeInvestigationUrl } from './deepLink';
   import EvidenceValue from './EvidenceValue.svelte';
@@ -69,10 +70,45 @@
   ];
 
   const relations = $derived(event ? relatedSummary(event, events) : null);
-  const causalCount = $derived(event
-    ? [event.parent_event_id, event.span_id, event.parent_span_id, event.correlation_id, ...event.links].filter(Boolean).length
-      + (relations?.children.length ?? 0)
+  const maxCorrelatedRows = 8;
+  /** Correlation peers that are not already listed as the parent, a child, or a link. */
+  const correlated = $derived.by(() => {
+    if (!relations) return [];
+    const shown = new Set([
+      relations.parent.found?.event_id,
+      ...relations.children.map((child) => child.event_id),
+      ...relations.links.map((link) => link.found?.event_id),
+      ...relations.linkedFrom.map((source) => source.event_id)
+    ]);
+    return relations.peers.filter((peer) => !shown.has(peer.event_id));
+  });
+  /** Relations the user can open: each is a recorded event, not an identifier field. */
+  const causalCount = $derived(relations
+    ? (relations.parent.found ? 1 : 0)
+      + relations.children.length
+      + correlated.length
+      + relations.linkedFrom.length
+      + relations.links.filter((link) => link.found).length
     : 0);
+  /** Identifiers worth listing even when none of them resolves to another event. */
+  const hasIdentifiers = $derived(Boolean(event
+    && [event.parent_event_id, event.span_id, event.parent_span_id, event.correlation_id, ...event.links].some(Boolean)));
+  /** Above this the Raw tab shows the head of the text; the whole value stays one click or copy away. */
+  const rawLimit = 200_000;
+  let rawExpanded = $state(false);
+  // Only the Raw tab pays for serializing the payload and envelope.
+  const rawPayload = $derived(activeTab === 'raw' ? JSON.stringify(payload, null, 2) : '');
+  const rawEnvelope = $derived(activeTab === 'raw' && event ? JSON.stringify({ ...event, payload_json: undefined }, null, 2) : '');
+
+  function bounded(text: string): string {
+    return rawExpanded || text.length <= rawLimit ? text : `${text.slice(0, rawLimit)}\n…`;
+  }
+
+  /** A producer timestamp is stored as given; one that is not a date is shown as it was recorded. */
+  function observedAt(current: TraceEvent): string {
+    const parsed = Date.parse(current.timestamp);
+    return Number.isFinite(parsed) ? new Date(parsed).toLocaleTimeString() : (current.timestamp.trim() || 'at an unrecorded time');
+  }
 
   function tabCount(tab: Tab): number | null {
     if (tab === 'data') return entries.length;
@@ -80,10 +116,14 @@
     return null;
   }
 
+  /** The event a relation was followed to; arriving there keeps the tab the user is hopping in. */
+  let followedTo: string | null = null;
   $effect(() => {
     if (event?.event_id) {
-      activeTab = 'overview';
+      if (event.event_id !== followedTo) activeTab = 'overview';
+      followedTo = null;
       copied = null;
+      rawExpanded = false;
     }
   });
 
@@ -104,6 +144,9 @@
   function eventTitle(current: TraceEvent): string {
     const named = payload.tool_name ?? payload.tool ?? payload.model ?? payload.operation ?? payload.action ?? payload.name ?? payload.task ?? payload.goal;
     if (typeof named === 'string' && named.trim()) return named;
+    // Adapter events keep the provider object under payload.native.
+    const nativeNamed = current.kind.startsWith('tool.') ? payloadTool(payload) : current.kind.startsWith('model.') ? payloadModel(payload) : null;
+    if (nativeNamed) return nativeNamed;
     return current.kind.replace(/[._-]+/g, ' ');
   }
 
@@ -128,6 +171,7 @@
     const result = resolveRelatedTarget(events, id);
     if (result.found) {
       relatedMissing = null;
+      followedTo = result.found.event_id;
       onnavigate?.(result.found.event_id);
     } else {
       relatedMissing = id;
@@ -145,7 +189,7 @@
   }
 
   function eventFamilyIcon(current: TraceEvent) {
-    if (['error', 'failed', 'denied'].includes(current.status) || current.kind.endsWith('.error')) return CircleAlert;
+    if (isIssue(current)) return CircleAlert;
     const family = eventFamily(current);
     if (family === 'agent') return Bot;
     if (family === 'model') return Sparkles;
@@ -296,8 +340,8 @@
     >
       {#if activeTab === 'overview'}
         {@const FamilyIcon = eventFamilyIcon(event)}
-        {@const modelProvider = typeof payload.provider === 'string' ? payload.provider : typeof payload.vendor === 'string' ? payload.vendor : null}
-        {@const modelName = typeof payload.model === 'string' ? payload.model : typeof payload.model_id === 'string' ? payload.model_id : null}
+        {@const modelProvider = payloadProvider(payload)}
+        {@const modelName = payloadModel(payload)}
         <section class="hero-summary" aria-label="Event summary">
           <div class="summary-heading">
             <span class="category-mark" data-category={eventFamily(event)}>
@@ -314,7 +358,7 @@
           <p>{eventDescription(event)}</p>
           <div class="summary-facts">
             <div><UserRound size={15} strokeWidth={1.8} aria-hidden="true" /><span>Actor</span><strong>{actorId(event)}</strong><small>{event.actor_type || 'process'}</small></div>
-            <div><Clock3 size={15} strokeWidth={1.8} aria-hidden="true" /><span>Duration</span><strong>{durationLabel(event)}</strong><small>Observed {new Date(event.timestamp).toLocaleTimeString()}</small></div>
+            <div><Clock3 size={15} strokeWidth={1.8} aria-hidden="true" /><span>Duration</span><strong>{durationLabel(event)}</strong><small>Observed {observedAt(event)}</small></div>
             <div><Radio size={15} strokeWidth={1.8} aria-hidden="true" /><span>Source</span><strong>{event.source || 'Unknown'}</strong><small>Capture producer</small></div>
             <div><Fingerprint size={15} strokeWidth={1.8} aria-hidden="true" /><span>Sequence</span><strong>Event {event.sequence}</strong><small>Recorded order</small></div>
           </div>
@@ -355,10 +399,10 @@
           </section>
         {/if}
 
-        {#if causalCount}
+        {#if causalCount || hasIdentifiers}
           <section class="evidence-section overview-relations">
             <div class="section-title">
-              <h3><GitBranch size={14} aria-hidden="true" />Trace context <b>{causalCount}</b></h3>
+              <h3><GitBranch size={14} aria-hidden="true" />Trace context {#if causalCount}<b title="Related events you can open">{causalCount}</b>{/if}</h3>
               <button class="text-action" onclick={() => (activeTab = 'relationships')}>Explore <ChevronRight size={14} aria-hidden="true" /></button>
             </div>
             <dl class="field-list causal-list">
@@ -387,19 +431,20 @@
           {#if relatedMissing}
             <div class="relation-missing" role="status"><strong>Not in journal</strong><span>No event matches <code>{relatedMissing}</code>. The reference may be outside this trace or never recorded.</span></div>
           {/if}
-          {#if causalCount || relations?.children.length}
+          {#if causalCount || hasIdentifiers}
           <dl class="field-list causal-list">
             <div><dt>Event ID</dt><dd><code>{event.event_id}</code></dd></div>
-            {#if event.parent_event_id}
+            {#if relations?.parent.reference}
+              {@const parent = relations.parent}
               <div>
                 <dt>Parent event</dt>
                 <dd>
-                  {#if relations?.missingParent}
-                    <span class="missing-ref"><code>{event.parent_event_id}</code><em>not in journal</em></span>
+                  {#if !parent.found}
+                    <span class="missing-ref"><code>{parent.reference}</code><em>{parent.via === 'span' ? 'span not in journal' : 'not in journal'}</em></span>
                   {:else if onnavigate}
-                    <button class="evidence-link" onclick={() => openRelated(event.parent_event_id)}><code>{event.parent_event_id}</code><span>Open <ChevronRight size={14} aria-hidden="true" /></span></button>
+                    <button class="evidence-link" onclick={() => openRelated(parent.found!.event_id)}><code>{parent.found.event_id}</code><span>{parent.via === 'span' ? `${parent.found.kind} · via span ${parent.reference}` : 'Open'} <ChevronRight size={14} aria-hidden="true" /></span></button>
                   {:else}
-                    <code>{event.parent_event_id}</code>
+                    <code>{parent.found.event_id}</code>
                   {/if}
                 </dd>
               </div>
@@ -420,6 +465,15 @@
             {/if}
             {#each relations?.children ?? [] as child}
               <div><dt>Child event</dt><dd>{#if onnavigate}<button class="evidence-link" onclick={() => openRelated(child.event_id)}><code>{child.event_id}</code><span>{child.kind} <ChevronRight size={14} aria-hidden="true" /></span></button>{:else}<code>{child.event_id}</code>{/if}</dd></div>
+            {/each}
+            {#each correlated.slice(0, maxCorrelatedRows) as peer}
+              <div><dt>Correlated event</dt><dd>{#if onnavigate}<button class="evidence-link" onclick={() => openRelated(peer.event_id)}><code>{peer.event_id}</code><span>{peer.kind} <ChevronRight size={14} aria-hidden="true" /></span></button>{:else}<code>{peer.event_id}</code>{/if}</dd></div>
+            {/each}
+            {#if correlated.length > maxCorrelatedRows}
+              <div><dt>Correlated</dt><dd><span class="missing-ref">{correlated.length - maxCorrelatedRows} more share this correlation. Use Filter to list them all.</span></dd></div>
+            {/if}
+            {#each relations?.linkedFrom ?? [] as source}
+              <div><dt>Linked from</dt><dd>{#if onnavigate}<button class="evidence-link" onclick={() => openRelated(source.event_id)}><code>{source.event_id}</code><span>{source.kind} <ChevronRight size={14} aria-hidden="true" /></span></button>{:else}<code>{source.event_id}</code>{/if}</dd></div>
             {/each}
             {#each event.links as link}
               <div>
@@ -444,12 +498,21 @@
       {:else}
         <section class="evidence-section raw-section">
           <div class="section-title"><h3><Braces size={14} aria-hidden="true" />Decoded payload</h3><button class="text-action" onclick={() => writeClipboard(JSON.stringify(payload, null, 2), 'payload')}>{#if copied === 'payload'}<Check size={14} aria-hidden="true" />Copied{:else}<Copy size={14} aria-hidden="true" />Copy payload{/if}</button></div>
-          <pre>{JSON.stringify(payload, null, 2)}</pre>
+          <pre>{bounded(rawPayload)}</pre>
         </section>
         <section class="evidence-section raw-section">
           <div class="section-title"><h3><Code2 size={14} aria-hidden="true" />Event envelope</h3><button class="text-action" onclick={() => writeClipboard(JSON.stringify({ ...event, payload_json: undefined }, null, 2), 'event')}>{#if copied === 'event'}<Check size={14} aria-hidden="true" />Copied{:else}<Copy size={14} aria-hidden="true" />Copy envelope{/if}</button></div>
-          <pre>{JSON.stringify({ ...event, payload_json: undefined }, null, 2)}</pre>
+          <pre>{bounded(rawEnvelope)}</pre>
         </section>
+        {#if !rawExpanded && (rawPayload.length > rawLimit || rawEnvelope.length > rawLimit)}
+          <section class="evidence-section raw-section">
+            <div class="section-empty raw-truncated" role="status">
+              <strong>Showing the first {rawLimit.toLocaleString('en-US')} characters</strong>
+              <span>The payload is {Math.max(rawPayload.length, rawEnvelope.length).toLocaleString('en-US')} characters. Copy still copies all of it.</span>
+              <button class="text-action" onclick={() => (rawExpanded = true)}>Show all</button>
+            </div>
+          </section>
+        {/if}
       {/if}
     </div>
   {:else}
@@ -465,7 +528,7 @@
   .rail-expand, .rail-tabs button { width: 100%; min-height: 48px; display: grid; place-items: center; padding: 0; border: 0; border-bottom: 1px solid #202a39; color: #8492a7; background: transparent; cursor: pointer; }
   .rail-expand:hover, .rail-tabs button:hover { color: white; background: rgba(111,123,247,.12); }
   .rail-status { width: 100%; display: grid; justify-items: center; gap: 4px; padding: 12px 4px; border-bottom: 1px solid #202a39; color: #a7b5c8; }
-  .rail-status[data-status='error'], .rail-status[data-status='failed'], .rail-status[data-status='denied'] { color: #ff8f8b; }
+  .rail-status[data-status='error'], .rail-status[data-status='failed'], .rail-status[data-status='denied'], .rail-status[data-status='rejected'], .rail-status[data-status='blocked'] { color: #ff8f8b; }
   .rail-status b { font: 8px 'IBM Plex Mono', monospace; }
   .rail-tabs { width: 100%; }
   .rail-tabs button.active { color: #c8d5ff; background: rgba(111,123,247,.17); box-shadow: inset -2px 0 var(--blue); }
@@ -497,8 +560,8 @@
   .category-mark[data-category='tool'] { border-color: rgba(240,185,104,.45); color: #f0c784; }
   .category-mark[data-category='model'] { border-color: rgba(198,141,255,.45); color: #d4aaff; }
   .category-mark[data-category='error'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; }
-  .status-badge[data-status='error'], .status-badge[data-status='failed'], .status-badge[data-status='denied'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; background: rgba(255,113,109,.08); }
-  .status-badge[data-status='error'] i, .status-badge[data-status='failed'] i, .status-badge[data-status='denied'] i { background: var(--red); box-shadow: 0 0 8px rgba(255,124,120,.45); }
+  .status-badge[data-status='error'], .status-badge[data-status='failed'], .status-badge[data-status='denied'], .status-badge[data-status='rejected'], .status-badge[data-status='blocked'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; background: rgba(255,113,109,.08); }
+  .status-badge[data-status='error'] i, .status-badge[data-status='failed'] i, .status-badge[data-status='denied'] i, .status-badge[data-status='rejected'] i, .status-badge[data-status='blocked'] i { background: var(--red); box-shadow: 0 0 8px rgba(255,124,120,.45); }
   .status-badge[data-status='ok'], .status-badge[data-status='approved'] { border-color: rgba(95,214,160,.4); color: #91e3bd; background: rgba(95,214,160,.07); }
   .status-badge[data-status='ok'] i, .status-badge[data-status='approved'] i { background: var(--green); box-shadow: 0 0 8px rgba(99,220,165,.35); }
   .hero-summary p { margin: 15px 0 16px; color: #b7c1cf; font-size: 13px; line-height: 1.58; }

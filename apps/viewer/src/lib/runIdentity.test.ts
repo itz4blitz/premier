@@ -79,4 +79,38 @@ describe('deriveRunIdentity', () => {
       source: 'name',
     });
   });
+
+  it.each([
+    [['bash', '-lc', 'deploy --prod']],
+    [['bash', '-l', '-c', 'deploy --prod']],
+    [['/bin/zsh', '-ec', 'deploy --prod']],
+    [['python', '-u', '-c', 'import os']],
+    [['python3.12', '-c', 'import os']],
+    [['C:\\Windows\\System32\\cmd.exe', '/d', '/c', 'deploy --prod']],
+    [['PowerShell.EXE', '-NoProfile', '-Command', 'deploy --prod']],
+    [['env', 'DEPLOY_TOKEN=abc123', 'bash', '-lc', 'deploy --prod']],
+    [['sudo', '-u', 'deploy', 'sh', '-c', 'deploy --prod']],
+    [['timeout', '30s', 'node', '--eval', 'deploy()']],
+  ])('does not expose inline source in %j', (command) => {
+    const identity = deriveRunIdentity(manifest(null, command));
+    expect(identity).toEqual({ title: 'Recorded inline workflow', source: 'fallback' });
+  });
+
+  it('does not mistake a script that takes -c for inline source', () => {
+    expect(deriveRunIdentity(manifest(null, ['bash', '/opt/run.sh', '-c', 'config.yml'])).title).toBe('bash /opt/run.sh -c config.yml');
+    expect(deriveRunIdentity(manifest(null, ['node', 'server.js', '-e', 'prod'])).title).toBe('node server.js -e prod');
+  });
+
+  it('masks credentials passed as arguments and bounds the title', () => {
+    const value = ['hunter', '2-value'].join('');
+    expect(deriveRunIdentity(manifest(null, ['deploy', `--api-key=${value}`, 'prod'])).title).toBe('deploy --api-key=[redacted] prod');
+    expect(deriveRunIdentity(manifest(null, ['deploy', '--token', value, 'prod'])).title).toBe('deploy --token [redacted] prod');
+    expect(deriveRunIdentity(manifest(null, ['env', `DB_PASSWORD=${value}`, 'migrate', 'up'])).title).toBe('env DB_PASSWORD=[redacted] migrate up');
+    expect(deriveRunIdentity(manifest(null, ['git', 'clone', `https://user:${value}@example.test/repo.git`])).title).toBe('git clone https://[redacted]@example.test/repo.git');
+    // Ordinary assignments and flags are left alone.
+    expect(deriveRunIdentity(manifest(null, ['make', 'TARGET=release', '--jobs=4'])).title).toBe('make TARGET=release --jobs=4');
+    const long = deriveRunIdentity(manifest(null, ['agent', 'x'.repeat(200)])).title;
+    expect(long.length).toBe(80);
+    expect(long.endsWith('…')).toBe(true);
+  });
 });

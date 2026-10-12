@@ -9,25 +9,43 @@
     current,
     baselineEvents,
     currentEvents,
-    onselectCurrent = () => undefined
+    onselectCurrent = () => undefined,
+    onselectBaseline = undefined
   }: {
     baseline: TraceManifest;
     current: TraceManifest;
     baselineEvents: TraceEvent[];
     currentEvents: TraceEvent[];
     onselectCurrent?: (event: TraceEvent) => void;
+    /** Open an event of the baseline run. Without it, baseline-side events offer no action. */
+    onselectBaseline?: (event: TraceEvent) => void;
   } = $props();
+
+  /** Rows rendered at once; a comparison of two long, unrelated runs has tens of thousands. */
+  const PAGE = 200;
+  /** Field changes listed before a row is expanded. */
+  const FIELD_PREVIEW = 5;
+  let shown = $state(PAGE);
+  let expanded = $state<Record<string, boolean>>({});
 
   let comparison = $derived(compareTraces(baselineEvents, currentEvents));
   let baselineHealth = $derived(runHealth(baseline, baselineEvents));
   let currentHealth = $derived(runHealth(current, currentEvents));
   let baselineIssues = $derived(baselineEvents.filter(isIssue).length);
   let currentIssues = $derived(currentEvents.filter(isIssue).length);
+  /**
+   * Every item that is not unchanged, in trace order: the list reads the way the runs happened, and
+   * its first row is the first divergence. `ordinal` numbers the rows of one status.
+   */
   let differences = $derived.by(() => {
-    const order = { changed: 0, added: 1, removed: 2, unchanged: 3 } as const;
-    return comparison.items.filter((item) => item.status !== 'unchanged')
-      .sort((a, b) => order[a.status] - order[b.status] || (a.current ?? a.baseline)!.sequence - (b.current ?? b.baseline)!.sequence);
+    const seen: Record<string, number> = {};
+    return comparison.items.filter((item) => item.status !== 'unchanged').map((item) => {
+      const ordinal = seen[item.status] ?? 0;
+      seen[item.status] = ordinal + 1;
+      return { item, ordinal };
+    });
   });
+  let visibleDifferences = $derived(differences.slice(0, shown));
 
   function runName(trace: TraceManifest): string {
     return trace.name?.trim() || trace.summary?.display_name?.trim() || trace.trace_id;
@@ -42,8 +60,20 @@
     if (value === null) return 'null';
     if (typeof value === 'string') return value || 'Empty';
     if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-    const serialized = JSON.stringify(value);
-    return serialized.length > 80 ? `${serialized.slice(0, 77)}…` : serialized;
+    return JSON.stringify(value);
+  }
+
+  /** One line for the collapsed row; the whole value is shown when the row is expanded. */
+  function brief(text: string): string {
+    return text.length > 80 ? `${text.slice(0, 77)}…` : text;
+  }
+
+  /** "baseline #4 → current #6": where the two sides of a row sit in their own runs. */
+  function position(item: ComparisonItem): string {
+    return [
+      item.baseline ? `baseline #${item.baseline.sequence}` : null,
+      item.current ? `current #${item.current.sequence}` : null
+    ].filter(Boolean).join(' → ');
   }
 
   function signed(value: number, unit: string, digits = 0): string {
@@ -70,7 +100,7 @@
 <section class="comparison" aria-label="Trace comparison">
   <header class="comparison-head">
     <div><GitCompareArrows size={15} /><span>Semantic comparison</span></div>
-    <small>Generated IDs, timestamps, and correlation noise are excluded.</small>
+    <small>Events are aligned in order; generated IDs, timestamps, and where output was split are excluded.</small>
   </header>
 
   <div class="run-pair">
@@ -99,8 +129,22 @@
     <div class="changed" aria-label="Changed events"><span>Changed</span><strong>{comparison.counts.changed}</strong></div>
     <div class="added" aria-label="Added events"><span>Added</span><strong>{comparison.counts.added}</strong></div>
     <div class="removed" aria-label="Removed events"><span>Removed</span><strong>{comparison.counts.removed}</strong></div>
+    <div class="moved" aria-label="Moved events"><span>Moved</span><strong>{comparison.counts.moved}</strong></div>
     <div class="unchanged" aria-label="Unchanged events"><span>Unchanged</span><strong>{comparison.counts.unchanged}</strong></div>
   </div>
+
+  {#if comparison.firstDivergence}
+    {@const first = comparison.firstDivergence.item}
+    {@const firstEvent = eventFor(first)}
+    <p class="first-divergence" data-testid="comparison-first-divergence">
+      <b>First divergence</b>
+      <span>{first.status} · {firstEvent.kind} · {firstEvent.actor_id || 'root'}</span>
+      <small>{position(first)}{#if first.changes[0]} · <code>{first.changes[0].field}</code>{/if}</small>
+    </p>
+  {/if}
+  {#if comparison.alignment === 'per_key'}
+    <p class="first-divergence">These traces differ in too many places to align in order; events were paired per kind and actor, and order was not compared.</p>
+  {/if}
 
   {#if baselineEvents.length === 0 && currentEvents.length === 0}
     <div class="empty-state">
@@ -112,43 +156,55 @@
     <div class="empty-state success">
       <Check size={22} />
       <strong>No meaningful differences</strong>
-      <p>Semantic evidence matches; generated IDs and ordering noise are ignored.</p>
+      <p>Semantic evidence matches, in the same order; generated IDs are ignored.</p>
     </div>
   {:else}
     <div class="difference-list" aria-label="Meaningful differences">
       <header><span>Evidence changes</span><small>{differences.length} difference{differences.length === 1 ? '' : 's'}</small></header>
-      {#each differences as item, index (item.key)}
+      {#each visibleDifferences as { item, ordinal } (item.key)}
         {@const event = eventFor(item)}
-        <article class="difference" data-status={item.status} data-testid={`comparison-${item.status}-${index}`}>
+        {@const open = Boolean(expanded[item.key])}
+        <article class="difference" data-status={item.status} data-testid={`comparison-${item.status}-${ordinal}`}>
           <div class="difference-main">
             <div class="status-icon" aria-hidden="true">
               {#if item.status === 'added'}<CirclePlus size={15} />{:else if item.status === 'removed'}<CircleMinus size={15} />{:else}<GitCompareArrows size={15} />{/if}
             </div>
             <div class="event-copy">
-              <span><b>{item.status}</b><em>{event.actor_id || 'root'}</em></span>
+              <span><b>{item.status}</b><em>{event.actor_id || 'root'}</em><i class="position">{position(item)}</i></span>
               <strong>{event.kind}</strong>
               <small>{eventSummary(event)}</small>
             </div>
-            {#if item.current}
-              <button type="button" onclick={() => onselectCurrent(item.current!)} aria-label={`Inspect current event ${item.current.kind}`}>
-                Inspect <ArrowRight size={13} />
-              </button>
-            {/if}
+            <div class="row-actions">
+              {#if item.baseline && onselectBaseline}
+                <button type="button" onclick={() => onselectBaseline!(item.baseline!)} aria-label={`Open baseline event #${item.baseline.sequence} ${item.baseline.kind} in the baseline run`}>
+                  Baseline <ArrowRight size={13} />
+                </button>
+              {/if}
+              {#if item.current}
+                <button type="button" onclick={() => onselectCurrent(item.current!)} aria-label={`Inspect current event ${item.current.kind}`}>
+                  Inspect <ArrowRight size={13} />
+                </button>
+              {/if}
+            </div>
           </div>
 
           {#if item.changes.length || item.deltas.durationMs || item.deltas.totalTokens || item.deltas.costUsd}
             <div class="change-detail">
               {#if item.changes.length}
                 <div class="fields">
-                  {#each item.changes.slice(0, 5) as change (change.field)}
-                    <div class="field">
+                  {#each open ? item.changes : item.changes.slice(0, FIELD_PREVIEW) as change (change.field)}
+                    <div class="field" class:full={open}>
                       <code>{change.field}</code>
-                      <span title={value(change.before)}>{value(change.before)}</span>
+                      <span title={value(change.before)}>{open ? value(change.before) : brief(value(change.before))}</span>
                       <ArrowRight size={11} />
-                      <span title={value(change.after)}>{value(change.after)}</span>
+                      <span title={value(change.after)}>{open ? value(change.after) : brief(value(change.after))}</span>
                     </div>
                   {/each}
-                  {#if item.changes.length > 5}<small class="more">+{item.changes.length - 5} more field changes</small>{/if}
+                  {#if item.changes.length > FIELD_PREVIEW || item.changes.some((change) => value(change.before).length > 80 || value(change.after).length > 80)}
+                    <button type="button" class="more" aria-expanded={open} onclick={() => expanded = { ...expanded, [item.key]: !open }}>
+                      {#if open}Show less{:else if item.changes.length > FIELD_PREVIEW}Show all {item.changes.length} field changes{:else}Show full values{/if}
+                    </button>
+                  {/if}
                 </div>
               {/if}
               <div class="delta-list" aria-label="Operational deltas">
@@ -160,6 +216,11 @@
           {/if}
         </article>
       {/each}
+      {#if differences.length > shown}
+        <button type="button" class="show-more" onclick={() => shown += PAGE}>
+          Show {Math.min(PAGE, differences.length - shown)} more of {differences.length - shown} remaining differences
+        </button>
+      {/if}
     </div>
   {/if}
 </section>
@@ -182,7 +243,10 @@
   .run-metrics span[data-tone='warning'] { color: #efbc70; }
   .run-metrics small { display: inline-flex; align-items: center; gap: 3px; color: #7e8ca0; font-size: 9px; }
   .run-metrics small.issue { color: #ea918d; }
-  .counts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid #202a3a; }
+  .counts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid #202a3a; }
+  .first-divergence { margin: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 12px; border-bottom: 1px solid #202a3a; color: #cfd9e8; font-size: 12px; }
+  .first-divergence b { color: #f1be73; font-size: 11px; }
+  .first-divergence small { color: #8493a8; font-size: 11px; }
   .counts > div { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 6px; padding: 8px 12px; border-left: 1px solid #202a3a; }
   .counts > div:first-child { border-left: 0; }
   .counts span { color: #78879b; font-size: 9px; font-weight: 700; }
@@ -190,6 +254,7 @@
   .counts .changed strong { color: #f1be73; }
   .counts .added strong { color: #74d8a8; }
   .counts .removed strong { color: #ff8b86; }
+  .counts .moved strong { color: #8fb7f5; }
   .empty-state { min-height: 145px; display: grid; place-items: center; align-content: center; gap: 7px; padding: 24px; color: #738299; text-align: center; }
   .empty-state strong { color: #cbd5e4; font-size: 12px; }
   .empty-state p { max-width: 420px; margin: 0; color: #718096; font-size: 10px; line-height: 1.45; }
@@ -221,7 +286,12 @@
   .field code { overflow: hidden; color: #8394b0; font: 8.5px/1.3 'IBM Plex Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
   .field span { overflow: hidden; padding: 2px 5px; color: #9aa8bb; border-radius: 4px; background: #121a26; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
   .field :global(svg) { color: #53637a; }
-  .more { color: #68778d; font-size: 8px; }
+  .field.full { align-items: start; }
+  .field.full span { overflow: visible; white-space: pre-wrap; overflow-wrap: anywhere; text-overflow: clip; }
+  .fields .more { justify-self: start; min-height: 22px; margin-top: 2px; padding: 0 7px; font-size: 9px; }
+  .row-actions { display: inline-flex; align-items: center; gap: 6px; }
+  .event-copy .position { color: #8493a8; font: 9px 'IBM Plex Mono', monospace; font-style: normal; }
+  .show-more { justify-content: center; width: calc(100% - 24px); margin: 10px 12px; min-height: 32px; font-size: 10px; }
   .delta-list { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
   .delta-list span { padding: 3px 6px; color: #7edbac; border: 1px solid rgba(93,205,154,.25); border-radius: 999px; background: rgba(93,205,154,.07); font-size: 8px; font-weight: 750; white-space: nowrap; }
   .delta-list span[data-tone='worse'] { color: #f1bd70; border-color: rgba(241,189,112,.27); background: rgba(241,189,112,.07); }
@@ -245,7 +315,8 @@
     .direction :global(svg) { transform: rotate(90deg); }
     .run-summary > strong { white-space: normal; overflow-wrap: anywhere; }
     .difference-main { grid-template-columns: auto minmax(0, 1fr); }
-    .difference-main button { grid-column: 1 / -1; justify-content: center; width: 100%; }
+    .row-actions { grid-column: 1 / -1; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; }
+    .row-actions button { justify-content: center; width: 100%; }
     .field { grid-template-columns: minmax(72px, .7fr) minmax(0, 1fr); }
     .field :global(svg) { display: none; }
     .field span:last-child { grid-column: 2; }

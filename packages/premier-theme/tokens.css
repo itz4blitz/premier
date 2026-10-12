@@ -28,6 +28,9 @@
   --accent: #6f7bf7;
   --accent-strong: #9eaaff;
   --accent-deep: #4f5bd5;
+  /* Fill behind white text: 5.5:1, where --accent gives 3.6:1. */
+  --accent-solid: var(--accent-deep);
+  --accent-solid-hover: #434ec0;
   --accent-soft: rgba(111, 123, 247, .15);
   --accent-glow: rgba(111, 123, 247, .28);
   --accent-focus: #aab4ff;
@@ -44,6 +47,8 @@
   --shadow-overlay: 0 24px 80px rgba(0, 0, 0, .58), 0 0 0 1px rgba(255,255,255,.035);
 }
 
+/* The theme is dark only: tell the browser, so form controls, scrollbars and the canvas match it. */
+:root { color-scheme: dark; }
 * { box-sizing: border-box; }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
@@ -123,14 +128,15 @@ button:focus-visible { position: relative; z-index: 1; }
   color: white;
   background: #171f2c;
 }
+/* White text needs 4.5:1. On --accent it is 3.6:1; on --accent-solid it is 5.5:1. */
 .action-primary {
   border-color: var(--blue);
   color: white;
-  background: var(--blue);
+  background: var(--accent-solid);
 }
 .action-primary:hover {
   border-color: var(--blue-strong);
-  background: var(--accent-deep);
+  background: var(--accent-solid-hover);
   color: white;
 }
 .action-button:disabled, .action-primary:disabled {
@@ -188,7 +194,7 @@ button:focus-visible { position: relative; z-index: 1; }
   top: 0;
   z-index: 100;
   padding: 10px 14px;
-  background: var(--blue);
+  background: var(--accent-solid);
   color: white;
   font-weight: 700;
 }

@@ -55,6 +55,28 @@ describe('TraceList', () => {
     expect(screen.getByText('Live repair')).toBeInTheDocument();
   });
 
+  it('shows an abandoned recording as abandoned, never as live', async () => {
+    const live = { ...trace, trace_id: 'live', name: 'Live repair', ended_at: null, exit_code: null, integrity: 'live' as const };
+    const abandoned = {
+      ...trace, trace_id: 'gone', name: 'Crashed repair', ended_at: null, exit_code: null, integrity: 'abandoned' as const,
+      integrity_detail: 'The recorder is no longer running. Run `premier recover /traces/gone.atrace` to finalize this trace.'
+    };
+    render(TraceList, { props: { traces: [live, abandoned], selectedId: null, onselect: vi.fn() } });
+    const row = screen.getByRole('button', { name: /Crashed repair/ });
+    expect(row).toHaveTextContent('Abandoned — run premier recover');
+    expect(row).not.toHaveTextContent(/Live|Running/);
+    expect(row).toHaveAccessibleName(/Abandoned/);
+    expect(row.querySelector('.abandoned-badge')).toHaveAttribute('title', abandoned.integrity_detail);
+    expect(screen.getByRole('button', { name: /Live repair/ })).toHaveTextContent('Live');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Live' }));
+    expect(screen.getByText('Live repair')).toBeInTheDocument();
+    expect(screen.queryByText('Crashed repair')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Issues' }));
+    expect(screen.getByText('Crashed repair')).toBeInTheDocument();
+    expect(screen.queryByText('Live repair')).not.toBeInTheDocument();
+  });
+
   it('supports arrow-key run navigation', async () => {
     const onselect = vi.fn();
     const second = { ...trace, trace_id: 'trace-2', name: 'Second run' };
@@ -79,5 +101,63 @@ describe('TraceList', () => {
     expect(container.querySelector('.run-list-header')).toBeNull();
     await userEvent.click(run);
     expect(onselect).toHaveBeenCalledWith(trace);
+  });
+
+  it('shows why a locked, unsupported or damaged entry cannot be opened, and never calls it live', async () => {
+    const unreadable = { ...trace, format_version: 0, ended_at: null, exit_code: null, journal: null, summary: undefined };
+    const locked = { ...unreadable, trace_id: 'locked:sealed.atrace', artifact: 'sealed.atrace', name: 'Sealed run', integrity: 'locked' as const, integrity_detail: 'This trace is encrypted and premier was started without --key-file.' };
+    const newer = { ...unreadable, trace_id: 'unsupported:next.atrace', artifact: 'next.atrace', name: 'Next run', integrity: 'unsupported' as const, integrity_detail: 'Format version 9; this build reads 1 and 2.' };
+    const damaged = { ...unreadable, trace_id: 'damaged:broken.atrace', artifact: 'broken.atrace', name: 'Broken run', integrity: 'invalid' as const, integrity_detail: 'manifest.json is not valid JSON.' };
+    render(TraceList, { props: { traces: [locked, newer, damaged], selectedId: null, onselect: vi.fn() } });
+
+    for (const [name, badge, detail] of [
+      ['Sealed run', 'Locked', locked.integrity_detail],
+      ['Next run', 'Newer format', newer.integrity_detail],
+      ['Broken run', 'Damaged', damaged.integrity_detail]
+    ]) {
+      const row = screen.getByRole('button', { name: new RegExp(name) });
+      expect(row.querySelector('.abandoned-badge')).toHaveTextContent(badge);
+      expect(row.querySelector('.live-badge')).toBeNull();
+      // The reason is text on the row, not only a hover title.
+      expect(row.querySelector('.run-reason')).toHaveTextContent(detail);
+      expect(row).not.toHaveTextContent(/\bLive\b|Running/);
+    }
+    expect(screen.getByRole('button', { name: /Broken run/ })).toHaveAccessibleName(/Damaged/);
+    await userEvent.click(screen.getByRole('button', { name: 'Live' }));
+    expect(screen.getByRole('status')).toHaveTextContent('No live runs');
+  });
+
+  it('never shows a run that was signalled, interrupted or ended without a status as passed', () => {
+    const rows: Array<[string, Partial<TraceManifest>, string]> = [
+      ['signalled', { exit_code: null, termination: { kind: 'signal', signal: 15, signal_name: 'SIGTERM' } }, 'Failed'],
+      ['interrupted', { exit_code: null, termination: { kind: 'interrupted' } }, 'Interrupted'],
+      ['statusless', { exit_code: null }, 'Unknown'],
+      ['clean', {}, 'Passed']
+    ];
+    render(TraceList, {
+      props: {
+        traces: rows.map(([name, overrides]) => ({ ...trace, trace_id: name, artifact: `${name}.atrace`, name, ...overrides })),
+        selectedId: null,
+        onselect: vi.fn()
+      }
+    });
+    for (const [name, , label] of rows) {
+      const row = screen.getByRole('button', { name: new RegExp(`^${name}\\.`) });
+      expect(row.querySelector('.run-outcome'), name).toHaveTextContent(label);
+      if (label !== 'Passed') expect(row.querySelector('.run-outcome'), name).not.toHaveAttribute('data-tone', 'success');
+    }
+    // The Issues filter keeps every run that did not pass.
+    expect(screen.getAllByRole('button', { name: /\.atrace|events\.$/ }).length).toBeGreaterThan(0);
+  });
+
+  it('shows the open run the outcome its header shows', () => {
+    // The summary counts no issue, but the loaded events hold a pending approval.
+    const props = { traces: [{ ...trace, artifact: 'one.atrace' }, { ...trace, trace_id: 'trace-2', artifact: 'two.atrace', name: 'Other run' }], onselect: vi.fn() };
+    render(TraceList, { props: { ...props, selectedId: 'one.atrace', selectedHealth: { label: 'Awaiting approval', tone: 'warning', detail: '1 pending decision' } } });
+    const open = screen.getByRole('button', { name: /npm test/i });
+    expect(open.querySelector('.run-outcome')).toHaveTextContent('Awaiting approval');
+    expect(open).toHaveAccessibleName(expect.stringContaining('Awaiting approval'));
+    // Other rows keep their own outcome.
+    expect(screen.getByRole('button', { name: /Other run/i }).querySelector('.run-outcome')).toHaveTextContent('Passed');
   });
 });

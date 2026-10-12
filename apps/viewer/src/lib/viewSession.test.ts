@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearViewSession, readViewSession, writeViewSession } from './viewSession';
 import type { TraceEvent, TraceManifest } from './types';
 
@@ -72,5 +72,34 @@ describe('viewSession', () => {
     parsed.savedAt = Date.now() - 31 * 60 * 1000;
     sessionStorage.setItem('premier.viewer.session.v1', JSON.stringify(parsed));
     expect(readViewSession('trace-a')).toBeNull();
+  });
+
+  it('marks a snapshot that holds only the head of a long run', () => {
+    const journal = Array.from({ length: 2_600 }, (_, index) => ({ ...event, event_id: `e${index}`, sequence: index + 1 }));
+    writeViewSession({ traces: [trace], selectedTrace: trace, events: journal, selectedSequence: null });
+    const hit = readViewSession('trace-a');
+    expect(hit?.events).toHaveLength(2_500);
+    expect(hit?.truncated).toBe(true);
+    writeViewSession({ traces: [trace], selectedTrace: trace, events: [event], selectedSequence: null });
+    expect(readViewSession('trace-a')?.truncated).toBe(false);
+  });
+
+  it('does not write the events of an encrypted trace to browser storage', () => {
+    const encrypted = { ...trace, encryption: { algorithm: 'xchacha20-poly1305' } };
+    writeViewSession({ traces: [encrypted], selectedTrace: encrypted, events: [{ ...event, payload_json: '{"secret":"plaintext"}' }], selectedSequence: 4 });
+    expect(sessionStorage.getItem('premier.viewer.session.v1')).not.toContain('plaintext');
+    expect(readViewSession('trace-a')).toMatchObject({ events: [], truncated: true });
+  });
+
+  it('drops the previous snapshot when a write fails', () => {
+    writeViewSession({ traces: [trace], selectedTrace: trace, events: [event], selectedSequence: 4 });
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('full', 'QuotaExceededError'); });
+    try {
+      writeViewSession({ traces: [trace], selectedTrace: { ...trace, trace_id: 'trace-b' }, events: [event], selectedSequence: 4 });
+    } finally {
+      setItem.mockRestore();
+    }
+    // The older run must not come back on reload as if it were the one last opened.
+    expect(readViewSession()).toBeNull();
   });
 });

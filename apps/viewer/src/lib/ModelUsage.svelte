@@ -31,6 +31,15 @@
     hasCost: total.hasCost || row.hasCost
   }), { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, tokens: 0, cost: 0, hasInput: false, hasOutput: false, hasCache: false, hasReasoning: false, hasTokens: false, hasCost: false }));
 
+  /** Calls that reported the figure a total is made of; a total over fewer than all of them is partial. */
+  const withTokens = $derived(usage.calls.filter((call) => call.tokens.total !== null).length);
+  const withCost = $derived(usage.calls.filter((call) => call.costUsd !== null).length);
+
+  function coverage(reported: number, what: string, complete: string): string {
+    if (reported === 0) return `No call reported ${what}`;
+    return reported < usage.calls.length ? `${reported} of ${usage.calls.length} calls reported ${what}` : complete;
+  }
+
   function tokens(value: number, captured: boolean): string {
     return captured ? value.toLocaleString() : '—';
   }
@@ -53,12 +62,12 @@
   </header>
 
     <div class="usage-totals" aria-label="Model usage totals">
-      <div><span>Total tokens</span><strong>{tokens(totals.tokens, totals.hasTokens)}</strong><small>{totals.calls} recorded call{totals.calls === 1 ? '' : 's'}</small></div>
+      <div><span>Total tokens</span><strong>{tokens(totals.tokens, totals.hasTokens)}</strong><small data-testid="usage-token-coverage">{coverage(withTokens, 'tokens', `${totals.calls} recorded call${totals.calls === 1 ? '' : 's'}`)}</small></div>
       <div><span>Input</span><strong>{tokens(totals.input, totals.hasInput)}</strong><small>Provider-reported context</small></div>
       <div><span>Output</span><strong>{tokens(totals.output, totals.hasOutput)}</strong><small>Generated completion</small></div>
       <div><span>Cache</span><strong>{tokens(totals.cacheRead + totals.cacheWrite, totals.hasCache)}</strong><small>{totals.hasCache ? `${totals.cacheRead.toLocaleString()} read · ${totals.cacheWrite.toLocaleString()} write` : 'No cache breakdown'}</small></div>
       <div><span>Reasoning</span><strong>{tokens(totals.reasoning, totals.hasReasoning)}</strong><small>Included in output when reported</small></div>
-      <div><span>Recorded cost</span><strong>{cost(totals.cost, totals.hasCost)}</strong><small>Provider or collector supplied</small></div>
+      <div><span>Recorded cost</span><strong>{cost(totals.cost, totals.hasCost)}</strong><small data-testid="usage-cost-coverage">{coverage(withCost, 'a cost', 'Provider or collector supplied')}</small></div>
     </div>
 
     <div class="rollup" role="table" aria-label="Usage by model and actor">

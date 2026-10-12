@@ -29,8 +29,12 @@
     { value: 'tool', label: 'tools' },
     { value: 'approval', label: 'decisions' },
     { value: 'process', label: 'runtime' },
+    { value: 'other', label: 'other' },
     { value: 'error', label: 'issues' }
   ];
+  /** `other` holds kinds no tab is named for; it appears only when the run has some. */
+  let shownCategories = $derived(categories.filter((category) =>
+    category.value !== 'other' || (counts.other ?? 0) > 0 || filters.category === 'other'));
   let active = $derived(scopeIsActive(filters, windowActive ? 1 : null));
   let activeLabel = $derived(categories.find((category) => category.value === filters.category)?.label ?? 'events');
   let scopedTotal = $derived(counts.all);
@@ -61,7 +65,7 @@
 <section class="filter-bar" aria-label="Event filters">
   <label class="search"><span aria-hidden="true">⌕</span><input id="event-search" name="event-search" value={searchValue} oninput={(event) => updateSearch(event.currentTarget.value)} placeholder="Search this run…" aria-label="Search events" /></label>
   <div class="category-tabs" aria-label="Event categories">
-    {#each categories as category}
+    {#each shownCategories as category}
       {@const count = counts[category.value] ?? 0}
       <button
         class:active={filters.category === category.value}
@@ -69,7 +73,7 @@
         aria-label={category.label}
         aria-pressed={filters.category === category.value}
         disabled={category.value !== 'all' && count === 0}
-        title={category.value !== 'all' && count === 0 ? `No ${category.label} in the current scope` : `${count} ${category.label}`}
+        title={category.value !== 'all' && count === 0 ? `No ${category.label} in the current scope` : category.value === 'other' ? `${count} events of kinds that are not agent, model, tool, approval, or runtime kinds` : `${count} ${category.label}`}
         onclick={() => onchange({ ...filters, category: category.value, errorsOnly: false })}
       ><span>{category.label}</span><b aria-hidden="true">{count}</b></button>
     {/each}

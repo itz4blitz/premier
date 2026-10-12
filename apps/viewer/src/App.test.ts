@@ -29,15 +29,17 @@ function mockWorkspace(traces: TraceManifest[] = [trace], eventMap: Record<strin
     if (url.endsWith('/api/traces')) {
       return new Response(JSON.stringify(traces), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    const eventsMatch = url.match(/\/api\/traces\/([^/]+)\/events$/);
+    const eventsMatch = url.match(/\/api\/traces\/([^/]+)\/events(?:\?.*)?$/);
     if (eventsMatch) {
       const id = decodeURIComponent(eventsMatch[1]);
-      return new Response(JSON.stringify(eventMap[id] ?? []), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      // Like the server: an artifact name, or a trace id.
+      const traceId = traces.find((item) => item.artifact === id)?.trace_id ?? id;
+      return new Response(JSON.stringify(eventMap[traceId] ?? []), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     const detailMatch = url.match(/\/api\/traces\/([^/]+)$/);
     if (detailMatch) {
       const id = decodeURIComponent(detailMatch[1]);
-      const found = traces.find((item) => item.trace_id === id) ?? { ...trace, trace_id: id };
+      const found = traces.find((item) => item.artifact === id) ?? traces.find((item) => item.trace_id === id) ?? { ...trace, trace_id: id };
       return new Response(JSON.stringify(found), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     return new Response('not found', { status: 404 });
@@ -164,6 +166,44 @@ it('keeps secondary investigation tools in More instead of crowding the header',
   expect(await screen.findByRole('region', { name: 'Trace comparison' })).toBeInTheDocument();
 });
 
+it('opens a copied trace by its artifact, not by the trace id both copies share', async () => {
+  const original: TraceManifest = { ...trace, name: 'Original recording', artifact: 'original.atrace' };
+  const copy: TraceManifest = { ...trace, name: 'Copied recording', artifact: 'copy.atrace' };
+  const requested: string[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (url.endsWith('/api/traces')) return json([original, copy]);
+    requested.push(url);
+    // The server refuses the shared id; only an artifact names one trace.
+    if (url.includes(`/api/traces/${trace.trace_id}`)) return new Response(JSON.stringify({ error: 'shared' }), { status: 409 });
+    const artifact = url.includes('/api/traces/copy.atrace') ? copy : original;
+    if (url.includes('/events')) {
+      // The copy was recorded on from where the original stopped.
+      const extra = { ...events[1], event_id: 'event-3', sequence: 3, kind: 'tool.copied' };
+      const all = artifact === copy ? [...events, extra] : events;
+      const after = Number(new URL(url, 'http://localhost').searchParams.get('after_sequence') ?? 0);
+      return json(all.filter((event) => event.sequence > after));
+    }
+    return json(artifact);
+  });
+  render(App);
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('original.atrace');
+  const rows = () => screen.getAllByRole('button', { pressed: true }).filter((button) => /recording/.test(button.textContent ?? ''));
+  expect(rows()).toHaveLength(1);
+  expect(rows()[0]).toHaveTextContent('Original recording');
+
+  await fireEvent.click(screen.getByRole('button', { name: /Copied recording/ }));
+  await waitFor(() => expect(screen.getAllByText('tool.copied').length).toBeGreaterThan(0));
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('copy.atrace');
+  // Only the copy's row is selected, although both rows have the same trace id.
+  expect(rows()).toHaveLength(1);
+  expect(rows()[0]).toHaveTextContent('Copied recording');
+  expect(requested.some((url) => url.includes(`/api/traces/${trace.trace_id}`))).toBe(false);
+  expect(requested.some((url) => url.includes('/api/traces/copy.atrace/events'))).toBe(true);
+});
+
 it('restores and persists every desktop workspace dimension', async () => {
   localStorage.setItem('premier.viewer.workspace.v1', JSON.stringify({ leftWidth: 312, rightWidth: 440, timeNavigatorHeight: 236, leftCollapsed: false, rightCollapsed: true }));
   mockWorkspace();
@@ -188,6 +228,7 @@ it('repaints from the session cache on hard refresh without a skeleton flash', a
   const cachedTrace: TraceManifest = {
     ...trace,
     trace_id: 'cached-trace',
+    artifact: 'cached-trace.atrace',
     name: 'Cached investigation'
   };
   const cachedEvents = events.map((event) => ({ ...event, trace_id: 'cached-trace', event_id: `cached-${event.event_id}` }));
@@ -251,17 +292,17 @@ it('keeps the previous run painted while the next load is in flight', async () =
     if (url.endsWith('/api/traces')) {
       return new Response(JSON.stringify([current, next]), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/current/events')) {
+    if (url.includes('/api/traces/current.atrace/events')) {
       return new Response(JSON.stringify(currentEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/next/events')) {
+    if (url.includes('/api/traces/next.atrace/events')) {
       await nextGate;
       return new Response(JSON.stringify(nextEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/current')) {
+    if (url.endsWith('/api/traces/current.atrace')) {
       return new Response(JSON.stringify(current), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/next')) {
+    if (url.endsWith('/api/traces/next.atrace')) {
       return new Response(JSON.stringify(next), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     return new Response('not found', { status: 404 });
@@ -303,17 +344,17 @@ it('never attributes a slower previous load to a newer selected run', async () =
     if (url.endsWith('/api/traces')) {
       return new Response(JSON.stringify([fast, slow]), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/slow/events')) {
+    if (url.includes('/api/traces/slow.atrace/events')) {
       await slowGate;
       return new Response(JSON.stringify(slowEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/fast/events')) {
+    if (url.includes('/api/traces/fast.atrace/events')) {
       return new Response(JSON.stringify(fastEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/slow')) {
+    if (url.endsWith('/api/traces/slow.atrace')) {
       return new Response(JSON.stringify(slow), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/fast')) {
+    if (url.endsWith('/api/traces/fast.atrace')) {
       return new Response(JSON.stringify(fast), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     return new Response('not found', { status: 404 });
@@ -348,4 +389,672 @@ it('shows unverified outcome for integrity-invalid traces', async () => {
   render(App);
   expect(await screen.findAllByText('Unverified')).not.toHaveLength(0);
   expect(screen.getByText('Integrity failed')).toBeInTheDocument();
+});
+
+it('leaves the empty state when Refresh runs finds a first recording', async () => {
+  let available: TraceManifest[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify(available), { status: 200 });
+    if (url.includes('/events')) return new Response(JSON.stringify(events), { status: 200 });
+    return new Response(JSON.stringify(trace), { status: 200 });
+  });
+  const errors: unknown[] = [];
+  const onError = (event: ErrorEvent) => { errors.push(event.error ?? event.message); event.preventDefault(); };
+  const onRejection = (event: PromiseRejectionEvent) => { errors.push(event.reason); event.preventDefault(); };
+  window.addEventListener('error', onError);
+  window.addEventListener('unhandledrejection', onRejection);
+  try {
+    render(App);
+    expect(await screen.findByText('No traces yet')).toBeInTheDocument();
+    available = [trace];
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh runs' }));
+    await waitFor(() => expect(document.querySelector('.run-shell')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+    expect(screen.queryByText('No traces yet')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Investigation summary')).toBeInTheDocument();
+    expect(new URL(window.location.href).searchParams.get('trace')).toBe('investigation.atrace');
+    expect(errors).toEqual([]);
+  } finally {
+    window.removeEventListener('error', onError);
+    window.removeEventListener('unhandledrejection', onRejection);
+  }
+});
+
+it('opens the first recording when the background poll finds it on the empty state', async () => {
+  let available: TraceManifest[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify(available), { status: 200 });
+    if (url.includes('/events')) return new Response(JSON.stringify(events), { status: 200 });
+    return new Response(JSON.stringify(trace), { status: 200 });
+  });
+  const polls: Array<() => void> = [];
+  const realSetInterval = window.setInterval.bind(window);
+  vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler, timeout?: number, ...rest: unknown[]) => {
+    if (timeout === 4000 && typeof handler === 'function') {
+      polls.push(handler as () => void);
+      return 0;
+    }
+    return realSetInterval(handler, timeout, ...rest);
+  }) as typeof window.setInterval);
+  render(App);
+  expect(await screen.findByText('No traces yet')).toBeInTheDocument();
+  await waitFor(() => expect(polls).toHaveLength(1));
+  available = [trace];
+  polls[0]();
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(screen.queryByText('No traces yet')).not.toBeInTheDocument();
+  expect(screen.getByLabelText('Current run')).toHaveTextContent('Investigation');
+});
+
+it('recovers from a missing shared trace by opening the latest available run', async () => {
+  window.history.replaceState({}, '', '/?trace=missing-trace&event=4');
+  mockWorkspace([trace]);
+  render(App);
+  expect(await screen.findByText('Trace not found')).toBeInTheDocument();
+  await fireEvent.click(screen.getByRole('button', { name: 'Open the latest available run' }));
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(screen.queryByText('Trace not found')).not.toBeInTheDocument();
+  expect(screen.getByLabelText('Investigation summary')).toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('investigation.atrace');
+});
+
+it('exports token usage intact, masks credentials, and labels the file honestly', async () => {
+  const usageEvents: TraceEvent[] = [
+    events[0],
+    { ...events[1], kind: 'model.response', payload_json: JSON.stringify({ model: 'gpt-5.2', apiKey: 'sk-live-EXPORT1', usage: { input_tokens: 1296, output_tokens: 546, total_tokens: 1842 } }) },
+    { ...events[1], event_id: 'event-3', sequence: 3, kind: 'process.stdout', payload_json: JSON.stringify({ text: '{"apiKey":"sk-live-STDOUT1","ok":true}\n' }) }
+  ];
+  const unverified: TraceManifest = { ...trace, integrity: 'invalid', integrity_detail: 'journal digest mismatch' };
+  mockWorkspace([unverified], { 'trace-1': usageEvents });
+  const blobs: Blob[] = [];
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn((blob: Blob) => { blobs.push(blob); return 'blob:export'; }) });
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+
+  render(App);
+  await screen.findByRole('button', { name: 'Ask AI' });
+  await waitFor(() => expect(screen.getAllByText('model.response').length).toBeGreaterThan(0));
+  await fireEvent.click(screen.getByRole('button', { name: 'More' }));
+  await fireEvent.click(screen.getByRole('menuitem', { name: /Export safe JSON/ }));
+
+  expect(click).toHaveBeenCalledTimes(1);
+  expect(blobs).toHaveLength(1);
+  const text = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(blobs[0]);
+  });
+  expect(text).not.toContain('sk-live-EXPORT1');
+  expect(text).not.toContain('sk-live-STDOUT1');
+  const exported = JSON.parse(text) as { export: { source_integrity: string; verified: boolean; redaction: { masked_values: number } }; events: TraceEvent[] };
+  expect(JSON.parse(exported.events[1].payload_json).usage).toEqual({ input_tokens: 1296, output_tokens: 546, total_tokens: 1842 });
+  expect(exported.export.source_integrity).toBe('invalid');
+  expect(exported.export.verified).toBe(false);
+  expect(exported.export.redaction.masked_values).toBe(2);
+  const toast = document.querySelector('.action-feedback');
+  expect(toast).toHaveTextContent(/2 values masked/);
+  expect(toast).toHaveTextContent(/not verified/);
+});
+
+function largeTrace(count: number, traceId = 'large'): { manifest: TraceManifest; events: TraceEvent[] } {
+  const started = Date.parse('2026-01-01T00:00:00Z');
+  return {
+    manifest: {
+      ...trace, trace_id: traceId, name: 'Large run', artifact: `${traceId}.atrace`,
+      journal: { path: 'events/000001.events.pb.zst', sha256: 'abc', event_count: count }
+    },
+    events: Array.from({ length: count }, (_, index): TraceEvent => ({
+      ...events[1],
+      trace_id: traceId,
+      event_id: `${traceId}-${index + 1}`,
+      sequence: index + 1,
+      timestamp: new Date(started + index * 10).toISOString(),
+      actor_id: `agent-${index % 4}`,
+      parent_event_id: '',
+      parent_span_id: '',
+      span_id: `span-${index + 1}`,
+      payload_json: `{"tool":"verify","index":${index + 1}}`
+    }))
+  };
+}
+
+/** Serves the events endpoint the way the server does: sequence cursor plus a bounded limit. */
+function mockPagedWorkspace(
+  runs: Array<{ manifest: TraceManifest; events: TraceEvent[] }>,
+  gate?: (traceId: string, afterSequence: number) => Promise<void> | void
+) {
+  const requests: Array<{ traceId: string; afterSequence: number; limit: number | null; signal?: AbortSignal | null }> = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = new URL(String(input), 'http://localhost');
+    const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (url.pathname === '/api/traces') return json(runs.map((run) => run.manifest));
+    const eventsMatch = url.pathname.match(/^\/api\/traces\/([^/]+)\/events$/);
+    if (eventsMatch) {
+      const run = runs.find((item) => [item.manifest.artifact, item.manifest.trace_id].includes(decodeURIComponent(eventsMatch[1])));
+      const afterSequence = Number(url.searchParams.get('after_sequence') ?? 0);
+      const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+      requests.push({ traceId: run?.manifest.trace_id ?? '', afterSequence, limit, signal: init?.signal });
+      await gate?.(run?.manifest.trace_id ?? '', afterSequence);
+      if (init?.signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+      const rest = (run?.events ?? []).filter((event) => event.sequence > afterSequence);
+      return json(limit === null ? rest : rest.slice(0, limit));
+    }
+    const detailMatch = url.pathname.match(/^\/api\/traces\/([^/]+)$/);
+    if (detailMatch) {
+      const run = runs.find((item) => [item.manifest.artifact, item.manifest.trace_id].includes(decodeURIComponent(detailMatch[1])));
+      return run ? json(run.manifest) : new Response('not found', { status: 404 });
+    }
+    return new Response('not found', { status: 404 });
+  });
+  return requests;
+}
+
+it('pages a 50k-event run with visible progress, bounded rows, and a late deep link', async () => {
+  const large = largeTrace(50_000);
+  let releaseRest: (() => void) | undefined;
+  const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+  const requests = mockPagedWorkspace([large], (_, afterSequence) => (afterSequence > 0 ? restGate : undefined));
+  window.history.replaceState({}, '', '/?trace=large&event_id=large-49990');
+  render(App);
+
+  // The first page paints while the rest of the journal is still in flight.
+  expect(await screen.findByText('Loading 5,000 of 50,000 events', undefined, { timeout: 20_000 })).toBeInTheDocument();
+  expect(document.querySelector('.run-shell')).toHaveClass('trace-loading');
+  expect(document.querySelector('.run-shell')).not.toHaveClass('content-stale');
+  expect(screen.getAllByRole('option').length).toBeGreaterThan(0);
+  expect(screen.getAllByRole('option').length).toBeLessThan(100);
+  // A link to an event that has not arrived yet is pending, not reported missing or rewritten.
+  expect(screen.queryByText('Linked event not found')).not.toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('event_id')).toBe('large-49990');
+
+  releaseRest?.();
+  await waitFor(() => expect(document.querySelector('.run-shell')).not.toHaveClass('trace-loading'), { timeout: 60_000 });
+  expect(screen.queryByText(/^Loading .* events$/)).not.toBeInTheDocument();
+  expect(document.querySelector('.timeline .panel-heading')).toHaveTextContent(/\b50000 events? ·/);
+  expect(requests).toHaveLength(11);
+  expect(requests.every((request) => request.limit !== null && request.limit <= 5_000)).toBe(true);
+  expect(requests.map((request) => request.afterSequence)).toEqual([0, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000, 35_000, 40_000, 45_000, 50_000]);
+
+  const selected = document.querySelector('.timeline [role="option"][aria-selected="true"]');
+  expect(selected).toHaveAttribute('data-event-id', 'large-49990');
+  expect(screen.getAllByRole('option').length).toBeLessThan(100);
+  expect(screen.getByRole('complementary', { name: 'Event inspector' })).toBeInTheDocument();
+  expect(screen.queryByText('Linked event not found')).not.toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('event_id')).toBe('large-49990');
+}, 120_000);
+
+it('reports a linked event as missing only once every page has been read', async () => {
+  const large = largeTrace(12_000);
+  mockPagedWorkspace([large]);
+  window.history.replaceState({}, '', '/?trace=large&event_id=large-gone');
+  render(App);
+  expect(await screen.findByText('Linked event not found', undefined, { timeout: 30_000 })).toBeInTheDocument();
+  expect(document.querySelector('.timeline [role="option"][aria-selected="true"]')).not.toBeInTheDocument();
+}, 60_000);
+
+it('cancels the remaining pages when the user switches runs mid-load', async () => {
+  const large = largeTrace(12_000);
+  const small = { manifest: { ...trace, trace_id: 'small', name: 'Small run', artifact: 'small.atrace' }, events: events.map((event) => ({ ...event, trace_id: 'small', event_id: `small-${event.event_id}`, kind: event.sequence === 2 ? 'agent.turn' : event.kind })) };
+  let releaseRest: (() => void) | undefined;
+  const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+  const requests = mockPagedWorkspace([large, small], (traceId, afterSequence) => (traceId === 'large' && afterSequence > 0 ? restGate : undefined));
+  window.history.replaceState({}, '', '/?trace=large');
+  render(App);
+  expect(await screen.findByText('Loading 5,000 of 12,000 events', undefined, { timeout: 20_000 })).toBeInTheDocument();
+  const inFlight = requests.find((request) => request.traceId === 'large' && request.afterSequence === 5_000);
+  expect(inFlight?.signal?.aborted).toBe(false);
+
+  await fireEvent.click(screen.getByRole('button', { name: /Small run/ }));
+  expect(inFlight?.signal?.aborted).toBe(true);
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Small run'));
+  await waitFor(() => expect(screen.getAllByText('agent.turn').length).toBeGreaterThan(0));
+
+  releaseRest?.();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  // The abandoned run asks for nothing further and never paints over the new one.
+  expect(requests.filter((request) => request.traceId === 'large').map((request) => request.afterSequence)).toEqual([0, 5_000]);
+  expect(screen.getByLabelText('Current run')).toHaveTextContent('Small run');
+  expect(screen.queryByText(/^Loading .* events$/)).not.toBeInTheDocument();
+  expect(document.querySelector('.timeline .panel-heading')).toHaveTextContent(/\b2 events? ·/);
+  expect(document.querySelector('.run-shell')).not.toHaveClass('trace-loading');
+}, 60_000);
+
+it('pages a live run to its tail once and then follows the stream from the last sequence', async () => {
+  class FakeEventSource {
+    static instances: FakeEventSource[] = [];
+    onopen: ((event: Event) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+    private listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+    url: string;
+    constructor(url: string) { this.url = url; FakeEventSource.instances.push(this); }
+    addEventListener(type: string, listener: (event: MessageEvent) => void) {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+    dispatch(type: string, data: unknown) {
+      for (const listener of this.listeners.get(type) ?? []) listener({ data: JSON.stringify(data) } as MessageEvent);
+    }
+    close() {}
+  }
+  vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+  try {
+    const liveRun = largeTrace(6_000, 'live');
+    liveRun.manifest = { ...liveRun.manifest, name: 'Live run', ended_at: null, exit_code: null, journal: null, integrity: 'live' };
+    const requests = mockPagedWorkspace([liveRun]);
+    window.history.replaceState({}, '', '/?trace=live');
+    render(App);
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1), { timeout: 30_000 });
+    expect(FakeEventSource.instances[0].url).toBe('/api/traces/live.atrace/stream?after_sequence=6000');
+    expect(requests.map((request) => [request.afterSequence, request.limit])).toEqual([[0, 5_000], [5_000, 5_000]]);
+    expect(document.querySelector('.timeline .panel-heading')).toHaveTextContent(/\b6000 events? ·/);
+
+    FakeEventSource.instances[0].onopen?.(new Event('open'));
+    FakeEventSource.instances[0].dispatch('trace.event', { ...liveRun.events[0], event_id: 'live-6001', sequence: 6_001, span_id: 'span-6001' });
+    await waitFor(() => expect(document.querySelector('.timeline .panel-heading')).toHaveTextContent(/\b6001 events? ·/), { timeout: 10_000 });
+    expect(requests).toHaveLength(2);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+}, 60_000);
+
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+  onopen: ((event: Event) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  private listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+  closed = false;
+
+  constructor(public url: string) {
+    FakeEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: (event: MessageEvent) => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  dispatch(type: string, data: unknown) {
+    for (const listener of this.listeners.get(type) ?? []) listener({ data: JSON.stringify(data) } as MessageEvent);
+  }
+
+  close() {
+    this.closed = true;
+  }
+}
+
+/** A server whose traces and events the test can change between requests, plus the list poll as a callable. */
+function changingWorkspace(initial: { traces: TraceManifest[]; events: TraceEvent[] }) {
+  const server = { ...initial };
+  FakeEventSource.instances = [];
+  vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+  const fetched = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (url.endsWith('/api/traces')) return json(server.traces);
+    if (/\/events(\?|$)/.test(url)) return json(server.events);
+    const detail = url.match(/\/api\/traces\/([^/]+)$/);
+    const found = detail && server.traces.find((item) => item.trace_id === decodeURIComponent(detail[1]));
+    return found ? json(found) : new Response('not found', { status: 404 });
+  });
+  const polls: Array<() => void> = [];
+  const realSetInterval = window.setInterval.bind(window);
+  vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler, timeout?: number, ...rest: unknown[]) => {
+    if (timeout === 4000 && typeof handler === 'function') {
+      polls.push(handler as () => void);
+      return 0;
+    }
+    return realSetInterval(handler, timeout, ...rest);
+  }) as typeof window.setInterval);
+  const poll = async () => {
+    await waitFor(() => expect(polls).toHaveLength(1));
+    polls[0]();
+  };
+  const eventLoads = () => fetched.mock.calls.filter(([input]) => /\/events(\?|$)/.test(String(input))).length;
+  return { server, poll, eventLoads };
+}
+
+const connection = () => document.querySelector('.connection');
+const recording: TraceManifest = { ...trace, ended_at: null, exit_code: null, journal: null, integrity: 'live' };
+const abandoned: TraceManifest = {
+  ...recording,
+  integrity: 'abandoned',
+  integrity_detail: 'The recorder is no longer running. Run `premier recover investigation.atrace` to finalize this trace.'
+};
+const exitEvent: TraceEvent = { ...events[1], event_id: 'event-3', sequence: 3, kind: 'process.exit', source: 'premier-recovery', payload_json: '{"exit_code":130}', status: 'error' };
+
+it('does not open the event stream for an abandoned trace', async () => {
+  try {
+    changingWorkspace({ traces: [abandoned], events });
+    render(App);
+    await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+    await waitFor(() => expect(connection()).toHaveTextContent('ABANDONED'));
+    expect(FakeEventSource.instances).toHaveLength(0);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it('closes the event stream when a live trace turns abandoned', async () => {
+  try {
+    const { server, poll } = changingWorkspace({ traces: [recording], events });
+    render(App);
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const stream = FakeEventSource.instances[0];
+    // The pages already hold the journal up to the tail; the stream resumes after it.
+    // Addressed by artifact: a copy of the recording would share its trace id.
+    expect(stream.url).toBe('/api/traces/investigation.atrace/stream?after_sequence=2');
+    stream.onopen?.(new Event('open'));
+    await waitFor(() => expect(connection()).toHaveTextContent('STREAMING'));
+    expect(stream.closed).toBe(false);
+
+    server.traces = [abandoned];
+    await poll();
+    await waitFor(() => expect(stream.closed).toBe(true));
+    await waitFor(() => expect(connection()).toHaveTextContent('ABANDONED'));
+    expect(connection()).toHaveAttribute('title', abandoned.integrity_detail);
+    // Nothing is left to tail, so no second stream is opened.
+    expect(FakeEventSource.instances).toHaveLength(1);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it('ends the stream as abandoned when the server sends trace.abandoned', async () => {
+  try {
+    changingWorkspace({ traces: [recording], events });
+    render(App);
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const stream = FakeEventSource.instances[0];
+    stream.onopen?.(new Event('open'));
+    await waitFor(() => expect(connection()).toHaveTextContent('STREAMING'));
+
+    stream.dispatch('trace.abandoned', abandoned);
+    stream.onerror?.(new Event('error'));
+    await waitFor(() => expect(connection()).toHaveTextContent('ABANDONED'));
+    expect(connection()).toHaveAttribute('title', abandoned.integrity_detail);
+    expect(stream.closed).toBe(true);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it('reloads the open trace when it is recovered while abandoned', async () => {
+  try {
+    window.history.replaceState({}, '', '/?trace=trace-1&event_id=event-1');
+    const { server, poll, eventLoads } = changingWorkspace({ traces: [abandoned], events });
+    render(App);
+    await waitFor(() => expect(connection()).toHaveTextContent('ABANDONED'));
+    expect(screen.queryByText('process.exit')).not.toBeInTheDocument();
+    const loads = eventLoads();
+
+    // `premier recover` finalized the trace and appended its terminal event.
+    server.traces = [{ ...trace, exit_code: 130, journal: { ...trace.journal!, event_count: 3 } }];
+    server.events = [...events, exitEvent];
+    await poll();
+    await waitFor(() => expect(connection()).toHaveTextContent('RECORDED'));
+    await waitFor(() => expect(screen.getAllByText('process.exit').length).toBeGreaterThan(0));
+    expect(eventLoads()).toBe(loads + 1);
+    // The reload keeps what the user was inspecting.
+    expect(new URL(window.location.href).searchParams.get('event_id')).toBe('event-1');
+    expect(FakeEventSource.instances).toHaveLength(0);
+
+    // The same listed state does not reload again.
+    await poll();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(eventLoads()).toBe(loads + 1);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it('reloads the open trace when a live trace is finalized without a stream completion', async () => {
+  try {
+    const { server, poll, eventLoads } = changingWorkspace({ traces: [recording], events });
+    render(App);
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const stream = FakeEventSource.instances[0];
+    stream.onopen?.(new Event('open'));
+    await waitFor(() => expect(connection()).toHaveTextContent('STREAMING'));
+    const loads = eventLoads();
+
+    // The stream dropped before trace.complete; only the list knows the run ended.
+    stream.onerror?.(new Event('error'));
+    server.traces = [{ ...trace, journal: { ...trace.journal!, event_count: 3 } }];
+    server.events = [...events, { ...exitEvent, source: 'premier', payload_json: '{"exit_code":0}', status: 'ok' }];
+    await poll();
+    await waitFor(() => expect(connection()).toHaveTextContent('RECORDED'));
+    await waitFor(() => expect(screen.getAllByText('process.exit').length).toBeGreaterThan(0));
+    expect(eventLoads()).toBe(loads + 1);
+    expect(stream.closed).toBe(true);
+    expect(FakeEventSource.instances).toHaveLength(1);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+function capturePolls() {
+  const polls: Array<() => void> = [];
+  const realSetInterval = window.setInterval.bind(window);
+  vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler, timeout?: number, ...rest: unknown[]) => {
+    if (timeout === 4000 && typeof handler === 'function') {
+      polls.push(handler as () => void);
+      return 0;
+    }
+    return realSetInterval(handler, timeout, ...rest);
+  }) as typeof window.setInterval);
+  return polls;
+}
+
+it('shows why a locked trace cannot be opened instead of "trace not found" and "Running"', async () => {
+  const locked: TraceManifest = {
+    format_version: 0, trace_id: 'locked:sealed.atrace', artifact: 'sealed.atrace', name: 'Sealed run', command: ['agent'],
+    started_at: '2026-01-01T00:00:00Z', ended_at: null, exit_code: null, journal: null,
+    integrity: 'locked', integrity_detail: 'This trace is encrypted and premier was started without --key-file.'
+  };
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify([locked]), { status: 200 });
+    // What the server answers for an entry it cannot read.
+    return new Response(JSON.stringify({ error: 'trace not found' }), { status: 404 });
+  });
+  const sources: string[] = [];
+  vi.stubGlobal('EventSource', class { constructor(url: string) { sources.push(url); } addEventListener() {} close() {} });
+  try {
+    render(App);
+    const reason = await screen.findByRole('status', { name: 'Why this trace cannot be opened' });
+    expect(reason).toHaveTextContent('This trace is encrypted and no key that opens it was given');
+    expect(reason).toHaveTextContent('premier was started without --key-file');
+    expect(screen.queryByText('Trace could not be opened')).not.toBeInTheDocument();
+    expect(screen.queryByText(/trace not found/i)).not.toBeInTheDocument();
+    const header = screen.getByLabelText('Current run');
+    expect(header).toHaveTextContent('Locked');
+    expect(header).not.toHaveTextContent('Running');
+    expect(document.querySelector('.connection')).toHaveTextContent('LOCKED');
+    expect(screen.getByRole('button', { name: 'Ask AI' })).toBeDisabled();
+    // Nothing was requested for it, and no stream was opened on it.
+    expect(fetchMock.mock.calls.map(([input]) => String(input)).filter((url) => !url.endsWith('/api/traces'))).toEqual([]);
+    expect(sources).toEqual([]);
+    expect(new URL(window.location.href).searchParams.get('trace')).toBe('sealed.atrace');
+    // With no time navigator its grid row is still held, so the filters and the workspace keep
+    // the second and third rows of the run shell instead of each moving up one.
+    expect([...document.querySelector('.run-shell')!.children].map((child) => child.classList[0]))
+      .toEqual(['time-navigator-placeholder', 'filter-bar', 'workspace']);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+function seedSession() {
+  sessionStorage.setItem('premier.viewer.session.v1', JSON.stringify({
+    version: 1, savedAt: Date.now(), traces: [trace], selectedTrace: trace, events, selectedSequence: 2
+  }));
+  window.history.replaceState({}, '', '/?trace=investigation.atrace');
+}
+
+it('drops cached evidence and clears the loading state when a reload is answered 401', async () => {
+  seedSession();
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 401 }));
+  render(App);
+  expect(await screen.findByText('Viewer unavailable')).toBeInTheDocument();
+  expect(screen.getByText('Authentication is required.')).toBeInTheDocument();
+  expect(document.querySelector('.run-shell')).not.toBeInTheDocument();
+  expect(screen.queryByText('tool.execution')).not.toBeInTheDocument();
+  expect(document.querySelector('[aria-busy="true"]')).not.toBeInTheDocument();
+  expect(sessionStorage.getItem('premier.viewer.session.v1')).toBeNull();
+});
+
+it('labels a saved copy as such when the server cannot be reached on reload', async () => {
+  seedSession();
+  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'));
+  render(App);
+  const notice = await screen.findByRole('alert');
+  expect(notice).toHaveTextContent('Viewer server unreachable');
+  expect(notice).toHaveTextContent('copy of the run saved in this tab');
+  expect(screen.queryByText('Trace could not be opened')).not.toBeInTheDocument();
+  expect(document.querySelector('.run-shell')).toHaveAttribute('aria-busy', 'false');
+  expect(document.querySelector('.trace-load-progress')).not.toBeInTheDocument();
+  expect(document.querySelector('.connection')).toHaveTextContent('DISCONNECTED');
+});
+
+it('keeps the app bar usable on the empty screen and opens the dialogs its buttons promise', async () => {
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+  render(App);
+  expect(await screen.findByText('No traces yet')).toBeInTheDocument();
+  const bar = document.querySelector('.app-bar') as HTMLElement;
+  expect(screen.getByRole('button', { name: 'Ask AI' })).toBeDisabled();
+
+  await fireEvent.click(screen.getByRole('button', { name: 'Runs' }));
+  expect(screen.getByRole('dialog', { name: 'All runs' })).toBeInTheDocument();
+  expect(bar.inert).toBe(true);
+  await fireEvent.click(screen.getByRole('button', { name: 'Close runs' }));
+  expect(bar.inert).toBe(false);
+
+  await fireEvent.keyDown(window, { key: '?' });
+  expect(screen.getByRole('dialog', { name: 'Keyboard shortcuts' })).toBeInTheDocument();
+  await fireEvent.keyDown(window, { key: 'Escape' });
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(bar.inert).toBe(false);
+});
+
+it('refreshes a run row when the poll brings new counts, so a run with issues is not left reading Passed', async () => {
+  const listed = (issues: number, count: number): TraceManifest => ({ ...trace, summary: { display_name: null, actor_count: 2, issue_count: issues, event_count: count } });
+  let available = [listed(0, 2)];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify(available), { status: 200 });
+    if (url.includes('/events')) return new Response(JSON.stringify(events), { status: 200 });
+    return new Response(JSON.stringify(trace), { status: 200 });
+  });
+  const polls = capturePolls();
+  render(App);
+  const row = await screen.findByRole('button', { name: /Investigation\. Passed.*2 events/ });
+  expect(row).toBeInTheDocument();
+  await waitFor(() => expect(polls).toHaveLength(1));
+  // Same run, same end time, same integrity: only the counts moved.
+  available = [listed(3, 9)];
+  polls[0]();
+  expect(await screen.findByRole('button', { name: /Investigation\. Needs attention · 3 issues.*9 events/ })).toBeInTheDocument();
+});
+
+it('keeps the scope a history entry carries when Back lands on a different run', async () => {
+  const other: TraceManifest = { ...trace, trace_id: 'trace-2', artifact: 'other.atrace', name: 'Other run' };
+  const otherEvents = events.map((event) => ({ ...event, trace_id: 'trace-2', event_id: `other-${event.event_id}`, parent_event_id: event.parent_event_id ? `other-${event.parent_event_id}` : '' }));
+  mockWorkspace([trace, other], { 'trace-1': events, 'trace-2': otherEvents });
+  render(App);
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Investigation'));
+
+  // What Back does: the URL becomes an earlier entry, here a scoped view of the other run.
+  window.history.replaceState({}, '', '/?trace=other.atrace&kind=tool&actor=agent');
+  window.dispatchEvent(new PopStateEvent('popstate'));
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Other run'));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'tools' })).toHaveAttribute('aria-pressed', 'true'));
+  const params = new URL(window.location.href).searchParams;
+  expect(params.get('kind')).toBe('tool');
+  expect(params.get('actor')).toBe('agent');
+  expect(screen.getAllByRole('option')).toHaveLength(1);
+
+  // A switch made in the app still starts the next run unscoped.
+  await fireEvent.click(screen.getByRole('button', { name: /^Investigation\./ }));
+  await waitFor(() => expect(new URL(window.location.href).searchParams.get('trace')).toBe('investigation.atrace'));
+  expect(new URL(window.location.href).searchParams.has('kind')).toBe(false);
+});
+
+it('keeps the chosen comparison baseline when reopened, and opens baseline-side events in the baseline run', async () => {
+  const copy = (id: string, artifact: string, name: string, tool: string): [TraceManifest, TraceEvent[]] => [
+    { ...trace, trace_id: id, artifact, name },
+    events.map((event) => ({
+      ...event, trace_id: id, event_id: `${id}-${event.event_id}`,
+      parent_event_id: event.parent_event_id ? `${id}-${event.parent_event_id}` : '',
+      payload_json: event.kind === 'tool.execution' ? JSON.stringify({ tool }) : event.payload_json
+    }))
+  ];
+  const [other, otherEvents] = copy('trace-2', 'other.atrace', 'Other run', 'rg');
+  const [third, thirdEvents] = copy('trace-3', 'third.atrace', 'Third run', 'grep');
+  const fetchMock = mockWorkspace([trace, other, third], { 'trace-1': events, 'trace-2': otherEvents, 'trace-3': thirdEvents });
+  const loads = (artifact: string) => fetchMock.mock.calls.filter(([input]) => String(input).includes(`/api/traces/${artifact}/events`)).length;
+  render(App);
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Investigation'));
+
+  const openCompare = async () => {
+    await fireEvent.click(screen.getByRole('button', { name: 'More' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: /Compare runs/ }));
+    return screen.findByRole('dialog', { name: /Compare runs/ });
+  };
+  let dialog = await openCompare();
+  // The default baseline is the first other run; choose the one after it.
+  await waitFor(() => expect(dialog.querySelector('[data-testid="select-value"]')).toHaveTextContent('Other run'));
+  await fireEvent.click(screen.getByRole('button', { name: 'Comparison baseline' }));
+  await fireEvent.click(screen.getByRole('option', { name: /Third run/ }));
+  await waitFor(() => expect(dialog.querySelector('[data-testid="select-value"]')).toHaveTextContent('Third run'));
+  // The third run called a different tool: its call is removed, this run's is added.
+  const removed = await screen.findByTestId('comparison-removed-0');
+  expect(removed).toHaveTextContent('baseline #2');
+  expect(screen.getByTestId('comparison-first-divergence')).toHaveTextContent('tool.execution');
+  expect(loads('third.atrace')).toBe(1);
+
+  // Inspecting an event of this run closes the dialog...
+  await fireEvent.click(screen.getByTestId('comparison-added-0').querySelector('button[aria-label^="Inspect current event"]')!);
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  expect(screen.getByRole('option', { selected: true })).toHaveTextContent('tool.execution');
+
+  // ...and reopening it returns to the same baseline without loading it again.
+  dialog = await openCompare();
+  expect(dialog.querySelector('[data-testid="select-value"]')).toHaveTextContent('Third run');
+  expect(screen.getByTestId('comparison-removed-0')).toBeInTheDocument();
+  expect(loads('third.atrace')).toBe(1);
+  expect(loads('other.atrace')).toBe(1);
+
+  // An event only the baseline has opens in the baseline run, selected.
+  await fireEvent.click(screen.getByRole('button', { name: /Open baseline event #2 tool\.execution/ }));
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Third run'));
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('third.atrace');
+  await waitFor(() => expect(screen.getByRole('option', { selected: true })).toHaveTextContent('tool.execution'));
+  await waitFor(() => expect(screen.getByRole('complementary', { name: 'Event inspector' })).toHaveTextContent('grep'));
+});
+
+it('drops a stale event_id when recovering from a dead link', async () => {
+  window.history.replaceState({}, '', '/?trace=missing-trace&event_id=event-from-elsewhere');
+  mockWorkspace([trace]);
+  render(App);
+  expect(await screen.findByText('Trace not found')).toBeInTheDocument();
+  await fireEvent.click(screen.getByRole('button', { name: 'Open the latest available run' }));
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(screen.queryByText('Linked event not found')).not.toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('event_id')).not.toBe('event-from-elsewhere');
+});
+
+it('reveals a related event that the active filter was hiding', async () => {
+  window.history.replaceState({}, '', '/?trace=investigation.atrace&kind=tool&event_id=event-2');
+  mockWorkspace();
+  render(App);
+  await waitFor(() => expect(screen.getByRole('complementary', { name: 'Event inspector' })).toHaveTextContent('rg'));
+  expect(screen.getAllByRole('option')).toHaveLength(1);
+  await fireEvent.click(screen.getByRole('tab', { name: /Relations/ }));
+  await fireEvent.click(screen.getByRole('button', { name: /event-1/ }));
+  // The parent is a session event, outside the tools filter: the scope is cleared to show it.
+  await waitFor(() => expect(screen.getByRole('option', { name: /session\.start/ })).toHaveAttribute('aria-selected', 'true'));
+  expect(new URL(window.location.href).searchParams.has('kind')).toBe(false);
+  expect(screen.getByRole('tab', { name: /Relations/ })).toHaveAttribute('aria-selected', 'true');
 });

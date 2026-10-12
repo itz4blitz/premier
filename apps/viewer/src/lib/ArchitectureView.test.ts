@@ -102,3 +102,48 @@ it('renders architecture without coupling it to a second time ruler', () => {
   expect(screen.queryByText('Orchestration ruler', { exact: true })).not.toBeInTheDocument();
   expect(screen.getByRole('heading', { name: 'Agent topology' })).toBeInTheDocument();
 });
+
+it('mounts the time navigator for a journal larger than the argument-spread limit', () => {
+  const origin = Date.parse('2026-07-13T12:00:00.000Z');
+  const journal: TraceEvent[] = Array.from({ length: 130_000 }, (_, index) => ({
+    ...event(index + 1, index % 2 ? 'researcher' : 'coordinator', 'process.stdout', 0),
+    timestamp: new Date(origin + index * 10).toISOString()
+  }));
+  expect(() => render(ArchitectureView, {
+    props: { events: journal, timeOnly: true, compact: true, showHeader: false, showDiagram: false, onwindow: vi.fn(), onactor: vi.fn(), onselect: vi.fn() }
+  })).not.toThrow();
+  expect(document.querySelector('.architecture-view.time-only')).toBeInTheDocument();
+}, 60_000);
+
+it('keeps the full-run topology under a time range and only highlights the range', () => {
+  // The delegation (0 s) is outside the range; its edge to the researcher must survive the crop.
+  render(ArchitectureView, { props: { events, showRuler: false, windowStartMs: 7000, windowEndMs: 10000, onwindow: vi.fn(), onactor: vi.fn(), onselect: vi.fn() } });
+  expect(document.querySelector('.topology .summary')).toHaveTextContent('2 actors · 2 causal connections');
+  expect(screen.getByLabelText('Map scope')).toHaveTextContent('4 supplied events · 2 highlighted');
+  expect(screen.getByText('Range highlighted on the full-run map; structure is unchanged')).toBeInTheDocument();
+  expect(screen.getByText('2 events · 1 of 2 connections')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /coordinator to researcher: 1 linked event/ })).toHaveClass('muted');
+  expect(screen.getByRole('button', { name: /researcher to coordinator: 1 linked event/ })).not.toHaveClass('muted');
+});
+
+it('jumps to the first recorded issue, not the last', async () => {
+  const onselect = vi.fn();
+  const twoIssues = [...events, event(5, 'researcher', 'tool.error', 12, 'research', 'tool-2', 'error')];
+  render(ArchitectureView, { props: { events: twoIssues, onwindow: vi.fn(), onactor: vi.fn(), onselect } });
+  await fireEvent.click(screen.getByRole('button', { name: 'Failure window' }));
+  expect(onselect).toHaveBeenCalledWith(twoIssues[2]);
+});
+
+it('leaves events without a readable timestamp off the ruler and does not project durations past the run', () => {
+  const odd = [
+    ...events.slice(0, 3),
+    { ...event(4, 'coordinator', 'agent.join', 10, 'research', 'join'), duration_ms: 600_000 },
+    { ...event(5, 'researcher', 'tool.execution', 0), timestamp: 'not-a-time' }
+  ];
+  render(ArchitectureView, { props: { events: odd, onwindow: vi.fn(), onactor: vi.fn(), onselect: vi.fn() } });
+  // 10 s of receipts: neither the 10-minute duration nor a 1970 fallback stretches it.
+  expect(screen.getByText('Observed activity over 10 s')).toBeInTheDocument();
+  expect(screen.getByText(/1 without a readable timestamp, not on the ruler/)).toBeInTheDocument();
+  expect(screen.getByText('1 event without a readable timestamp')).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /sequence 5/ })).not.toBeInTheDocument();
+});

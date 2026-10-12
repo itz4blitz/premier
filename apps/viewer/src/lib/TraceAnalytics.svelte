@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { categoryOf, eventSummary } from './analysis';
+  import { eventSummary, familyOf, isIssue } from './analysis';
   import ModelUsage from './ModelUsage.svelte';
   import { modelUsage } from './modelUsage';
-  import type { EventCategory, TraceEvent } from './types';
+  import type { EventFamily, TraceEvent } from './types';
 
   let { events, selectedEventId = null, live = false, filtered = false, onreset = () => undefined, onselect }: {
     events: TraceEvent[];
@@ -13,16 +13,21 @@
     onselect: (event: TraceEvent) => void;
   } = $props();
 
-  type AnalyticsCategory = Exclude<EventCategory, 'all'>;
+  /**
+   * The mix and latency cards file each event under its recorded family, the same buckets the run
+   * header and the filter tabs count, so the three always agree. Issues are a facet of any family and
+   * are reported by the issue rate and the chart's issue markers instead.
+   */
+  type AnalyticsCategory = EventFamily;
   type Point = { x: number; y: number; count: number; event: TraceEvent; start: number; end: number };
 
-  const categories: AnalyticsCategory[] = ['agent', 'model', 'tool', 'approval', 'process', 'error'];
+  const categories: AnalyticsCategory[] = ['agent', 'model', 'tool', 'approval', 'process', 'other'];
   const categoryLabels: Record<AnalyticsCategory, string> = {
-    agent: 'Agent', model: 'Model', tool: 'Tool', approval: 'Approval', process: 'Process', error: 'Issue'
+    agent: 'Agent', model: 'Model', tool: 'Tool', approval: 'Approval', process: 'Process', other: 'Other'
   };
   const categoryColors: Record<AnalyticsCategory, string> = {
     agent: 'var(--blue-strong, #9eaaff)', model: 'var(--purple, #c59aff)', tool: 'var(--amber, #f5bc68)',
-    approval: 'var(--cyan, #66d8d5)', process: 'var(--green, #63dca5)', error: 'var(--red, #ff7c78)'
+    approval: 'var(--cyan, #66d8d5)', process: 'var(--green, #63dca5)', other: 'var(--muted, #8a9ab0)'
   };
 
   const left = 42;
@@ -36,7 +41,7 @@
   }
 
   function issue(event: TraceEvent): boolean {
-    return categoryOf(event) === 'error';
+    return isIssue(event);
   }
 
   function formatDuration(ms: number): string {
@@ -69,7 +74,8 @@
     if (!ordered.length) return null;
 
     const start = timestamp(ordered[0]);
-    const rawEnd = Math.max(...ordered.map((event) => timestamp(event) + Math.max(0, event.duration_ms || 0)));
+    // reduce, not Math.max(...values): spreading a large journal overflows the call stack.
+    const rawEnd = ordered.reduce((latest, event) => Math.max(latest, timestamp(event) + Math.max(0, event.duration_ms || 0)), Number.NEGATIVE_INFINITY);
     const end = Math.max(start, rawEnd);
     const span = Math.max(1, end - start);
     const binCount = ordered.length === 1 ? 1 : Math.min(24, Math.max(8, Math.ceil(Math.sqrt(ordered.length) * 2)));
@@ -98,7 +104,7 @@
 
     const mixCounts = categories.map((category) => ({
       category,
-      count: ordered.filter((event) => categoryOf(event) === category).length
+      count: ordered.filter((event) => familyOf(event) === category).length
     })).filter((item) => item.count > 0);
     let mixOffset = 0;
     const mix = mixCounts.map((item) => {
@@ -107,7 +113,7 @@
       return { ...item, offset };
     });
     const latency = categories.map((category) => {
-      const categoryEvents = ordered.filter((event) => categoryOf(event) === category);
+      const categoryEvents = ordered.filter((event) => familyOf(event) === category);
       return {
         category,
         total: categoryEvents.reduce((sum, event) => sum + Math.max(0, event.duration_ms || 0), 0),

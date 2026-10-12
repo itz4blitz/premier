@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { api } from './lib/api';
+  import { ApiError, api } from './lib/api';
   import type { EventFilters, TraceEvent, TraceManifest } from './lib/types';
-  import { listKey } from './lib/types';
-  import { filterEvents, isIssue, materialEvent, runHealth } from './lib/analysis';
-  import { applyTraceComplete, mergeLiveEvents, resolveSelectedEvent, shouldCommitLoad, type EventRequest } from './lib/traceLoad';
+  import { isAbandoned, isRecording, isUnreadable, listKey } from './lib/types';
+  import { filterEvents, isIssue, materialEvent, runHealth, traceTimeBounds } from './lib/analysis';
+  import { EVENT_PAGE_SIZE, applyTraceComplete, eventPages, expectedEventCount, loadAllEvents, mergeLiveEvents, resolveSelectedEvent, shouldCommitLoad, traceListChanged, type EventLoadProgress, type EventRequest } from './lib/traceLoad';
   import { readViewSession, writeViewSession, clearViewSession } from './lib/viewSession';
   import TraceList from './lib/TraceList.svelte';
   import EventTimeline from './lib/EventTimeline.svelte';
@@ -22,6 +22,7 @@
   import { deriveRunIdentity } from './lib/runIdentity';
   import { focusTrap } from './lib/interactions';
   import { findEventById } from './lib/causal';
+  import { buildSafeExport } from './lib/safeExport';
   import {
     clearScopeFilters,
     parseInvestigationParams,
@@ -62,14 +63,17 @@
     : null;
 
   let traces = $state<TraceManifest[]>(bootSession?.traces ?? []);
-  let events = $state<TraceEvent[]>(bootSession?.events ?? []);
+  // Raw: the journal is only ever replaced, and proxying tens of thousands of events is costly.
+  let events = $state.raw<TraceEvent[]>(bootSession?.events ?? []);
   let selectedTrace = $state<TraceManifest | null>(bootSession?.selectedTrace ?? null);
   let selectedEvent = $state<TraceEvent | null>(bootSelected);
   let loading = $state(!bootSession);
   let error = $state<string | null>(null);
   let fatalError = $state<string | null>(null);
   let live = $state(false);
-  let streamState = $state<'recorded' | 'connecting' | 'live' | 'reconnecting' | 'disconnected'>('recorded');
+  let streamState = $state<'recorded' | 'abandoned' | 'unreadable' | 'connecting' | 'live' | 'reconnecting' | 'disconnected'>('recorded');
+  /** The run list could not be fetched on load, so what is painted is this tab's saved copy. */
+  let offlineNotice = $state<string | null>(null);
   let actionFeedback = $state('');
   let replaying = $state(false);
   let replayTimer: number | null = null;
@@ -80,11 +84,18 @@
   let comparison = $state<{ baseline: TraceManifest; baselineEvents: TraceEvent[] } | null>(null);
   let closeStream: (() => void) | null = null;
   let loadEpoch = 0;
+  /** Cancels the in-flight event pages of a load that a newer selection superseded. */
+  let loadAbort: AbortController | null = null;
+  /** Paged-load progress; null whenever the journal is complete in memory. */
+  let eventLoad = $state<EventLoadProgress | null>(null);
+  /** Selection still owed to the current load: a linked event, or the default pick. */
+  let pendingSelection: { request?: EventRequest } | null = null;
   let traceLoading = $state(Boolean(bootSession));
   /** Dim evidence only when the painted payload is not a warm stand-in for the request. */
   let contentStale = $state(false);
   /** Optimistic selection while a run is loading (stale-while-revalidate). */
-  let pendingTraceId = $state<string | null>(bootSession?.selectedTrace.trace_id ?? null);
+  // Traces are addressed by `listKey` (the artifact name): copies of a recording share its trace id.
+  let pendingTraceId = $state<string | null>(bootSession ? listKey(bootSession.selectedTrace) : null);
   let liveFlushTimer: number | null = null;
   let pendingLiveEvents: TraceEvent[] = [];
   let filters = $state<EventFilters>(bootInvestigation?.filters ?? emptyFilters());
@@ -103,33 +114,53 @@
   let runsSheetOpen = $state(false);
   let shortcutsOpen = $state(false);
   let relatedFeedback = $state('');
+  // A cache that holds only the head of a run cannot say an event is missing; the load will.
   let missingEventReference = $state<string | null>(
-    bootEventRequest && !bootSelected ? describeEventRequest(bootEventRequest) : null
+    bootEventRequest && !bootSelected && !bootSession?.truncated ? describeEventRequest(bootEventRequest) : null
   );
   let architectureWindowStart = $state<number | null>(bootInvestigation?.windowStart ?? null);
   let architectureWindowEnd = $state<number | null>(bootInvestigation?.windowEnd ?? null);
   let pollTimer: number | null = null;
+  /** The listed state the open run is being reloaded for, so a change the reload cannot settle reloads once. */
+  let reloadedForState: string | null = null;
   let sessionWriteTimer: number | null = null;
   let windowedEvents = $derived(timeScopedEvents(events));
   let windowedVisibleEvents = $derived(filterEvents(windowedEvents, filters));
   let categoryCounts = $derived.by(() => Object.fromEntries(
-    (['all', 'agent', 'model', 'tool', 'approval', 'process', 'error'] as const).map((category) => [
+    (['all', 'agent', 'model', 'tool', 'approval', 'process', 'other', 'error'] as const).map((category) => [
       category,
       filterEvents(windowedEvents, { ...filters, category, errorsOnly: false }).length
     ])
   ) as Record<EventFilters['category'], number>);
   let rightCompact = $derived(rightCollapsed || !selectedEvent);
   let filtersActive = $derived(scopeIsActive(filters, architectureWindowStart));
+  /** Listed, but with no events the server can serve: locked, a newer format, or damaged. */
+  let unreadable = $derived(selectedTrace !== null && isUnreadable(selectedTrace));
+  /** Only a dialog that is actually on screen may take the rest of the page out of reach. */
+  /**
+   * The open run's outcome from its loaded events; its list row shows this instead of the summary's.
+   * Only once every event the list knows of is loaded: until then the server's summary knows more.
+   */
+  let selectedRowHealth = $derived.by(() => {
+    if (!selectedTrace || pendingTraceId || !events.length) return null;
+    const key = listKey(selectedTrace);
+    const listed = traces.find((trace) => listKey(trace) === key)?.summary?.event_count ?? 0;
+    return events.length >= listed ? runHealth(selectedTrace, events) : null;
+  });
+  let dialogOpen = $derived(Boolean((assistantOpen && selectedTrace) || (compareOpen && selectedTrace) || runsSheetOpen || shortcutsOpen));
 
-  function traceTimeBounds(input: TraceEvent[]): { start: number; span: number } | null {
-    const timestamps = input.map((event) => Date.parse(event.timestamp)).filter(Number.isFinite);
-    if (!timestamps.length) return null;
-    const start = Math.min(...timestamps);
-    const end = Math.max(...input.map((event) => {
-      const timestamp = Date.parse(event.timestamp);
-      return Number.isFinite(timestamp) ? timestamp + Math.max(0, event.duration_ms || 0) : start;
-    }));
-    return { start, span: Math.max(1, end - start) };
+  function unreadableTitle(trace: TraceManifest): string {
+    if (trace.integrity === 'locked') return 'This trace is encrypted and no key that opens it was given';
+    if (trace.integrity === 'unsupported') return 'This trace needs a newer Premier';
+    return 'This trace is damaged and cannot be read';
+  }
+
+  function unreadableDetail(trace: TraceManifest): string {
+    const detail = trace.integrity_detail?.trim();
+    if (detail) return detail;
+    if (trace.integrity === 'locked') return 'Restart premier with --key-file to read it. The evidence is sealed, not damaged.';
+    if (trace.integrity === 'unsupported') return 'It was written in a later trace format than this build reads. Upgrade premier to open it.';
+    return 'Its manifest or journal could not be read. Run premier verify on the trace directory for the reason.';
   }
 
   function normalizedWindow(input: TraceEvent[], startMs: number, endMs: number): [number, number] {
@@ -221,9 +252,9 @@
     return items.find(isIssue) ?? null;
   }
 
-  function showFeedback(message: string) {
+  function showFeedback(message: string, durationMs = 2200) {
     actionFeedback = message;
-    window.setTimeout(() => { if (actionFeedback === message) actionFeedback = ''; }, 2200);
+    window.setTimeout(() => { if (actionFeedback === message) actionFeedback = ''; }, durationMs);
   }
 
   function persistSessionSoon() {
@@ -253,7 +284,7 @@
     return request.eventId ? `Event ${request.eventId}` : `Event sequence ${request.eventSequence}`;
   }
 
-  function writeUrl(traceId = selectedTrace?.trace_id, event = selectedEvent, mode: 'push' | 'replace' = 'replace') {
+  function writeUrl(traceId = selectedTrace ? listKey(selectedTrace) : undefined, event = selectedEvent, mode: 'push' | 'replace' = 'replace') {
     const href = serializeInvestigationUrl(window.location.href, {
       traceId,
       eventId: event?.event_id ?? null,
@@ -290,7 +321,7 @@
 
   function setViewMode(next: ViewMode) {
     viewMode = next;
-    writeUrl(selectedTrace?.trace_id, selectedEvent, 'push');
+    writeUrl(selectedTrace ? listKey(selectedTrace) : undefined, selectedEvent, 'push');
   }
 
   function setArchitectureWindow(startMs: number | null, endMs: number | null) {
@@ -338,11 +369,15 @@
     liveFlushTimer = window.setTimeout(() => flushLiveBatch(epoch), 80);
   }
 
-  async function selectTrace(trace: TraceManifest, eventRequest?: EventRequest, pushHistory = false) {
+  /**
+   * `keepScope`: the filters and time window were just read from the URL (a link, Back or Forward)
+   * and belong to this run; only a switch the user makes in the app starts a run unscoped.
+   */
+  async function selectTrace(trace: TraceManifest, eventRequest?: EventRequest, pushHistory = false, keepScope = false) {
     stopReplay();
-    const switching = Boolean(selectedTrace && selectedTrace.trace_id !== trace.trace_id);
-    const warmPaint = !switching && selectedTrace?.trace_id === trace.trace_id && events.length > 0;
-    if (switching) {
+    const switching = Boolean(selectedTrace && listKey(selectedTrace) !== listKey(trace));
+    const warmPaint = !switching && selectedTrace !== null && listKey(selectedTrace) === listKey(trace) && events.length > 0;
+    if (switching && !keepScope) {
       architectureWindowStart = null;
       architectureWindowEnd = null;
       filters = emptyFilters();
@@ -350,56 +385,100 @@
     closeStream?.();
     closeStream = null;
     clearLiveBatch();
+    loadAbort?.abort();
+    const abort = new AbortController();
+    loadAbort = abort;
     const epoch = ++loadEpoch;
     // Stale-while-revalidate: keep previous evidence painted until the new payload
     // commits atomically. Only dim when the paint is not already this run.
-    pendingTraceId = trace.trace_id;
+    pendingTraceId = listKey(trace);
     traceLoading = true;
     contentStale = !warmPaint;
     live = false;
-    streamState = trace.ended_at ? 'recorded' : 'connecting';
+    streamState = isRecording(trace) ? 'connecting' : isAbandoned(trace) ? 'abandoned' : 'recorded';
     error = null;
     fatalError = null;
     missingEventReference = null;
-    try {
-      const [detail, nextEvents] = await Promise.all([
-        api.trace(trace.trace_id).catch(() => trace),
-        api.events(trace.trace_id)
-      ]);
-      if (!shouldCommitLoad(epoch, loadEpoch)) return;
-      const committed: TraceManifest = { ...trace, ...detail };
-      let nextWindowStart = architectureWindowStart;
-      let nextWindowEnd = architectureWindowEnd;
-      if (nextWindowStart !== null && nextWindowEnd !== null) {
-        [nextWindowStart, nextWindowEnd] = normalizedWindow(nextEvents, nextWindowStart, nextWindowEnd);
-      }
-      architectureWindowStart = nextWindowStart;
-      architectureWindowEnd = nextWindowEnd;
-      const scopedEvents = filterEvents(
-        nextWindowStart !== null && nextWindowEnd !== null
-          ? nextEvents.filter((event) => {
-              const bounds = traceTimeBounds(nextEvents);
-              if (!bounds) return true;
-              const timestamp = Date.parse(event.timestamp);
-              const offset = timestamp - bounds.start;
-              const endOffset = offset + Math.max(0, event.duration_ms || 0);
-              return Number.isFinite(offset) && offset <= nextWindowEnd! && endOffset >= nextWindowStart!;
-            })
-          : nextEvents,
-        filters
-      );
-      const nextSelected = resolveSelectedEvent(nextEvents, scopedEvents, eventRequest, materialEvent);
-      missingEventReference = eventRequest && !nextSelected ? describeEventRequest(eventRequest) : null;
-      // Atomic commit of identity + evidence. Skip event array churn when ids match.
-      selectedTrace = committed;
-      if (!sameEventIds(events, nextEvents)) events = nextEvents;
-      if (selectedEvent?.event_id !== nextSelected?.event_id) selectedEvent = nextSelected;
+    eventLoad = null;
+    pendingSelection = null;
+    offlineNotice = null;
+    if (isUnreadable(trace)) {
+      // The server has no events for this entry; asking would only answer "trace not found".
+      // Show what the list already says about it instead.
+      selectedTrace = trace;
+      events = [];
+      selectedEvent = null;
+      streamState = 'unreadable';
+      loading = false;
+      traceLoading = false;
+      contentStale = false;
       pendingTraceId = null;
-      if (!missingEventReference) writeUrl(committed.trace_id, selectedEvent, pushHistory ? 'push' : 'replace');
-      persistSessionSoon();
-      if (!committed.ended_at) {
+      clearViewSession();
+      writeUrl(listKey(trace), null, pushHistory ? 'push' : 'replace');
+      return;
+    }
+    try {
+      const pages = eventPages(
+        (afterSequence, limit) => api.eventsPage(listKey(trace), { afterSequence, limit, signal: abort.signal }),
+        EVENT_PAGE_SIZE,
+        abort.signal
+      );
+      const [detail, first] = await Promise.all([
+        api.trace(listKey(trace)).catch(() => trace),
+        pages.next()
+      ]);
+      if (!shouldCommitLoad(epoch, loadEpoch) || first.done) return;
+      const committed: TraceManifest = { ...trace, ...detail };
+      const total = expectedEventCount(committed);
+      let loaded = first.value.events;
+      let complete = first.value.last;
+      let cursor = 0;
+      // A warm paint may already show more of this run than the first pages hold;
+      // never shrink it, swap once the load has caught up.
+      let painted = false;
+      const commitPage = (page: TraceEvent[]) => {
+        for (const event of page) if (event.sequence > cursor) cursor = event.sequence;
+        if (!complete) eventLoad = { loaded: loaded.length, total };
+        if (!painted && !complete && warmPaint && loaded.length < events.length) return;
+        const initial = !painted;
+        if (initial) {
+          painted = true;
+          // Atomic commit of identity + evidence. Skip event array churn when ids match.
+          selectedTrace = committed;
+          if (!sameEventIds(events, loaded)) events = loaded;
+          contentStale = false;
+          pendingTraceId = null;
+          // The first page is enough to leave the boot skeleton; the rest appends in place.
+          loading = false;
+          pendingSelection = { request: eventRequest };
+        } else {
+          events = loaded;
+        }
+        // Only the complete journal has the real span to clamp a requested time window against.
+        if (complete && architectureWindowStart !== null && architectureWindowEnd !== null) {
+          [architectureWindowStart, architectureWindowEnd] = normalizedWindow(loaded, architectureWindowStart, architectureWindowEnd);
+        }
+        resolvePendingSelection(initial ? loaded : page, initial, pushHistory);
+        if (complete) {
+          const unresolved = pendingSelection?.request;
+          pendingSelection = null;
+          if (unresolved && hasEventIdentity(unresolved)) missingEventReference = describeEventRequest(unresolved);
+        }
+        if (initial || complete) persistSessionSoon();
+      };
+      commitPage(loaded);
+      while (!complete) {
+        const next = await pages.next();
+        if (!shouldCommitLoad(epoch, loadEpoch) || next.done) return;
+        loaded = loaded.concat(next.value.events);
+        complete = next.value.last;
+        commitPage(next.value.events);
+      }
+      eventLoad = null;
+      // An abandoned trace has no recorder left to tail.
+      if (isRecording(committed)) {
         closeStream = api.stream(
-          committed.trace_id,
+          listKey(committed),
           (event) => enqueueLiveEvent(epoch, event),
           (state) => {
             if (!shouldCommitLoad(epoch, loadEpoch)) return;
@@ -413,18 +492,23 @@
             live = false;
             streamState = 'recorded';
             traces = traces.map((item) =>
-              item.trace_id === complete.trace_id ? { ...item, ...complete } : item
+              listKey(item) === listKey(complete) ? { ...item, ...complete } : item
             );
             persistSessionSoon();
-          }
+            // The completion carries no summary; the row's counts and outcome come from the list.
+            void api.traces().then((next) => { traces = next; }).catch(() => undefined);
+          },
+          // The pages already hold everything up to the tail; follow only what comes after.
+          cursor
         );
       } else {
         live = false;
-        streamState = 'recorded';
+        streamState = isAbandoned(committed) ? 'abandoned' : 'recorded';
       }
     } catch (cause) {
       if (!shouldCommitLoad(epoch, loadEpoch)) return;
       pendingTraceId = null;
+      pendingSelection = null;
       streamState = 'disconnected';
       error = cause instanceof Error ? cause.message : 'Unable to load trace.';
       if (warmPaint) {
@@ -440,15 +524,38 @@
       if (shouldCommitLoad(epoch, loadEpoch)) {
         traceLoading = false;
         contentStale = false;
-        if (pendingTraceId === trace.trace_id) pendingTraceId = null;
+        eventLoad = null;
+        if (pendingTraceId === listKey(trace)) pendingTraceId = null;
       }
     }
   }
 
+  function hasEventIdentity(request: EventRequest | undefined): boolean {
+    return Boolean(request?.eventId) || (request?.eventSequence !== undefined && request?.eventSequence !== null);
+  }
+
+  /**
+   * Settle the selection a load still owes. A linked event is looked up only in
+   * `arrived` (the newest page); the default pick waits for scoped evidence.
+   */
+  function resolvePendingSelection(arrived: TraceEvent[], initial: boolean, pushHistory: boolean) {
+    const pending = pendingSelection;
+    if (!pending || !selectedTrace) return;
+    const requested = hasEventIdentity(pending.request);
+    const next = requested
+      ? resolveSelectedEvent(arrived, arrived, pending.request, materialEvent)
+      : materialEvent(filterEvents(timeScopedEvents(events), filters));
+    if ((initial || next) && selectedEvent?.event_id !== next?.event_id) selectedEvent = next;
+    if (next) pendingSelection = null;
+    // A link that is still loading keeps its own URL; rewriting it now would drop the event.
+    if (next || (initial && !requested)) writeUrl(listKey(selectedTrace), selectedEvent, initial && pushHistory ? 'push' : 'replace');
+  }
+
   function selectEvent(event: TraceEvent) {
     missingEventReference = null;
+    pendingSelection = null;
     selectedEvent = event;
-    if (selectedTrace) writeUrl(selectedTrace.trace_id, event);
+    if (selectedTrace) writeUrl(listKey(selectedTrace), event);
   }
 
   function inspectEvent(event: TraceEvent) {
@@ -463,14 +570,15 @@
 
   function closeInspector() {
     missingEventReference = null;
+    pendingSelection = null;
     selectedEvent = null;
-    if (selectedTrace) writeUrl(selectedTrace.trace_id, null);
+    if (selectedTrace) writeUrl(listKey(selectedTrace), null);
   }
 
   function openRunOverview() {
     missingEventReference = null;
     selectedEvent = null;
-    if (selectedTrace) writeUrl(selectedTrace.trace_id, null, 'replace');
+    if (selectedTrace) writeUrl(listKey(selectedTrace), null, 'replace');
   }
 
   function changeFilters(next: EventFilters) {
@@ -490,7 +598,8 @@
     const related = findEventById(events, id);
     if (related) {
       relatedFeedback = '';
-      selectEvent(related);
+      // Reveal it: a relation outside the active filter or time range must still show in the timeline.
+      inspectEvent(related);
       return;
     }
     relatedFeedback = `Not in journal: ${id}`;
@@ -522,41 +631,17 @@
     }
   }
 
-  function redactString(value: string): string {
-    return value
-      .replace(/(bearer\s+)[a-z0-9._~+/=-]+/gi, '$1[REDACTED]')
-      .replace(/((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]');
-  }
-
-  function safeExportValue(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(safeExportValue);
-    if (typeof value === 'string') {
-      try {
-        const decoded = JSON.parse(value) as unknown;
-        if (decoded && typeof decoded === 'object') return JSON.stringify(safeExportValue(decoded));
-      } catch {
-        // Plain strings still receive token-pattern masking below.
-      }
-      return redactString(value);
-    }
-    if (!value || typeof value !== 'object') return value;
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => {
-      const normalized = key.toLowerCase().replace(/[- ]/g, '_');
-      const sensitive = /password|secret|token|authorization|cookie|api_key|private_key/.test(normalized);
-      return [key, sensitive ? '[REDACTED BY PREMIER]' : safeExportValue(child)];
-    }));
-  }
-
   function exportJson() {
     if (!selectedTrace) return;
-    const artifact = JSON.stringify(safeExportValue({ manifest: selectedTrace, events }), null, 2);
-    const url = URL.createObjectURL(new Blob([artifact], { type: 'application/json' }));
+    const { document: exported, label } = buildSafeExport(selectedTrace, events);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(exported, null, 2)], { type: 'application/json' }));
     const anchor = document.createElement('a');
     anchor.href = url;
     anchor.download = `${runTitle(selectedTrace).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase()}.redacted.json`;
     anchor.click();
-    URL.revokeObjectURL(url);
-    showFeedback('Redacted JSON export created');
+    // Released once the browser has had time to start the download; revoking in the same task can cancel it.
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    showFeedback(label, 6000);
   }
 
   function focusIssue() {
@@ -585,28 +670,56 @@
     }, 700);
   }
 
+  /** Counts baseline loads, so a slow one cannot overwrite the baseline chosen after it. */
+  let comparisonEpoch = 0;
+
   async function compareAgainst(traceId: string) {
+    const epoch = ++comparisonEpoch;
     baselineId = traceId;
     comparison = null;
     comparisonError = '';
-    const baseline = traces.find((trace) => trace.trace_id === traceId);
+    const baseline = traces.find((trace) => listKey(trace) === traceId);
     if (!baseline) return;
     comparisonLoading = true;
     try {
-      const baselineEvents = await api.events(traceId);
+      const baselineEvents = await loadAllEvents((afterSequence, limit) => api.eventsPage(traceId, { afterSequence, limit }));
+      if (epoch !== comparisonEpoch) return;
       comparison = { baseline, baselineEvents };
     } catch (cause) {
+      if (epoch !== comparisonEpoch) return;
       comparisonError = cause instanceof Error ? cause.message : 'Unable to compare traces.';
     } finally {
-      comparisonLoading = false;
+      if (epoch === comparisonEpoch) comparisonLoading = false;
     }
   }
 
   function openCompare() {
     compareOpen = true;
-    const initial = traces.find((trace) => trace.trace_id !== selectedTrace?.trace_id && trace.command[0] === selectedTrace?.command[0])
-      ?? traces.find((trace) => trace.trace_id !== selectedTrace?.trace_id);
-    if (initial) void compareAgainst(initial.trace_id);
+    const selectedKey = selectedTrace ? listKey(selectedTrace) : null;
+    // Reopening keeps the baseline that was chosen, as long as it is still a different, listed run.
+    const kept = traces.find((trace) => listKey(trace) === baselineId && listKey(trace) !== selectedKey);
+    if (kept && comparison && listKey(comparison.baseline) === baselineId && !comparisonError) return;
+    const initial = kept
+      ?? traces.find((trace) => listKey(trace) !== selectedKey && trace.command[0] === selectedTrace?.command[0])
+      ?? traces.find((trace) => listKey(trace) !== selectedKey);
+    if (initial) void compareAgainst(listKey(initial));
+  }
+
+  /** What tells two runs with the same title apart in the baseline picker. */
+  function baselineDescription(trace: TraceManifest): string {
+    const count = trace.summary?.event_count ?? trace.journal?.event_count ?? 0;
+    const started = Date.parse(trace.started_at);
+    return [
+      Number.isFinite(started) ? new Date(started).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : null,
+      `${count} event${count === 1 ? '' : 's'}`,
+      trace.artifact ?? null
+    ].filter(Boolean).join(' · ');
+  }
+
+  /** Open an event of the baseline run: that run becomes the open one. */
+  function inspectBaselineEvent(baseline: TraceManifest, event: TraceEvent) {
+    compareOpen = false;
+    void selectTrace(baseline, { eventId: event.event_id, eventSequence: event.sequence }, true);
   }
 
   function closeMore(restoreFocus = false) {
@@ -639,7 +752,8 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
-    const target = event.target as HTMLElement | null;
+    // The target is the window or document when nothing is focused; only an element can be a field.
+    const target = event.target instanceof Element ? event.target : null;
     if (event.key === 'Escape') {
       if (shortcutsOpen) shortcutsOpen = false;
       else if (runsSheetOpen) runsSheetOpen = false;
@@ -675,7 +789,10 @@
     const params = new URLSearchParams(window.location.search);
     parseRequestedState(params);
     const requestedId = params.get('trace');
-    const requested = requestedId ? traces.find((trace) => trace.trace_id === requestedId) : traces[0];
+    // A link names the artifact; one written before artifacts were addressed names the trace id.
+    const requested = requestedId
+      ? traces.find((trace) => listKey(trace) === requestedId) ?? traces.find((trace) => trace.trace_id === requestedId)
+      : traces[0];
     if (!requested) {
       selectedTrace = null;
       selectedEvent = null;
@@ -688,7 +805,7 @@
     const eventRequest: EventRequest | undefined = state.eventId || state.eventSequence !== null
       ? { eventId: state.eventId, eventSequence: state.eventSequence }
       : undefined;
-    await selectTrace(requested, eventRequest);
+    await selectTrace(requested, eventRequest, false, true);
   }
 
   function handlePopState() {
@@ -711,19 +828,76 @@
       traces = await api.traces();
       await applyLocationState();
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Unable to connect to Premier.';
+      const message = cause instanceof Error ? cause.message : 'Unable to connect to Premier.';
+      // A reload paint was waiting on this request; nothing else will clear its loading state.
+      traceLoading = false;
+      contentStale = false;
+      pendingTraceId = null;
+      eventLoad = null;
+      if (cause instanceof ApiError && cause.status === 401) {
+        // The server wants credentials: evidence cached by an earlier session must not stay readable.
+        clearViewSession();
+        traces = [];
+        events = [];
+        selectedTrace = null;
+        selectedEvent = null;
+        missingEventReference = null;
+        error = message;
+      } else if (selectedTrace) {
+        // Unreachable, with a saved copy on screen: keep it, and say that is what it is.
+        offlineNotice = message;
+        streamState = 'disconnected';
+      } else {
+        error = message;
+      }
     } finally {
       loading = false;
     }
     pollTimer = window.setInterval(() => {
       void api.traces().then((next) => {
-        if (next.length !== traces.length || next.some((item, index) => item.trace_id !== traces[index]?.trace_id || item.ended_at !== traces[index]?.ended_at)) {
-          traces = next;
+        // Rows show counts and outcomes, so a change in either is a change to the list.
+        if (traceListChanged(traces, next)) traces = next;
+        if (offlineNotice) {
+          // The server is back: replace the saved copy with what it has now.
+          offlineNotice = null;
+          void applyLocationState();
+          return;
         }
+        const current = pendingTraceId ? null : selectedTrace;
+        const listed = current ? next.find((item) => listKey(item) === listKey(current)) : undefined;
+        if (current && listed && (listed.integrity !== current.integrity || (listed.ended_at ?? null) !== (current.ended_at ?? null))) {
+          if (isAbandoned(listed) && !current.ended_at) {
+            // A recorder that died while its trace was open: stop tailing and say so.
+            closeStream?.();
+            closeStream = null;
+            flushLiveBatch(loadEpoch);
+            selectedTrace = { ...current, integrity: listed.integrity, integrity_detail: listed.integrity_detail };
+            live = false;
+            streamState = 'abandoned';
+            reloadedForState = null;
+          } else {
+            // The open run changed under the user (recovered, finalized, or recording again):
+            // what is painted is stale, so reload its manifest and events, keeping the selection.
+            const state = `${listKey(listed)}|${listed.integrity}|${listed.ended_at}`;
+            if (state !== reloadedForState) {
+              reloadedForState = state;
+              const inspected = selectedEvent;
+              void selectTrace(listed, inspected ? { eventId: inspected.event_id } : undefined).then(() => {
+                if (!inspected && selectedTrace && listKey(selectedTrace) === listKey(listed) && !pendingTraceId) openRunOverview();
+              });
+            }
+          }
+        } else if (listed) {
+          reloadedForState = null;
+        }
+        // The empty state has nothing selected; adopt the first recording as soon as it appears.
+        if (next.length && !selectedTrace && !pendingTraceId && !fatalError) void applyLocationState();
       }).catch(() => undefined);
     }, 4000);
   });
   onDestroy(() => {
+    loadEpoch += 1;
+    loadAbort?.abort();
     closeStream?.();
     clearLiveBatch();
     stopReplay();
@@ -741,7 +915,7 @@
 
 <main>
   <a class="skip-link" href="#main-content">Skip to evidence</a>
-  <header class="app-bar" inert={assistantOpen || compareOpen || runsSheetOpen || shortcutsOpen}>
+  <header class="app-bar" inert={dialogOpen}>
     <div class="brand" aria-label="Premier Trace">
       <span class="brand-mark" aria-hidden="true">
         <svg class="brand-mark-glyph" fill="none" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
@@ -767,17 +941,17 @@
     <div class="app-actions">
       {#if actionFeedback}<span class="action-feedback" role="status">{actionFeedback}</span>{/if}
       <button class="action-button runs-sheet-trigger" onclick={() => runsSheetOpen = true} title="Browse all runs">Runs</button>
-      <button class="action-button assistant-trigger" data-active={assistantOpen} onclick={() => assistantOpen = true}>Ask AI</button>
+      <button class="action-button assistant-trigger" data-active={assistantOpen} disabled={!selectedTrace || unreadable} title={selectedTrace && !unreadable ? undefined : 'Open a readable run to ask about it'} onclick={() => assistantOpen = true}>Ask AI</button>
       {#if issueEvent()}<button class="action-button action-primary" onclick={focusIssue} title="Jump to the next recorded issue">Next issue</button>{/if}
       <div class="action-menu" class:open={moreOpen}>
         <button bind:this={moreButton} class="menu-trigger" aria-label="More" aria-haspopup="menu" aria-expanded={moreOpen} onclick={toggleMore}>More</button>
         {#if moreOpen}<div bind:this={moreMenu} role="menu" tabindex="-1" aria-label="More trace actions" onkeydown={navigateMore}>
           <button role="menuitem" onclick={() => { closeMore(); void copyLink(); }}><span>Copy link</span><small>Deep link with filters and time window</small></button>
-          <button role="menuitem" onclick={() => { closeMore(); exportJson(); }}><span>Export safe JSON</span><small>Redacts common secret and credential fields</small></button>
+          <button role="menuitem" onclick={() => { closeMore(); exportJson(); }}><span>Export safe JSON</span><small>Best-effort masking of common secrets; token usage is kept</small></button>
           <button role="menuitem" onclick={() => { closeMore(); void shareTrace(); }}><span>Share local link</span><small>Open the system share sheet</small></button>
           <button role="menuitem" onclick={() => { closeMore(); shortcutsOpen = true; }}><span>Keyboard shortcuts</span><small>Press ? anytime</small></button>
           <hr />
-          <button role="menuitem" onclick={() => { closeMore(); openCompare(); }} disabled={traces.length < 2}><span>Compare runs</span><small>Semantic field, latency, token, and cost deltas</small></button>
+          <button role="menuitem" onclick={() => { closeMore(); openCompare(); }} disabled={traces.length < 2 || !selectedTrace}><span>Compare runs</span><small>Semantic field, latency, token, and cost deltas</small></button>
           <button role="menuitem" onclick={() => { closeMore(); toggleReplay(); }}><span>{replaying ? 'Stop slideshow' : 'Slideshow'}</span><small>700ms step through scoped events</small></button>
           {#if issueEvent()}<button role="menuitem" onclick={() => { closeMore(); focusIssue(); }}><span>Next issue</span><small>Jump to the next scoped issue</small></button>{/if}
           <button role="menuitem" onclick={() => { closeMore(); togglePane('left'); }}><span>{leftCollapsed ? 'Expand' : 'Compact'} runs</span><small>Toggle the run browser rail</small></button>
@@ -788,7 +962,7 @@
         </div>{/if}
       </div>
     </div>
-    <div class="connection" class:live class:recorded={streamState === 'recorded'} class:disconnected={streamState === 'reconnecting' || streamState === 'disconnected'} title={streamState === 'reconnecting' ? 'The live stream dropped. The browser is retrying automatically.' : undefined} role="status" aria-live="polite"><span></span>{streamState === 'live' ? 'STREAMING' : streamState === 'recorded' ? 'RECORDED' : streamState === 'reconnecting' ? 'RECONNECTING' : streamState === 'disconnected' ? 'DISCONNECTED' : 'CONNECTING'}</div>
+    <div class="connection" class:live class:recorded={streamState === 'recorded'} class:disconnected={streamState === 'reconnecting' || streamState === 'disconnected' || streamState === 'abandoned' || streamState === 'unreadable'} title={streamState === 'reconnecting' ? 'The live stream dropped. The browser is retrying automatically.' : streamState === 'disconnected' ? 'Not connected to the viewer server. Nothing is being retried; reload to try again.' : streamState === 'abandoned' ? (selectedTrace?.integrity_detail || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.') : streamState === 'unreadable' && selectedTrace ? unreadableDetail(selectedTrace) : undefined} role="status" aria-live="polite"><span></span>{streamState === 'live' ? 'STREAMING' : streamState === 'recorded' ? 'RECORDED' : streamState === 'abandoned' ? 'ABANDONED' : streamState === 'unreadable' ? (selectedTrace?.integrity === 'locked' ? 'LOCKED' : selectedTrace?.integrity === 'unsupported' ? 'UNSUPPORTED' : 'DAMAGED') : streamState === 'reconnecting' ? 'RECONNECTING' : streamState === 'disconnected' ? 'DISCONNECTED' : 'CONNECTING'}</div>
   </header>
 
   {#if loading}
@@ -809,7 +983,7 @@
       </div>
     </section>
   {:else if fatalError}
-    <section class="state-screen error"><span class="state-icon">!</span><strong>Trace not found</strong><span>{fatalError}</span><button onclick={() => { const url = new URL(window.location.href); url.searchParams.delete('trace'); url.searchParams.delete('event'); history.pushState({}, '', url); void applyLocationState(); }}>Open the latest available run</button></section>
+    <section class="state-screen error"><span class="state-icon">!</span><strong>Trace not found</strong><span>{fatalError}</span><button onclick={() => { const url = new URL(window.location.href); url.searchParams.delete('trace'); url.searchParams.delete('event'); url.searchParams.delete('event_id'); history.pushState({}, '', url); void applyLocationState(); }}>Open the latest available run</button></section>
   {:else if error && traces.length === 0}
     <section class="state-screen error"><span class="state-icon">!</span><strong>Viewer unavailable</strong><span>{error}</span><button onclick={() => location.reload()}>Try again</button></section>
   {:else if traces.length === 0}
@@ -829,60 +1003,21 @@
       <p class="empty-note">Process recordings capture stdout/stderr automatically. Under <code>premier record</code>, emit typed agent events with <code>premier emit</code> or the <code>@premierstudio/trace</code> package for the full multi-actor experience.</p>
     </section>
   {:else}
-    {#if compareOpen && selectedTrace}
-      <div class="compare-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) compareOpen = false; }}>
-        <div class="compare-panel" role="dialog" aria-modal="true" aria-labelledby="compare-title" tabindex="-1" use:focusTrap={{ onEscape: () => compareOpen = false, initialFocus: '.inspector-close' }}>
-          <div class="compare-header"><div><span>Regression analysis</span><strong id="compare-title">Compare runs</strong></div><button class="inspector-close" onclick={() => compareOpen = false} aria-label="Close comparison">×</button></div>
-          <div class="compare-controls"><label>Baseline<PremierSelect label="Comparison baseline" value={baselineId} options={traces.filter((trace) => trace.trace_id !== selectedTrace?.trace_id).map((trace) => ({ value: trace.trace_id, label: runTitle(trace), description: `${trace.summary?.event_count ?? trace.journal?.event_count ?? 0} recorded events` }))} onchange={(value) => void compareAgainst(value)} /></label><span>Candidate<strong>{runTitle(selectedTrace)}</strong></span></div>
-          {#if comparisonLoading}<div class="compare-divergence">Loading baseline evidence…</div>
-          {:else if comparisonError}<div class="compare-divergence error">{comparisonError}</div>
-          {:else if comparison}
-            <div class="compare-content"><TraceComparison baseline={comparison.baseline} current={selectedTrace} baselineEvents={comparison.baselineEvents} currentEvents={events} onselectCurrent={(event) => { compareOpen = false; inspectEvent(event); }} /></div>
-          {/if}
-        </div>
-      </div>
-    {/if}
-    {#if assistantOpen && selectedTrace}
-      <div class="assistant-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) assistantOpen = false; }}>
-        <div class="assistant-drawer" role="dialog" aria-modal="true" aria-label="Ask your local AI" tabindex="-1" use:focusTrap={{ onEscape: () => assistantOpen = false, initialFocus: '.assistant-close' }}>
-          <LocalAssistant traceId={selectedTrace.trace_id} {selectedEvent} onclose={() => assistantOpen = false} />
-        </div>
-      </div>
-    {/if}
-    {#if runsSheetOpen}
-      <div class="runs-sheet-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) runsSheetOpen = false; }}>
-        <div class="runs-sheet" role="dialog" aria-modal="true" aria-label="All runs" tabindex="-1" use:focusTrap={{ onEscape: () => runsSheetOpen = false, initialFocus: '.runs-sheet-close' }}>
-          <div class="runs-sheet-header">
-            <div><span>Runs</span><strong>{traces.length} available</strong></div>
-            <button type="button" class="runs-sheet-close inspector-close" onclick={() => runsSheetOpen = false} aria-label="Close runs">×</button>
-          </div>
-          <div class="runs-sheet-body">
-            <TraceList traces={traces} selectedId={pendingTraceId ?? selectedTrace?.trace_id ?? null} onselect={(trace) => { runsSheetOpen = false; void selectTrace(trace, undefined, true); }} />
-          </div>
-        </div>
-      </div>
-    {/if}
-    {#if shortcutsOpen}
-      <div class="shortcuts-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) shortcutsOpen = false; }}>
-        <div class="shortcuts-panel" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" tabindex="-1" use:focusTrap={{ onEscape: () => shortcutsOpen = false }}>
-          <div class="shortcuts-header"><strong id="shortcuts-title">Keyboard shortcuts</strong><button type="button" class="inspector-close" onclick={() => shortcutsOpen = false} aria-label="Close shortcuts">×</button></div>
-          <dl class="shortcuts-list">
-            <div><dt>j / k</dt><dd>Next / previous event in scope</dd></div>
-            <div><dt>?</dt><dd>Toggle this help</dd></div>
-            <div><dt>Esc</dt><dd>Close dialogs and inspector</dd></div>
-            <div><dt>Arrow keys</dt><dd>Move within focused lists</dd></div>
-          </dl>
-        </div>
-      </div>
-    {/if}
-    <div class="run-shell" class:trace-loading={traceLoading} class:content-stale={contentStale} class:shell-enter={!bootSession} id="main-content" inert={assistantOpen || compareOpen || runsSheetOpen || shortcutsOpen} aria-busy={traceLoading} bind:this={runShellElement} style={`--time-navigator:${selectedTrace ? timeNavigatorHeight : 0}px`}>
+    <div class="run-shell" class:trace-loading={traceLoading} class:content-stale={contentStale} class:shell-enter={!bootSession} id="main-content" inert={dialogOpen} aria-busy={traceLoading} bind:this={runShellElement} style={`--time-navigator:${selectedTrace && !unreadable ? timeNavigatorHeight : 0}px`}>
       {#if traceLoading}
         <div class="trace-load-progress" role="status" aria-live="polite">
           <span class="trace-load-bar" aria-hidden="true"></span>
-          <span class="sr-only">Loading run evidence…</span>
+          <span class="sr-only">Loading run evidence…{#if eventLoad} {eventLoad.loaded.toLocaleString('en-US')}{eventLoad.total !== null && eventLoad.total >= eventLoad.loaded ? ` of ${eventLoad.total.toLocaleString('en-US')}` : ''} events loaded{/if}</span>
         </div>
       {/if}
-      {#if selectedTrace}
+      {#if offlineNotice}
+        <div class="missing-evidence-banner" role="alert">
+          <span class="missing-evidence-icon" aria-hidden="true">!</span>
+          <span><strong>Viewer server unreachable</strong><small>{offlineNotice} This is the copy of the run saved in this tab, which may be incomplete or out of date.</small></span>
+          <button type="button" onclick={() => location.reload()}>Try again</button>
+        </div>
+      {/if}
+      {#if selectedTrace && !unreadable}
         <div class="time-navigator" aria-label="Run time navigator">
           <ArchitectureView
             {events}
@@ -909,6 +1044,13 @@
             </div>
           {/if}
         </div>
+      {:else if unreadable}
+        <!--
+          The run shell is a three-row grid: time navigator, filters, workspace. A trace that cannot be
+          read has no time navigator; this keeps its (zero-height) row, so the filters and the
+          workspace do not each move up a row and leave the workspace 48 pixels tall.
+        -->
+        <div class="time-navigator-placeholder" aria-hidden="true"></div>
       {/if}
       {#if relatedFeedback}<div class="relation-banner" role="status">{relatedFeedback}</div>{/if}
       <FilterBar
@@ -928,7 +1070,7 @@
         style={`--trace-pane: ${leftCollapsed ? leftRailWidth : leftWidth}px; --left-divider: ${leftCollapsed ? 0 : 8}px; --inspector-pane: ${rightCompact ? rightRailWidth : rightWidth}px; --right-divider: ${rightCompact ? 0 : 8}px;`}
         bind:this={workspaceElement}
       >
-        <TraceList {traces} selectedId={pendingTraceId ?? selectedTrace?.trace_id ?? null} onselect={(trace) => void selectTrace(trace, undefined, true)} compact={leftCollapsed} onrestore={() => togglePane('left')} />
+        <TraceList {traces} selectedHealth={selectedRowHealth} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => void selectTrace(trace, undefined, true)} compact={leftCollapsed} onrestore={() => togglePane('left')} />
         <SplitHandle side="left" label="trace list" value={leftWidth} min={leftLimits.min} max={leftLimits.max} collapsed={leftCollapsed} onresize={(value) => resizePane('left', value)} oncollapse={() => togglePane('left')} />
         <section class="evidence-main" aria-label="Trace visualization workspace">
           <div class="evidence-view-toolbar">
@@ -942,13 +1084,19 @@
             </span>
           </div>
           <div class="evidence-view" class:system-mode={viewMode === 'map'}>
-            {#if error}
+            {#if unreadable && selectedTrace}
+              <section class="inline-error unreadable-trace" role="status" aria-label="Why this trace cannot be opened">
+                <strong>{unreadableTitle(selectedTrace)}</strong>
+                <span>{unreadableDetail(selectedTrace)}</span>
+                {#if selectedTrace.artifact}<code>{selectedTrace.artifact}</code>{/if}
+              </section>
+            {:else if error}
               <section class="inline-error"><strong>Trace could not be opened</strong><span>{error}</span></section>
             {:else}
               {#if viewMode === 'timeline'}
                 <div class="mode-content events-mode">
-                  <InvestigationSummary trace={selectedTrace!} {events} onselect={inspectEvent} />
-                  <EventTimeline events={windowedVisibleEvents} selectedSequence={selectedEvent?.sequence ?? null} onselect={selectEvent} />
+                  {#if selectedTrace}<InvestigationSummary trace={selectedTrace} {events} onselect={inspectEvent} />{/if}
+                  <EventTimeline events={windowedVisibleEvents} journal={events} selectedSequence={selectedEvent?.sequence ?? null} onselect={selectEvent} loading={eventLoad} />
                 </div>
               {:else if viewMode === 'analytics'}
                 <div class="mode-content analytics-mode"><TraceAnalytics events={windowedVisibleEvents} selectedEventId={selectedEvent?.event_id ?? null} {live} filtered={filtersActive} onreset={clearScope} onselect={selectEvent} /></div>
@@ -974,6 +1122,53 @@
         <SplitHandle side="right" label="event inspector" value={rightWidth} min={rightLimits.min} max={rightLimits.max} collapsed={rightCompact} onresize={(value) => resizePane('right', value)} oncollapse={() => togglePane('right')} />
         {#if selectedEvent}<button class="inspector-scrim" aria-label="Dismiss event inspector backdrop" onclick={closeInspector}></button>{/if}
         <Inspector event={selectedEvent} events={events} onclose={closeInspector} onnavigate={selectRelated} oncorrelation={filterByCorrelation} compact={rightCompact} onrestore={restoreRightPane} />
+      </div>
+    </div>
+  {/if}
+  <!-- Dialogs live outside the state branches: their triggers work on every screen. -->
+  {#if compareOpen && selectedTrace}
+    <div class="compare-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) compareOpen = false; }}>
+      <div class="compare-panel" role="dialog" aria-modal="true" aria-labelledby="compare-title" tabindex="-1" use:focusTrap={{ onEscape: () => compareOpen = false, initialFocus: '.inspector-close' }}>
+        <div class="compare-header"><div><span>Regression analysis</span><strong id="compare-title">Compare runs</strong></div><button class="inspector-close" onclick={() => compareOpen = false} aria-label="Close comparison">×</button></div>
+        <div class="compare-controls"><label>Baseline<PremierSelect label="Comparison baseline" value={baselineId} options={traces.filter((trace) => !selectedTrace || listKey(trace) !== listKey(selectedTrace)).map((trace) => ({ value: listKey(trace), label: runTitle(trace), description: baselineDescription(trace) }))} onchange={(value) => void compareAgainst(value)} /></label><span>Candidate<strong>{runTitle(selectedTrace)}</strong></span></div>
+        {#if comparisonLoading}<div class="compare-divergence">Loading baseline evidence…</div>
+        {:else if comparisonError}<div class="compare-divergence error">{comparisonError}</div>
+        {:else if comparison}
+          <div class="compare-content"><TraceComparison baseline={comparison.baseline} current={selectedTrace} baselineEvents={comparison.baselineEvents} currentEvents={events} onselectCurrent={(event) => { compareOpen = false; inspectEvent(event); }} onselectBaseline={(event) => inspectBaselineEvent(comparison!.baseline, event)} /></div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+  {#if assistantOpen && selectedTrace}
+    <div class="assistant-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) assistantOpen = false; }}>
+      <div class="assistant-drawer" role="dialog" aria-modal="true" aria-label="Ask an AI CLI installed here" tabindex="-1" use:focusTrap={{ onEscape: () => assistantOpen = false, initialFocus: '.assistant-close' }}>
+        <LocalAssistant traceId={listKey(selectedTrace)} {selectedEvent} onclose={() => assistantOpen = false} />
+      </div>
+    </div>
+  {/if}
+  {#if runsSheetOpen}
+    <div class="runs-sheet-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) runsSheetOpen = false; }}>
+      <div class="runs-sheet" role="dialog" aria-modal="true" aria-label="All runs" tabindex="-1" use:focusTrap={{ onEscape: () => runsSheetOpen = false, initialFocus: '.runs-sheet-close' }}>
+        <div class="runs-sheet-header">
+          <div><span>Runs</span><strong>{traces.length} available</strong></div>
+          <button type="button" class="runs-sheet-close inspector-close" onclick={() => runsSheetOpen = false} aria-label="Close runs">×</button>
+        </div>
+        <div class="runs-sheet-body">
+          <TraceList traces={traces} selectedHealth={selectedRowHealth} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => { runsSheetOpen = false; void selectTrace(trace, undefined, true); }} />
+        </div>
+      </div>
+    </div>
+  {/if}
+  {#if shortcutsOpen}
+    <div class="shortcuts-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) shortcutsOpen = false; }}>
+      <div class="shortcuts-panel" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" tabindex="-1" use:focusTrap={{ onEscape: () => shortcutsOpen = false }}>
+        <div class="shortcuts-header"><strong id="shortcuts-title">Keyboard shortcuts</strong><button type="button" class="inspector-close" onclick={() => shortcutsOpen = false} aria-label="Close shortcuts">×</button></div>
+        <dl class="shortcuts-list">
+          <div><dt>j / k</dt><dd>Next / previous event in scope</dd></div>
+          <div><dt>?</dt><dd>Toggle this help</dd></div>
+          <div><dt>Esc</dt><dd>Close dialogs and inspector</dd></div>
+          <div><dt>Arrow keys</dt><dd>Move within focused lists</dd></div>
+        </dl>
       </div>
     </div>
   {/if}

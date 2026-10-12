@@ -1,12 +1,45 @@
+<script lang="ts" module>
+  import type { AssistantContext as Context, AssistantHistoryMessage as HistoryMessage } from './types';
+
+  type SessionMessage = HistoryMessage & { id: number; provider?: string; elapsedMs?: number; context?: Context };
+
+  /**
+   * One conversation per trace, kept for as long as the page is open. The panel is unmounted when it
+   * closes (Escape, the backdrop, the close button); the conversation, the draft and an answer that
+   * is still on its way must outlive that.
+   */
+  interface Session {
+    messages: SessionMessage[];
+    draft: string;
+    provider: string;
+    scope: 'run' | 'event';
+    consented: Record<string, boolean>;
+    messageId: number;
+    /** The request in flight, if any. Settles after `messages` and `error` were updated. */
+    pending: Promise<void> | null;
+    error: string;
+  }
+
+  const sessions = new Map<string, Session>();
+
+  /** Forget every kept conversation. For tests. */
+  export function resetAssistantSessions(): void {
+    sessions.clear();
+  }
+</script>
+
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { api } from './api';
   import { eventSummary } from './analysis';
   import { renderAssistantMarkdown } from './markdown';
   import PremierSelect from './PremierSelect.svelte';
   import type {
     AssistantAvailability,
+    AssistantContext,
     AssistantHistoryMessage,
+    AssistantPreview,
+    AssistantRequest,
     TraceEvent
   } from './types';
 
@@ -17,7 +50,7 @@
   } = $props();
 
   type Scope = 'run' | 'event';
-  type ChatMessage = AssistantHistoryMessage & { id: number; provider?: string; elapsedMs?: number };
+  type ChatMessage = SessionMessage;
 
   const MAX_DISPLAY_MESSAGES = 12;
   const MAX_RETAINED_MESSAGES = 24;
@@ -29,31 +62,142 @@
     'What evidence should I inspect next, and why?'
   ];
 
+  const session: Session = untrack(() => {
+    const known = sessions.get(traceId);
+    if (known) return known;
+    const fresh: Session = { messages: [], draft: '', provider: '', scope: 'run', consented: {}, messageId: 0, pending: null, error: '' };
+    sessions.set(traceId, fresh);
+    return fresh;
+  });
+
   let providers = $state<AssistantAvailability[]>([]);
-  let provider = $state('');
-  let scope = $state<Scope>('run');
-  let prompt = $state('');
-  let messages = $state<ChatMessage[]>([]);
+  let provider = $state(session.provider);
+  let scope = $state<Scope>(session.scope);
+  let prompt = $state(session.draft);
+  let messages = $state<ChatMessage[]>(session.messages);
   let loadingProviders = $state(true);
-  let waiting = $state(false);
+  let waiting = $state(session.pending !== null);
   let loadError = $state('');
-  let sendError = $state('');
+  let sendError = $state(session.error);
   let providerNotice = $state('');
-  let messageId = 0;
   let textarea: HTMLTextAreaElement;
+  /** What the next question would send, as the server would build it. */
+  let preview = $state<AssistantPreview | null>(null);
+  let previewError = $state('');
+  let promptShown = $state(false);
+  let previewRequest = 0;
 
   const availableProviders = $derived(providers.filter((item) => item.available));
   const unavailableProviders = $derived(providers.filter((item) => !item.available));
   const selectedProvider = $derived(providers.find((item) => item.provider === provider) ?? null);
   const displayedMessages = $derived(messages.slice(-MAX_DISPLAY_MESSAGES));
   const hiddenMessageCount = $derived(Math.max(0, messages.length - displayedMessages.length));
-  const canSubmit = $derived(Boolean(traceId && provider && prompt.trim() && !waiting && selectedProvider?.available));
+  /** Who receives what the selected CLI sends: the CLI runs here, the model does not. */
+  const VENDORS: Record<string, string> = { claude: 'Anthropic', codex: 'OpenAI', gemini: 'Google', grok: 'xAI' };
+  const vendor = $derived(VENDORS[provider] ?? 'the provider');
+  /** Providers the user agreed to send trace content to, for as long as this panel is open. */
+  let consented = $state<Record<string, boolean>>(session.consented);
+  const hasConsent = $derived(Boolean(provider && consented[provider]));
+  const canSubmit = $derived(Boolean(traceId && provider && prompt.trim() && !waiting && selectedProvider?.available && hasConsent));
 
   $effect(() => {
     if (!selectedEvent && scope === 'event') scope = 'run';
   });
 
-  onMount(loadProviders);
+  // What is typed and chosen is kept with the trace, not with this mounted panel.
+  $effect(() => {
+    session.draft = prompt;
+    session.provider = provider;
+    session.scope = scope;
+    session.consented = consented;
+  });
+
+  // The coverage line follows the scope and the selected event.
+  $effect(() => {
+    void scope;
+    void selectedEvent?.event_id;
+    void messages.length;
+    if (!loadingProviders && provider) untrack(() => void refreshPreview());
+  });
+
+  onMount(() => {
+    void loadProviders();
+    // A question asked before the panel was closed is still being answered: wait for it here too.
+    const pending = session.pending;
+    if (pending) void pending.then(() => adoptSession());
+  });
+
+  /** Take over what a request that outlived an earlier mount of this panel left in the session. */
+  function adoptSession(): void {
+    messages = session.messages;
+    sendError = session.error;
+    if (session.error) prompt = session.draft;
+    waiting = session.pending !== null;
+  }
+
+  function requestBody(question: string, history: AssistantHistoryMessage[]): AssistantRequest {
+    return {
+      provider,
+      prompt: question,
+      history,
+      ...(scope === 'event' && selectedEvent ? { selected_event_id: selectedEvent.event_id } : {})
+    };
+  }
+
+  /** Ask the server what a question would send. Nothing leaves this machine to answer that. */
+  async function refreshPreview(): Promise<void> {
+    if (!provider) return;
+    const request = ++previewRequest;
+    try {
+      const next = await api.previewAssistant(traceId, requestBody(prompt.trim(), boundedHistory(messages)));
+      if (request !== previewRequest) return;
+      preview = next;
+      previewError = '';
+    } catch (error) {
+      if (request !== previewRequest) return;
+      preview = null;
+      previewError = error instanceof Error ? error.message : 'Could not work out what would be sent.';
+    }
+  }
+
+  async function togglePrompt(): Promise<void> {
+    promptShown = !promptShown;
+    // Include the question as it stands now.
+    if (promptShown) await refreshPreview();
+  }
+
+  function range(context: AssistantContext): string {
+    if (context.first_sequence === undefined || context.last_sequence === undefined) return 'no events';
+    return context.first_sequence === context.last_sequence
+      ? `event #${context.first_sequence}`
+      : `events #${context.first_sequence}–#${context.last_sequence}`;
+  }
+
+  /** "events #12–#51 (40 of 300)", with the selected event named first when one is sent. */
+  function coverage(context: AssistantContext): string {
+    const all = context.included_events >= context.total_events;
+    const recent = context.total_events === 0
+      ? 'no events (the trace has none)'
+      : all
+        ? `all ${context.total_events} event${context.total_events === 1 ? '' : 's'} (${range(context)})`
+        : `${range(context)} (the newest ${context.included_events} of ${context.total_events})`;
+    return context.selected_sequence !== undefined ? `the selected event #${context.selected_sequence} and ${recent}` : recent;
+  }
+
+  function notSent(context: AssistantContext): string {
+    const missing = omitted(context);
+    return `${missing.toLocaleString()} earlier event${missing === 1 ? ' is' : 's are'} not sent, so a question about the whole run is answered from this range only.`;
+  }
+
+  /** What an answer was based on, said with the answer. */
+  function basis(context: AssistantContext): string {
+    const missing = omitted(context);
+    return `Based on ${coverage(context)}.${missing ? ` ${missing.toLocaleString()} earlier event${missing === 1 ? ' was' : 's were'} not sent to the model.` : ''}`;
+  }
+
+  function omitted(context: AssistantContext): number {
+    return Math.max(0, context.total_events - context.included_events);
+  }
 
   async function loadProviders(): Promise<void> {
     loadingProviders = true;
@@ -77,6 +221,8 @@
 
   function changeProvider(next: string): void {
     if (next !== provider && messages.length) {
+      session.messages = [];
+      session.error = '';
       messages = [];
       sendError = '';
       providerNotice = 'Conversation cleared because each provider receives its own context.';
@@ -89,34 +235,37 @@
     const question = prompt.trim();
     if (!canSubmit || !question) return;
 
-    const priorHistory = boundedHistory(messages);
-    const userMessage: ChatMessage = { id: ++messageId, role: 'user', content: question };
-    messages = [...messages, userMessage].slice(-MAX_RETAINED_MESSAGES);
+    const body = requestBody(question, boundedHistory(messages));
+    const userMessage: ChatMessage = { id: ++session.messageId, role: 'user', content: question };
+    session.messages = [...session.messages, userMessage].slice(-MAX_RETAINED_MESSAGES);
+    session.error = '';
+    session.draft = '';
+    messages = session.messages;
     prompt = '';
     sendError = '';
     waiting = true;
-    try {
-      const response = await api.askAssistant(traceId, {
-        provider,
-        prompt: question,
-        history: priorHistory,
-        ...(scope === 'event' && selectedEvent ? { selected_event_id: selectedEvent.event_id } : {})
-      });
+    // The outcome is written to the session first: this panel may be closed before the answer arrives.
+    const pending = api.askAssistant(traceId, body).then((response) => {
       const answerMessage: ChatMessage = {
-        id: ++messageId,
+        id: ++session.messageId,
         role: 'assistant',
         content: response.answer,
         provider: response.provider,
-        elapsedMs: response.elapsed_ms
+        elapsedMs: response.elapsed_ms,
+        context: response.context
       };
-      messages = [...messages, answerMessage].slice(-MAX_RETAINED_MESSAGES);
-    } catch (error) {
-      messages = messages.filter((message) => message.id !== userMessage.id);
-      sendError = error instanceof Error ? error.message : 'The local assistant did not respond.';
-      prompt = question;
-    } finally {
-      waiting = false;
-    }
+      session.messages = [...session.messages, answerMessage].slice(-MAX_RETAINED_MESSAGES);
+    }, (error: unknown) => {
+      session.messages = session.messages.filter((message) => message.id !== userMessage.id);
+      session.error = error instanceof Error ? error.message : 'The local assistant did not respond.';
+      // The question goes back to the composer, ahead of anything typed since.
+      session.draft = session.draft.trim() ? `${question}\n${session.draft}` : question;
+    }).finally(() => {
+      if (session.pending === pending) session.pending = null;
+    });
+    session.pending = pending;
+    await pending;
+    adoptSession();
   }
 
   function boundedHistory(input: ChatMessage[]): AssistantHistoryMessage[] {
@@ -151,18 +300,18 @@
       </span>
       <div>
         <span class="eyebrow">Trace copilot</span>
-        <h2 id="assistant-title">Ask your local AI</h2>
+        <h2 id="assistant-title">Ask an AI CLI installed here</h2>
       </div>
     </div>
     {#if selectedProvider}
-      <span class="privacy-note"><i aria-hidden="true"></i>{selectedProvider.label} CLI</span>
+      <span class="privacy-note"><i aria-hidden="true"></i>{selectedProvider.label} CLI · sends to {vendor}</span>
     {/if}
     {#if onclose}<button class="assistant-close" type="button" onclick={onclose}>Close AI workspace</button>{/if}
   </header>
 
   <div class="assistant-controls">
     <div class="provider-control">
-      <label for="assistant-provider">Local provider</label>
+      <label for="assistant-provider">Provider CLI</label>
       {#if loadingProviders}
         <div class="provider-loading" role="status"><span aria-hidden="true"></span>Discovering installed CLIs…</div>
       {:else if loadError}
@@ -172,19 +321,16 @@
         </div>
       {:else}
         <PremierSelect
-          label="Local provider"
+          id="assistant-provider"
+          label="Provider CLI"
           value={provider}
           options={availableProviders.length
             ? availableProviders.map((item) => ({
                 value: item.provider,
                 label: item.label,
-                description: item.provider === 'claude'
-                  ? 'Anthropic · verified local CLI'
-                  : item.provider === 'codex'
-                    ? 'OpenAI · verified local CLI'
-                    : 'Capability-checked local CLI'
+                description: `Sends to ${VENDORS[item.provider] ?? 'the provider'} · CLI runs on this machine`
               }))
-            : [{ value: '', label: 'No safe provider available', disabled: true }]}
+            : [{ value: '', label: 'No provider available', disabled: true }]}
           disabled={!availableProviders.length || waiting}
           onchange={changeProvider}
         />
@@ -196,7 +342,7 @@
       <div class="scope-options">
         <label class:active={scope === 'run'}>
           <input type="radio" name="assistant-scope" value="run" bind:group={scope} disabled={waiting} />
-          <span><strong>Run context</strong><small>Manifest + recent events</small></span>
+          <span><strong>Run context</strong><small>{preview && preview.context.scope === 'run' && preview.context.total_events ? `Manifest + ${coverage(preview.context)}` : 'Manifest + recent events'}</small></span>
         </label>
         <label class:active={scope === 'event'} class:disabled={!selectedEvent}>
           <input type="radio" name="assistant-scope" value="event" bind:group={scope} disabled={!selectedEvent || waiting} />
@@ -204,7 +350,42 @@
         </label>
       </div>
     </fieldset>
-    <p class="context-disclosure">Premier redacts sensitive field names, bounds the context, and invokes the selected CLI with its verified read-only/tool-deny flags. The provider may still use its configured account and network.</p>
+    <div class="context-disclosure">
+      <p>Asking sends trace content off this machine: the run's manifest and its most recent events (or the selected event), redacted by Premier's secret rules, go with your question to {vendor}'s model service through the {selectedProvider?.label ?? 'selected'} CLI and the account it is signed in to. Captured output is sent as recorded. Nothing is sent until you ask.</p>
+      {#if provider}
+        {#if selectedProvider?.containment_summary}
+          <p class="containment" class:weaker={selectedProvider.containment !== 'no_tools'} data-testid="assistant-containment" data-containment={selectedProvider.containment}>
+            <strong>What the CLI can do while it answers:</strong> {selectedProvider.containment_summary}
+            {#if selectedProvider.containment !== 'no_tools'}<em>Trace content is untrusted input to it: text recorded in the trace could steer what it does with those abilities.</em>{/if}
+          </p>
+        {/if}
+        <label class="consent">
+          <input type="checkbox" checked={hasConsent} disabled={waiting} onchange={(event) => { consented = { ...consented, [provider]: event.currentTarget.checked }; }} />
+          <span>Send redacted trace content to {vendor}</span>
+        </label>
+        <div class="coverage" data-testid="assistant-coverage" aria-live="polite">
+          {#if preview}
+            <span>
+              <strong>What will be sent:</strong> the run's outcome and manifest, {coverage(preview.context)}{#if preview.context.history_messages}, {preview.context.history_messages} earlier message{preview.context.history_messages === 1 ? '' : 's'} of this conversation{/if} and your question — about {preview.context.prompt_chars.toLocaleString()} characters.
+              {#if omitted(preview.context)}<em>{notSent(preview.context)}</em>{/if}
+            </span>
+            <button type="button" aria-expanded={promptShown} aria-controls="assistant-prompt-preview" onclick={togglePrompt}>{promptShown ? 'Hide the exact text' : 'Show the exact text'}</button>
+          {:else if previewError}
+            <span>What would be sent could not be worked out: {previewError}</span>
+            <button type="button" onclick={refreshPreview}>Retry</button>
+          {:else}
+            <span>Working out what would be sent…</span>
+          {/if}
+        </div>
+        {#if promptShown && preview}
+          <!-- A scrolling region has to be reachable by keyboard to be scrolled by keyboard. -->
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+          <pre id="assistant-prompt-preview" class="prompt-preview" data-testid="assistant-prompt-preview" role="region" tabindex="0" aria-label="The exact text that will be sent">{preview.prompt}</pre>
+        {/if}
+      {:else if !loadingProviders && !loadError && providers.length === 0}
+        <p class="assistant-off" role="status">No provider is offered by this server: the assistant is turned off (<code>--no-assistant</code>) or none of the supported CLIs is installed.</p>
+      {/if}
+    </div>
   </div>
 
   {#if unavailableProviders.length && !loadingProviders}
@@ -212,7 +393,7 @@
       <summary>{unavailableProviders.length} unavailable provider{unavailableProviders.length === 1 ? '' : 's'}</summary>
       <ul>
         {#each unavailableProviders as item (item.provider)}
-          <li><strong>{item.label}</strong><span>{item.reason ?? (item.installed ? 'Safe invocation is unavailable.' : 'CLI is not installed.')}</span></li>
+          <li><strong>{item.label}</strong><span>{item.reason ?? (item.installed ? 'The CLI cannot be run for a single answer.' : 'CLI is not installed.')}</span></li>
         {/each}
       </ul>
     </details>
@@ -238,6 +419,11 @@
           </div>
           {#if message.role === 'assistant'}
             <div class="markdown-content">{@html renderAssistantMarkdown(message.content)}</div>
+            {#if message.context}
+              <small class="message-basis" data-testid="assistant-answer-basis">
+                {basis(message.context)}
+              </small>
+            {/if}
           {:else}
             <p>{message.content}</p>
           {/if}
@@ -261,7 +447,7 @@
   </div>
 
   <form class="composer" onsubmit={submit}>
-    <label for="assistant-prompt">Question for your local AI</label>
+    <label for="assistant-prompt">Question for the provider</label>
     <div class="composer-field" class:error={Boolean(sendError)}>
       <textarea
         id="assistant-prompt"
@@ -271,7 +457,7 @@
         onkeydown={submitShortcut}
         maxlength="6000"
         rows="3"
-        placeholder={availableProviders.length ? 'Ask what happened, why it happened, or what to inspect next…' : 'Install or enable a safe local provider to ask about this trace.'}
+        placeholder={availableProviders.length ? 'Ask what happened, why it happened, or what to inspect next…' : 'Install a supported provider CLI to ask about this trace.'}
         disabled={waiting || !availableProviders.length}
       ></textarea>
       <div class="composer-footer">
@@ -317,7 +503,22 @@
   .scope-options strong, .scope-options small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .scope-options strong { color: #dce3ed; font-size: 11px; }
   .scope-options small { margin-top: 2px; color: #7f8da1; font-size: 9px; font-weight: 500; }
-  .context-disclosure { grid-column: 1 / -1; margin: -2px 0 0; color: #718096; font-size: 9px; line-height: 1.45; }
+  .context-disclosure { grid-column: 1 / -1; display: grid; gap: 6px; margin: -2px 0 0; padding: 8px 10px; border: 1px solid rgba(241,190,115,.28); border-radius: 6px; background: rgba(241,190,115,.06); }
+  .context-disclosure p { margin: 0; color: #c9d3e1; font-size: 12px; line-height: 1.45; }
+  .context-disclosure .containment strong { color: #f0f4fa; }
+  .context-disclosure .containment em { display: block; color: #f1be73; font-style: normal; }
+  .context-disclosure .containment.weaker { padding-left: 8px; border-left: 2px solid #f1be73; }
+  .context-disclosure .consent { display: flex; align-items: center; gap: 8px; color: #f0f4fa; font-size: 12px; font-weight: 650; text-transform: none; letter-spacing: 0; cursor: pointer; }
+  .context-disclosure .consent input { width: 15px; height: 15px; accent-color: #f1be73; }
+  .coverage { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; color: #c9d3e1; font-size: 12px; line-height: 1.45; }
+  .coverage > span { flex: 1 1 260px; min-width: 0; }
+  .coverage strong { color: #f0f4fa; }
+  .coverage em { display: block; color: #f2c57f; font-style: normal; }
+  .coverage button { flex: 0 0 auto; padding: 3px 8px; border: 1px solid #5a4a2c; border-radius: 4px; color: #f2d7a6; background: rgba(241,190,115,.08); font-size: 11px; font-weight: 650; cursor: pointer; }
+  .coverage button:hover { border-color: #8a7242; color: white; }
+  .prompt-preview { max-height: 180px; margin: 0; padding: 8px 10px; overflow: auto; border: 1px solid #2c3749; border-radius: 5px; color: #c5d0e0; background: #080b11; font: 11px/1.5 'IBM Plex Mono', monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .assistant-off { color: #c9d3e1; }
+  .message-basis { display: block; margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,.07); color: #93a1b6; font-size: 11px; line-height: 1.4; }
   .unavailable-providers { grid-row: 3; border-bottom: 1px solid var(--assistant-line); background: rgba(8,11,16,.64); }
   .unavailable-providers summary { padding: 8px 16px; color: #7f8da1; font-size: 10px; cursor: pointer; }
   .unavailable-providers ul { display: grid; gap: 7px; margin: 0; padding: 0 16px 11px 34px; }
@@ -395,7 +596,11 @@
     .assistant-workspace { grid-template-rows: auto auto 0 minmax(40px, 1fr) 0 auto; overflow: hidden; }
     .assistant-header { min-height: 52px; padding-block: 8px; background: rgba(9, 13, 20, .98); }
     .assistant-controls { grid-template-columns: minmax(130px, .55fr) minmax(280px, 1.45fr); gap: 8px; padding-block: 8px; }
-    .context-disclosure { display: none; }
+    /* The disclosure and its consent stay visible however short the window is. */
+    .context-disclosure { padding: 5px 8px; }
+    .context-disclosure p { font-size: 11px; line-height: 1.3; }
+    .coverage { font-size: 11px; line-height: 1.3; }
+    .prompt-preview { max-height: 84px; }
     .unavailable-providers { display: none; }
     .scope-options { grid-template-columns: 1fr 1fr; }
     .scope-options label { height: 36px; min-height: 36px; }

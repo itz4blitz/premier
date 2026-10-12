@@ -2,8 +2,9 @@
   import { onMount } from 'svelte';
   import type { TraceEvent } from './types';
   import { actorId, categoryOf, type ActorRole } from './analysis';
-  import { inferArchitecture } from './architectureInference';
-  import { fitTopology } from './topologyViewport';
+  import { inferArchitecture, type ArchitectureConnection, type ArchitectureInference } from './architectureInference';
+  import { MAX_ZOOM, MIN_ZOOM, fitTopology } from './topologyViewport';
+  import { edgePath, layoutTopology } from './topologyLayout';
 
   type Point = { x: number; y: number };
   type TopologyActor = {
@@ -13,6 +14,10 @@
     errors: number;
     firstSequence: number;
     status: string;
+    /** The role was worked out by the viewer, not stated by a producer. */
+    roleInferred: boolean;
+    recordedTypes: string[];
+    unattributed: number;
   } & Point;
   type TopologyEdge = {
     id: string;
@@ -20,6 +25,12 @@
     target: string;
     count: number;
     issues: number;
+    /** Issues recorded in what this handoff led to. */
+    downstream: number;
+    /** `high`: worked out from parent spans only, no recorded parent event. */
+    derived: boolean;
+    sources: ArchitectureConnection['sources'];
+    causallyConnected: boolean;
     event: TraceEvent;
     events: TraceEvent[];
   };
@@ -28,24 +39,28 @@
     events,
     focusEvents = null,
     selectedActor = null,
+    model = null,
     onactor,
     onselect = () => undefined
   }: {
+    /** The whole run. Structure is inferred from all of it; `focusEvents` only highlights. */
     events: TraceEvent[];
     focusEvents?: TraceEvent[] | null;
     selectedActor?: string | null;
+    /** The inference for `events`, when the caller already has it. */
+    model?: ArchitectureInference | null;
     onactor: (actorId: string | null) => void;
     onselect?: (event: TraceEvent) => void;
   } = $props();
 
-  const roleOrder: ActorRole[] = ['process', 'system', 'agent', 'subagent', 'human'];
-  const roleX: Record<ActorRole, number> = { process: 105, system: 285, agent: 500, subagent: 720, human: 915 };
   let stageElement = $state<HTMLDivElement>();
   let zoom = $state(1);
   let panX = $state(0);
   let panY = $state(0);
   let panPointer = $state<number | null>(null);
   let panOrigin = { x: 0, y: 0, panX: 0, panY: 0 };
+  /** Set once the user pans or zooms; a resize or a new event must not throw that view away. */
+  let userAdjusted = false;
 
   function fitView() {
     const width = stageElement?.clientWidth ?? 0;
@@ -56,21 +71,36 @@
     panY = fit.panY;
   }
 
-  function changeZoom(next: number) {
-    const clamped = Math.max(.35, Math.min(2, next));
+  function resetView() {
+    userAdjusted = false;
+    fitView();
+  }
+
+  function changeZoom(next: number, originX?: number, originY?: number) {
+    userAdjusted = true;
+    const clamped = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, next));
     if (!stageElement || zoom === clamped) {
       zoom = clamped;
       return;
     }
-    const centerX = stageElement.clientWidth / 2;
-    const centerY = stageElement.clientHeight / 2;
+    const centerX = originX ?? stageElement.clientWidth / 2;
+    const centerY = originY ?? stageElement.clientHeight / 2;
     const ratio = clamped / zoom;
     panX = centerX - (centerX - panX) * ratio;
     panY = centerY - (centerY - panY) * ratio;
     zoom = clamped;
   }
 
+  /** Ctrl/Cmd + wheel (and a trackpad pinch) zooms about the pointer; a plain wheel still scrolls the page. */
+  function wheelZoom(event: WheelEvent) {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    const rect = stageElement?.getBoundingClientRect();
+    changeZoom(zoom * Math.exp(-event.deltaY / 300), rect ? event.clientX - rect.left : undefined, rect ? event.clientY - rect.top : undefined);
+  }
+
   function pan(direction: 'left' | 'right' | 'up' | 'down') {
+    userAdjusted = true;
     if (direction === 'left') panX += 80;
     if (direction === 'right') panX -= 80;
     if (direction === 'up') panY += 60;
@@ -86,6 +116,7 @@
 
   function movePan(event: PointerEvent) {
     if (panPointer !== event.pointerId) return;
+    userAdjusted = true;
     panX = panOrigin.panX + event.clientX - panOrigin.x;
     panY = panOrigin.panY + event.clientY - panOrigin.y;
   }
@@ -96,41 +127,48 @@
     (event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId);
   }
 
+  /** Neutral names for what was recorded; `agent` says nothing about who coordinates whom. */
   function roleLabel(role: ActorRole): string {
-    if (role === 'agent') return 'Coordinator';
+    if (role === 'agent') return 'Agent';
     if (role === 'subagent') return 'Delegated agent';
     if (role === 'process') return 'Runtime process';
     if (role === 'human') return 'Human reviewer';
     return 'System service';
   }
 
-  function actorLabel(actor: TopologyActor): string {
-    const issueText = actor.errors ? `${actor.errors} issue${actor.errors === 1 ? '' : 's'}` : 'no issues';
-    return `${actor.id}, ${roleLabel(actor.type)}, ${actor.events} event${actor.events === 1 ? '' : 's'}, ${issueText}`;
+  function roleEvidence(actor: TopologyActor): string {
+    const recorded = actor.recordedTypes.length ? `Recorded actor_type: ${actor.recordedTypes.join(', ')}` : 'No actor_type was recorded';
+    const unattributed = actor.unattributed ? ` ${actor.unattributed} event${actor.unattributed === 1 ? '' : 's'} without an actor_id ${actor.unattributed === 1 ? 'is' : 'are'} grouped here.` : '';
+    return `${recorded}${actor.roleInferred ? '; the role shown is inferred.' : '.'}${unattributed}`;
   }
 
-  function layoutActors(input: TraceEvent[]): { actors: TopologyActor[]; height: number } {
-    const summaries = inferArchitecture(input).actors.map((actor) => ({
+  function actorLabel(actor: TopologyActor): string {
+    const issueText = actor.errors ? `${actor.errors} issue${actor.errors === 1 ? '' : 's'}` : 'no issues';
+    return `${actor.id}, ${roleLabel(actor.type)}, ${actor.events} event${actor.events === 1 ? '' : 's'}, ${issueText}${actor.roleInferred ? ', role inferred' : ''}${isolated.has(actor.id) ? ', no recorded links' : ''}`;
+  }
+
+  function layoutActors(inference: ArchitectureInference): { actors: TopologyActor[]; width: number; height: number } {
+    const summaries = inference.actors.map((actor) => ({
       id: actor.id,
       type: actor.role,
       events: actor.eventCount,
       errors: actor.issueCount,
       firstSequence: actor.firstSequence,
-      status: actor.issueCount ? 'error' : 'ok'
+      status: actor.issueCount ? 'error' : 'ok',
+      roleInferred: actor.roleSource === 'inferred',
+      recordedTypes: actor.recordedTypes,
+      unattributed: actor.unattributedEventCount
     }));
-    const maxInColumn = Math.max(1, ...roleOrder.map((role) => summaries.filter((actor) => actor.type === role).length));
-    const height = Math.max(330, maxInColumn * 138 + 72);
-    const actors = summaries.map((actor) => {
-      const peers = summaries.filter((candidate) => candidate.type === actor.type);
-      const index = peers.findIndex((candidate) => candidate.id === actor.id);
-      return { ...actor, x: roleX[actor.type], y: ((index + 1) * height) / (peers.length + 1) };
-    });
-    return { actors, height };
+    const layout = layoutTopology(summaries);
+    return {
+      actors: summaries.map((actor) => ({ ...actor, ...layout.positions.get(actor.id)! })),
+      width: layout.width,
+      height: layout.height
+    };
   }
 
-  function causalEdges(input: TraceEvent[]): TopologyEdge[] {
-    const byEvent = new Map(input.map((event) => [event.event_id, event]));
-    return inferArchitecture(input).connections.flatMap((connection) => {
+  function toEdges(connections: ArchitectureConnection[], byEvent: Map<string, TraceEvent>): TopologyEdge[] {
+    return connections.flatMap((connection) => {
       const linked = connection.eventIds.map((id) => byEvent.get(id)).filter((event): event is TraceEvent => Boolean(event));
       const representative = linked.find((event) => categoryOf(event) === 'error') ?? linked[0];
       if (!representative) return [];
@@ -140,6 +178,10 @@
         target: connection.targetActorId,
         count: connection.eventCount,
         issues: connection.issueCount,
+        downstream: connection.downstreamIssueCount,
+        derived: connection.confidence !== 'recorded',
+        sources: connection.sources,
+        causallyConnected: connection.causallyConnected,
         event: representative,
         events: linked
       }];
@@ -152,16 +194,20 @@
     return `${kinds.slice(0, 2).join(' · ')} +${kinds.length - 2} more`;
   }
 
-  function eventStatus(event: TraceEvent): string {
-    return event.status && event.status !== 'ok' ? event.status : 'recorded';
+  function edgeEvidence(edge: TopologyEdge): string {
+    return edge.derived ? 'derived from parent spans' : 'recorded parent events';
   }
 
-  function curve(source: Point, target: Point): string {
-    const nodeHalfWidth = 98;
-    const startX = source.x + (target.x >= source.x ? nodeHalfWidth : -nodeHalfWidth);
-    const endX = target.x + (target.x >= source.x ? -nodeHalfWidth : nodeHalfWidth);
-    const control = (startX + endX) / 2;
-    return `M ${startX} ${source.y} C ${control} ${source.y}, ${control} ${target.y}, ${endX} ${target.y}`;
+  function referenceEvidence(edge: TopologyEdge): string {
+    return edge.sources.map((source) => source === 'link' ? 'links' : 'shared correlation id').join(' + ');
+  }
+
+  function plural(count: number, noun: string): string {
+    return `${count} ${noun}${count === 1 ? '' : 's'}`;
+  }
+
+  function eventStatus(event: TraceEvent): string {
+    return event.status && event.status !== 'ok' ? event.status : 'recorded';
   }
 
   function activateEdge(keyEvent: KeyboardEvent, edge: TopologyEdge) {
@@ -170,18 +216,36 @@
     onselect(edge.event);
   }
 
-  let topology = $derived(layoutActors(events));
-  let edges = $derived(causalEdges(events));
+  // Inferred once from the whole run. A filter or time window never changes this structure.
+  let inference = $derived(model ?? inferArchitecture(events));
+  let topology = $derived(layoutActors(inference));
+  let eventsById = $derived(new Map(events.map((event) => [event.event_id, event])));
+  let edges = $derived(toEdges(inference.connections, eventsById));
+  let references = $derived(toEdges(inference.references, eventsById));
+  let edgeIds = $derived(new Set(edges.map((edge) => edge.id)));
+  /** Actors no causal connection or reference touches. */
+  let isolated = $derived.by(() => {
+    const referenced = new Set(references.flatMap((edge) => [edge.source, edge.target]));
+    return new Set(topology.actors.length > 1 ? inference.unlinkedActorIds.filter((id) => !referenced.has(id)) : []);
+  });
+  let unlinked = $derived(topology.actors.length > 1 ? inference.unlinkedActorIds : []);
   let byActor = $derived(new Map(topology.actors.map((actor) => [actor.id, actor])));
   let focusActive = $derived(focusEvents !== null && focusEvents.length !== events.length);
   let focusedEventIds = $derived(new Set((focusEvents ?? events).map((event) => event.event_id)));
   let focusedActorIds = $derived(new Set((focusEvents ?? events).map(actorId)));
   let fittedTopologyKey = '';
+  let fittedActorIds: string[] = [];
 
   $effect(() => {
     const key = topology.actors.map((actor) => `${actor.id}:${actor.x}:${actor.y}`).join('|');
     if (key === fittedTopologyKey) return;
     fittedTopologyKey = key;
+    // The same run growing keeps a view the user chose; a different set of actors starts over.
+    const ids = topology.actors.map((actor) => actor.id);
+    const grew = fittedActorIds.length > 0 && fittedActorIds.every((id) => ids.includes(id));
+    fittedActorIds = ids;
+    if (userAdjusted && grew) return;
+    userAdjusted = false;
     if (stageElement && stageElement.clientWidth > 0 && stageElement.clientHeight > 0) fitView();
   });
 
@@ -190,7 +254,7 @@
       fitView();
       return;
     }
-    const observer = new ResizeObserver(() => fitView());
+    const observer = new ResizeObserver(() => { if (!userAdjusted) fitView(); });
     observer.observe(stageElement);
     fitView();
     return () => observer.disconnect();
@@ -203,13 +267,13 @@
       <p>Execution map</p>
       <h2 id="agent-topology-title">Agent topology</h2>
     </div>
-    <div class="topology-actions"><span class="summary">{topology.actors.length} actor{topology.actors.length === 1 ? '' : 's'} · {edges.length} causal connection{edges.length === 1 ? '' : 's'}</span><div class="canvas-controls" aria-label="Map controls"><div class="pan-controls"><button onclick={() => pan('left')} aria-label="Pan left">←</button><button onclick={() => pan('up')} aria-label="Pan up">↑</button><button onclick={() => pan('down')} aria-label="Pan down">↓</button><button onclick={() => pan('right')} aria-label="Pan right">→</button></div><div class="zoom-controls" aria-label="Map zoom"><button onclick={() => changeZoom(zoom - .25)} disabled={zoom <= .35} aria-label="Zoom out">−</button><button onclick={fitView} aria-label="Reset map view">Fit</button><button onclick={() => changeZoom(zoom + .25)} disabled={zoom >= 2} aria-label="Zoom in">+</button></div></div></div>
+    <div class="topology-actions"><span class="summary">{topology.actors.length} actor{topology.actors.length === 1 ? '' : 's'} · {edges.length} causal connection{edges.length === 1 ? '' : 's'}{references.length ? ` · ${plural(references.length, 'reference')}` : ''}</span><div class="canvas-controls" aria-label="Map controls"><div class="pan-controls"><button onclick={() => pan('left')} aria-label="Pan left">←</button><button onclick={() => pan('up')} aria-label="Pan up">↑</button><button onclick={() => pan('down')} aria-label="Pan down">↓</button><button onclick={() => pan('right')} aria-label="Pan right">→</button></div><div class="zoom-controls" aria-label="Map zoom"><button onclick={() => changeZoom(zoom - .25)} disabled={zoom <= MIN_ZOOM} aria-label="Zoom out">−</button><button onclick={resetView} aria-label="Reset map view">Fit</button><button onclick={() => changeZoom(zoom + .25)} disabled={zoom >= MAX_ZOOM} aria-label="Zoom in">+</button></div></div></div>
   </header>
 
   <div class="map-scope" aria-label="Map scope">
     <strong>Scope</strong>
-    <span>{events.length} supplied event{events.length === 1 ? '' : 's'}</span>
-    <p>This map reflects the evidence currently supplied by the viewer. Connections require a recorded parent event or parent span.</p>
+    <span>{events.length} supplied event{events.length === 1 ? '' : 's'}{focusActive ? ` · ${focusedEventIds.size} highlighted` : ''}</span>
+    <p>Structure is inferred once from every supplied event; filters and time ranges only highlight. A connection requires a recorded parent event or parent span.</p>
   </div>
 
   {#if topology.actors.length === 0}
@@ -232,30 +296,39 @@
       onpointermove={movePan}
       onpointerup={stopPan}
       onpointercancel={stopPan}
+      onwheel={wheelZoom}
     >
-      <div class="graph" style={`--graph-height:${topology.height}px;transform:translate(${panX}px, ${panY}px) scale(${zoom})`}>
-        <svg viewBox={`0 0 1020 ${topology.height}`} preserveAspectRatio="none" aria-label="Causal connections between actors">
+      <div class="graph" style={`--graph-width:${topology.width}px;--graph-height:${topology.height}px;transform:translate(${panX}px, ${panY}px) scale(${zoom})`}>
+        <svg viewBox={`0 0 ${topology.width} ${topology.height}`} preserveAspectRatio="none" aria-label="Causal connections between actors">
           <defs>
             <marker id="topology-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="strokeWidth">
               <path d="M0,0 L7,3.5 L0,7 Z" class="arrow-head" />
             </marker>
           </defs>
+          {#each references.filter((reference) => !reference.causallyConnected) as reference (`reference-${reference.id}`)}
+            {@const source = byActor.get(reference.source)}
+            {@const target = byActor.get(reference.target)}
+            {#if source && target}
+              <path d={edgePath(source, target)} class="edge-line reference" class:muted={focusActive && !reference.events.some((event) => focusedEventIds.has(event.event_id))} aria-hidden="true" />
+            {/if}
+          {/each}
           {#each edges as edge (edge.id)}
             {@const source = byActor.get(edge.source)}
             {@const target = byActor.get(edge.target)}
             {#if source && target}
-              {@const path = curve({ x: source.x, y: source.y }, { x: target.x, y: target.y })}
-              <path d={path} class:error={edge.issues > 0} class:muted={focusActive && !edge.events.some((event) => focusedEventIds.has(event.event_id))} class="edge-line" marker-end="url(#topology-arrow)" />
+              {@const path = edgePath(source, target, edgeIds.has(`${edge.target}\u0000${edge.source}`))}
+              {@const muted = focusActive && !edge.events.some((event) => focusedEventIds.has(event.event_id))}
+              <path d={path} class:error={edge.issues > 0} class:downstream={edge.issues === 0 && edge.downstream > 0} class:derived={edge.derived} class:muted class="edge-line" data-confidence={edge.derived ? 'derived' : 'recorded'} marker-end="url(#topology-arrow)" />
               <path
                 d={path}
                 class="edge-hit"
-                class:muted={focusActive && !edge.events.some((event) => focusedEventIds.has(event.event_id))}
+                class:muted
                 role="button"
                 tabindex="0"
-                aria-label={`${edge.source} to ${edge.target}: ${edge.count} linked event${edge.count === 1 ? '' : 's'}, ${edgeKinds(edge)}${edge.issues ? `, ${edge.issues} issue${edge.issues === 1 ? '' : 's'}` : ''}. Select representative event ${edge.event.kind}, sequence ${edge.event.sequence}`}
+                aria-label={`${edge.source} to ${edge.target}: ${edge.count} linked event${edge.count === 1 ? '' : 's'}, ${edgeKinds(edge)}${edge.issues ? `, ${edge.issues} issue${edge.issues === 1 ? '' : 's'}` : ''}${edge.downstream ? `, ${plural(edge.downstream, 'issue')} downstream` : ''}, ${edgeEvidence(edge)}. Select representative event ${edge.event.kind}, sequence ${edge.event.sequence}`}
                 onclick={() => onselect(edge.event)}
                 onkeydown={(event) => activateEdge(event, edge)}
-              ><title>{edge.source} → {edge.target} · {edgeKinds(edge)} · select {edge.event.kind} #{edge.event.sequence}</title></path>
+              ><title>{edge.source} → {edge.target} · {edgeKinds(edge)} · {edgeEvidence(edge)} · select {edge.event.kind} #{edge.event.sequence}</title></path>
             {/if}
           {/each}
         </svg>
@@ -267,16 +340,19 @@
             class:selected={selectedActor === actor.id}
             class:muted={focusActive && !focusedActorIds.has(actor.id)}
             class:has-issues={actor.errors > 0}
+            class:isolated={isolated.has(actor.id)}
             data-role={actor.type}
             style={`--actor-x:${actor.x}px;--actor-y:${actor.y}px`}
             aria-label={actorLabel(actor)}
             aria-pressed={selectedActor === actor.id}
+            title={roleEvidence(actor)}
             onclick={() => onactor(selectedActor === actor.id ? null : actor.id)}
           >
             <span class="identity">
               <span class="monogram" aria-hidden="true">{actor.id.slice(0, 1).toUpperCase()}</span>
-              <span class="name"><strong>{actor.id}</strong><small>{roleLabel(actor.type)}</small></span>
-              <span class="health" data-tone={actor.errors ? 'issue' : 'healthy'}>{actor.errors ? 'Needs review' : 'Healthy'}</span>
+              <span class="name"><strong>{actor.id}</strong><small>{roleLabel(actor.type)}{#if actor.roleInferred}<em> · inferred</em>{/if}</small></span>
+              <span class="health" data-tone={actor.errors ? 'issue' : 'healthy'}>{actor.errors ? 'Issues recorded' : 'No issues recorded'}</span>
+              {#if isolated.has(actor.id)}<span class="health" data-tone="unlinked">No recorded links</span>{/if}
             </span>
             <span class="metrics">
               <span><strong>{actor.events}</strong> event{actor.events === 1 ? '' : 's'}</span>
@@ -288,9 +364,9 @@
 
       <div class="minimap" aria-label="Architecture minimap" role="img">
         {#each topology.actors as actor (actor.id)}
-          <i class:issue={actor.errors > 0} style={`left:${actor.x / 10.2}%;top:${actor.y / topology.height * 100}%`} title={actor.id}></i>
+          <i class:issue={actor.errors > 0} style={`left:${actor.x / topology.width * 100}%;top:${actor.y / topology.height * 100}%`} title={actor.id}></i>
         {/each}
-        <span style={`transform:translate(${-panX / Math.max(1, zoom) / 12}px, ${-panY / Math.max(1, zoom) / 12}px) scale(${1 / zoom})`}></span>
+        <span style={`transform:translate(${-panX / Math.max(MIN_ZOOM, zoom) / 12}px, ${-panY / Math.max(MIN_ZOOM, zoom) / 12}px) scale(${1 / zoom})`}></span>
       </div>
 
     </div>
@@ -306,7 +382,7 @@
               <summary>
                 <span class="route"><strong>{edge.source}</strong><i aria-hidden="true">→</i><strong>{edge.target}</strong></span>
                 <span class="route-kinds">{edgeKinds(edge)}</span>
-                <small>{edge.count} event{edge.count === 1 ? '' : 's'}{edge.issues ? ` · ${edge.issues} issue${edge.issues === 1 ? '' : 's'}` : ''}</small>
+                <small>{edge.count} event{edge.count === 1 ? '' : 's'}{edge.issues ? ` · ${edge.issues} issue${edge.issues === 1 ? '' : 's'}` : ''}{edge.downstream ? ` · ${plural(edge.downstream, 'issue')} downstream` : ''} · <span class="evidence-kind" data-confidence={edge.derived ? 'derived' : 'recorded'}>{edge.derived ? 'derived from spans' : 'recorded'}</span></small>
               </summary>
               <div class="handoff-events">
                 {#each edge.events as linkedEvent (linkedEvent.event_id)}
@@ -319,19 +395,57 @@
               </div>
             </details>
           {/each}
+          {#if unlinked.length}
+            <p class="unlinked-list" role="note"><strong>No causal link recorded for {unlinked.join(', ')}.</strong> No event of {unlinked.length === 1 ? 'this actor' : 'these actors'} names a cause in another actor, and no other actor's event names one of theirs.</p>
+          {/if}
         </div>
       {:else if topology.actors.length === 1}
         <p class="single-note">This run has one actor, so there are no cross-actor causal links.</p>
+      {:else}
+        <div class="unlinked-note" role="note" aria-label="Why this map has no connections">
+          <strong>No causal links were recorded between these {topology.actors.length} actors.</strong>
+          <p>A line is drawn only when an event names its cause in another actor: a <code>parent_event_id</code>, or a <code>parent_span_id</code> whose span belongs to one actor. This run recorded none. That is what a plain process capture produces (<code>premier record</code> of a command's output, or one provider session next to the recorder's own <code>root</code> process): the actors appear in the same run, and nothing recorded says one started the other.</p>
+          <p>The nodes are still evidence: each one is an <code>actor_id</code> that events were recorded for. To see handoffs, emit events with parent ids through <code>premier emit --parent-event</code> or the <code>@premierstudio/trace</code> package.{#if inference.unresolvedParents.length} {plural(inference.unresolvedParents.length, 'parent reference')} in this run could not be resolved and {inference.unresolvedParents.length === 1 ? 'was' : 'were'} not drawn.{/if}{#if references.length} {plural(references.length, 'reference')} by link or correlation id {references.length === 1 ? 'is' : 'are'} listed below; a reference is not a cause.{/if}</p>
+        </div>
+      {/if}
+
+      {#if references.length}
+        <div class="handoff-evidence reference-evidence" aria-label="Recorded references">
+          <div class="handoff-heading">
+            <div><span>Reference ledger</span><strong>Links and shared correlation ids</strong></div>
+            <p>These actors refer to the same work. A reference has no direction and is not a cause.</p>
+          </div>
+          {#each references as reference (`reference-${reference.id}`)}
+            <details>
+              <summary>
+                <span class="route"><strong>{reference.source}</strong><i aria-hidden="true">↔</i><strong>{reference.target}</strong></span>
+                <span class="route-kinds">{edgeKinds(reference)}</span>
+                <small>{plural(reference.count, 'event')} · {referenceEvidence(reference)}</small>
+              </summary>
+              <div class="handoff-events">
+                {#each reference.events as linkedEvent (linkedEvent.event_id)}
+                  <button type="button" onclick={() => onselect(linkedEvent)} aria-label={`Inspect referencing event ${linkedEvent.kind}, sequence ${linkedEvent.sequence}, ${reference.source} and ${reference.target}`}>
+                    <span class="event-sequence">#{linkedEvent.sequence}</span>
+                    <strong>{linkedEvent.kind}</strong>
+                    <span class="event-status" class:issue={categoryOf(linkedEvent) === 'error'}>{eventStatus(linkedEvent)}</span>
+                  </button>
+                {/each}
+              </div>
+            </details>
+          {/each}
+        </div>
       {/if}
   {/if}
 
   <div class="legend" aria-label="Topology legend">
     <strong>How to read this map</strong>
-    <span><i class="sample solid" aria-hidden="true"></i>Solid node: coordinator, runtime, system, or human</span>
+    <span><i class="sample solid" aria-hidden="true"></i>Solid node: agent, runtime, system, or human</span>
     <span><i class="sample dashed" aria-hidden="true"></i>Dashed node: delegated agent</span>
-    <span><i class="sample flow" aria-hidden="true"></i>Blue arrow: parent-to-child event flow</span>
-    <span><i class="sample issue" aria-hidden="true"></i>Red status: actor or link has recorded issues</span>
-    <span class="hint">Select a node to filter by actor. Select a line for its representative event, or expand Exact handoff evidence for every event behind the connection.</span>
+    <span><i class="sample flow" aria-hidden="true"></i>Blue arrow: parent-to-child event flow, recorded</span>
+    <span><i class="sample flow derived" aria-hidden="true"></i>Dashed arrow: derived from parent spans only</span>
+    <span><i class="sample flow reference" aria-hidden="true"></i>Dotted line: link or shared correlation id, not a cause</span>
+    <span><i class="sample issue" aria-hidden="true"></i>Red: issues recorded on the actor or handoff; amber line: issues downstream of it</span>
+    <span class="hint">Select a node to filter by actor. Select a line for its representative event, or expand Exact handoff evidence for every event behind the connection. Ctrl or Cmd + scroll zooms; Fit resets a view you moved. "Inferred" marks a role no producer stated.</span>
   </div>
 </section>
 
@@ -360,7 +474,7 @@
   .map-scope p { min-width: 0; overflow: hidden; color: #718096; font-size: 10px; white-space: nowrap; text-overflow: ellipsis; }
   .stage { position: relative; min-width: 0; height: clamp(240px, calc(100dvh - 520px), 560px); overflow: hidden; overscroll-behavior: contain; cursor: grab; touch-action: none; background-color: #070a0f; background-image: linear-gradient(rgba(122,145,184,.075) 1px, transparent 1px), linear-gradient(90deg, rgba(122,145,184,.075) 1px, transparent 1px), linear-gradient(rgba(122,145,184,.025) 1px, transparent 1px), linear-gradient(90deg, rgba(122,145,184,.025) 1px, transparent 1px); background-position: center; background-size: 112px 112px, 112px 112px, 28px 28px, 28px 28px; box-shadow: inset 0 0 60px rgba(0,0,0,.3); }
   .stage.panning { cursor: grabbing; }
-  .graph { position: relative; width: 1020px; min-width: 0; height: var(--graph-height); transform-origin: top left; }
+  .graph { position: relative; width: var(--graph-width, 1020px); min-width: 0; height: var(--graph-height); transform-origin: top left; }
   .stage.panning .graph { transition: none; }
   .minimap { position: sticky; z-index: 4; display: block; width: 118px; height: 72px; right: 10px; bottom: 10px; margin: -82px 10px 10px auto; overflow: hidden; pointer-events: none; border: 1px solid rgba(141,169,255,.28); border-radius: 7px; background: rgba(5,8,13,.88); box-shadow: 0 8px 22px rgba(0,0,0,.32); }
   .minimap i { position: absolute; width: 5px; height: 5px; transform: translate(-50%,-50%); border-radius: 50%; background: #7f9fff; }
@@ -371,6 +485,23 @@
   .edge-line.muted { opacity: .14; }
   .edge-line.error { stroke: #ff716d; }
   .arrow-head { fill: #9eaaff; }
+  .edge-line.derived { stroke-dasharray: 7 5; }
+  .edge-line.downstream { stroke: #f0bd76; }
+  .edge-line.reference { stroke: #7f8da1; stroke-width: 1.3; stroke-dasharray: 2 5; opacity: .7; }
+  .name small em { color: #f0bd76; font-style: normal; }
+  .health[data-tone='unlinked'] { color: #f0bd76; background: rgba(240,189,118,.1); }
+  .actor.isolated { border-color: rgba(240,189,118,.34); }
+  .unlinked-note { display: grid; gap: 7px; padding: 14px 20px 16px; border-top: 1px solid rgba(240,189,118,.22); color: #aab6c7; background: rgba(240,189,118,.045); font-size: 11px; line-height: 1.55; }
+  .unlinked-note strong { color: #f0d3a4; font-size: 12px; }
+  .unlinked-note p, .unlinked-list { max-width: 860px; }
+  .unlinked-note code { padding: 1px 4px; border-radius: 3px; color: #dfe6f2; background: rgba(255,255,255,.07); font: 10px 'IBM Plex Mono', monospace; }
+  .unlinked-list { padding: 6px 2px 0; color: #9cabc0; font-size: 10px; line-height: 1.5; }
+  .unlinked-list strong { color: #f0d3a4; }
+  .evidence-kind[data-confidence='derived'] { color: #f0bd76; }
+  .reference-evidence .route i { color: #7f8da1; }
+  .sample.flow.derived { border-top-style: dashed; }
+  .sample.flow.reference { border-top: 2px dotted #7f8da1; }
+  .sample.flow.reference::after { display: none; }
   .edge-hit { fill: none; stroke: transparent; stroke-width: 14; vector-effect: non-scaling-stroke; cursor: pointer; pointer-events: stroke; }
   .edge-hit.muted { pointer-events: none; }
   .edge-hit:focus { outline: none; stroke: rgba(141,169,255,.28); }

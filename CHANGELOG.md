@@ -1,0 +1,907 @@
+# Changelog
+
+Changes a user of the `premier` CLI, the viewer, or `@premierstudio/trace`
+would notice. Entries marked **Breaking** change behaviour that scripts or
+integrations may depend on.
+
+## Unreleased
+
+### Added
+
+- `premier delete <trace>...` removes trace directories, and `premier prune
+  --older-than <DURATION>` removes the finalized traces in a trace directory
+  that ended at least that long ago (`30d`, `12h`; `--dry-run`,
+  `--keep-issues`, `--trace-dir`). Both print what was removed with its size,
+  refuse a trace that is still being recorded and anything that is not
+  recognisably a trace directory, never follow symbolic links, remove an
+  abandoned trace only with `--include-abandoned`, and exit `1` when
+  something could not be removed. See [docs/cli.md](docs/cli.md#delete).
+- `record` and `demo` write `.premier/.gitignore` containing `*` when they
+  create a `.premier` directory, so traces are not committed by accident. An
+  existing directory or `.gitignore` is left alone.
+- The local assistant offers OpenCode, and reports for every provider the
+  containment it runs under: `GET /api/assistants` carries `containment`
+  (`no_tools`, `read_only_sandbox`, or `provider_default`) and
+  `containment_summary`, and the viewer shows that sentence above the consent
+  checkbox. `--assistant-containment <TIER>` on `open` and `serve`
+  (`PREMIER_ASSISTANT_CONTAINMENT`, also read by `record --open`) sets the
+  weakest tier allowed. See
+  [docs/security.md](docs/security.md#containment-tiers).
+- Viewer: the assistant panel shows what a question will send before it is
+  asked: the event range, how many earlier events are left out, the number of
+  earlier messages and the prompt size, and on request the exact text. Each
+  answer is followed by the event range it was based on. New route `POST
+  /api/traces/{trace}/assistant/preview` returns that prompt and its
+  `context` without running a provider, and the assistant route's response
+  carries the same `context`. See
+  [docs/security.md](docs/security.md#the-local-assistant).
+- Viewer: the investigation summary keeps one finding per recorder
+  diagnostic, each opening the event it is about, shows the number of
+  evidence gaps before Details is opened, and follows the effects of a
+  failure through events that name it only by parent span.
+- Viewer: the comparison opens baseline-side events in the baseline run,
+  expands a row to every field change with whole values, keeps the chosen
+  baseline when it is reopened, renders long lists a page at a time, and
+  tells baselines with the same title apart by start time and artifact.
+- Viewer: model usage says when only some calls reported tokens or a cost
+  (`3 of 5 calls reported tokens`) instead of presenting a partial sum as the
+  total.
+- Viewer accessibility: the custom select announces its selected value,
+  keeps its menu inside an enclosing dialog for assistive technology, returns
+  focus to its trigger on Tab, and has a solid keyboard focus ring distinct
+  from hover; primary buttons and the skip link meet 4.5:1 contrast; the page
+  declares its dark colour scheme and keeps focus and selection visible in
+  forced-colors mode.
+- `THIRD_PARTY_NOTICES.md` and `scripts/third-party-notices.mjs`, which
+  generates it from `Cargo.lock` and `package-lock.json`: the Rust crates in
+  the binary and the JavaScript packages in the viewer, with their declared
+  licences, for all four release targets. It ships beside `LICENSE` in every
+  release archive and in the npm launcher and platform packages, and CI
+  fails when it is out of date with either lockfile. See
+  [docs/releasing.md](docs/releasing.md#third-party-notices).
+- `premier diff` aligns events in order. An event present in only one trace
+  is reported as `added` or `removed` where it occurs and the events after it
+  stay paired with their counterparts; an event at a different place is
+  reported as `moved`. The output names the **first divergence**: the first
+  item, in trace order, that is not unchanged, with its first differing
+  field. The text view also lists each item's field changes with their
+  values, and manifest differences in `command`, `exit_code`, `termination`,
+  `adapter`, and `capabilities`.
+- `premier diff --exit-code`: exit status `1` when the traces differ, `0` when
+  they do not.
+- `premier diff` compares what events refer to: `parent_event`,
+  `parent_span`, `correlation`, and `links`, each followed to the events it
+  names, so a re-parented event is reported whatever the ids are.
+- `premier export` gives each export a digest of its own (the `integrity`
+  block, printed as `export digest: sha256:...`), and `premier verify
+  <export.json>` recomputes it, reports which trace the export says it was
+  derived from, and checks a copied source signature against the copied seal
+  digest (`--public-key` requires your key). An export is a derived, redacted
+  copy, not the sealed original: its digest is stored in the file it covers.
+  See [docs/redaction.md](docs/redaction.md#the-integrity-block).
+- `premier export --kind`, `--actor`, `--after-sequence`, and
+  `--before-sequence` export a selection of events, recorded in the export's
+  new `selection` block. `--redact-field` and `--redact-literal` apply rules
+  of the export's own, reported in its `redaction` block.
+- Exports record their `exporter` (name and version), and whether the source
+  was finalized and verified (`source.finalized`, `source.verification`). An
+  event whose stored payload is not JSON is exported with the stored text in
+  `payload_raw` instead of only `payload: null`.
+- `premier query` and `premier diff` read a file written by `premier export`
+  in place of a trace directory.
+- `premier query --event-id`, `--span`, `--parent-span`, `--parent`,
+  `--correlation`, `--after-sequence`, `--before-sequence`, `--since`,
+  `--until`, and `--issues`. A truncated result names the sequence to continue
+  from (`next_after_sequence` in `--json`), and `--json` carries a `source`
+  block saying whether the trace was finalized and verified.
+- `premier query --search` also matches event ids and timestamps, and every
+  payload string as it was recorded, with and without terminal control
+  sequences: text with quotes, line breaks, backslashes, or colour codes
+  matches as typed.
+- `premier demo --force` replaces a finalized trace that is not an earlier
+  demo.
+- `premier list` shows how a finished run ended (`[exit 3]`, `[SIGKILL]`,
+  `[interrupted]`) and each trace's directory name.
+- Viewer API: a trace is addressed by its **artifact** (directory name) in
+  `/api/traces/{trace}` and in the viewer's `?trace=` links. A trace id still
+  works when one served trace has it; an id shared by several traces (copies
+  of one recording) is answered `409` with the artifacts to choose from.
+- Viewer API: every `trace.event` of the event stream carries its sequence as
+  the SSE `id`, and the stream resumes after `Last-Event-ID`. A stream on a
+  trace that can no longer be read ends with the new terminal event
+  `trace.error` instead of polling silently.
+- Viewer server: a request with wrong credentials is answered after a delay
+  that grows with each refusal in a row (250 ms steps, at most 2 seconds) and
+  is logged. `serve` warns about a password shorter than 12 characters on a
+  non-loopback address, and refuses an auth config that lists one token
+  twice.
+- Viewer: the comparison shows the first divergence and a `Moved` count, and
+  applies the same rules as `premier diff`; the two are tested against one
+  shared set of cases.
+- Viewer: opening a locked, unsupported, or damaged trace shows why it cannot
+  be opened (the server's `integrity_detail`) instead of `trace not found`.
+  Its outcome reads `Locked`, `Unsupported`, or `Unverified` instead of
+  `Running`, its row shows the reason as text and a `Damaged` badge where it
+  used to show `Live`, and nothing is requested for it.
+- Viewer: the System map explains a run whose actors have no causal links
+  (what was recorded, why a plain process capture has none, and how to record
+  them), marks actors nothing links to, and names them when only some are
+  unlinked.
+- Viewer: the System map draws a connection derived from parent spans as a
+  dashed arrow and a recorded one as a solid arrow, lists which is which in
+  the connection ledger, and draws `links` and shared correlation ids between
+  actors as dotted references with their own ledger. An arrow turns amber
+  when an issue was recorded downstream of it.
+- Viewer: an `other` filter tab for kinds that are not agent, model, tool,
+  approval, or runtime kinds, shown when a run has some. The mapping is
+  documented in [docs/events.md](docs/events.md#viewer-categories).
+- Viewer: values the recorder replaced (`[REDACTED]`) carry a
+  `Redacted by Premier` chip in the inspector.
+- Viewer: the Raw tab shows the first 200,000 characters of a larger payload
+  with `Show all`; Copy still copies all of it.
+- Viewer: Ctrl or Cmd + scroll zooms the System map about the pointer, Fit
+  can show much larger maps, and a role with more than six actors wraps into
+  further columns.
+- Viewer: the reload cache is documented in
+  [docs/cli.md](docs/cli.md#the-reload-cache). It no longer stores the events
+  of an encrypted trace, and is cleared when a write to it fails or the
+  server answers `401`.
+- Viewer: the assistant panel states that asking sends redacted trace content
+  to the provider's vendor, at a readable size on every window height, and
+  the Ask button stays disabled until that is agreed to for the selected
+  provider.
+- Adapters: at most 20 `adapter.diagnostic` events per recording; the rest are
+  counted in a closing `adapter.summary` event. When some or no output lines
+  were native events, `record` says so on stderr and corrects
+  `adapter.completeness` in the manifest to `provider-native-partial` or
+  `no-native-events`.
+- Adapters read events wrapped in terminal decorations: a byte order mark, a
+  spinner overwritten by a carriage return, control sequences before or
+  after the object (including OSC ended by ST, charset selections, and the
+  8-bit CSI).
+- The assistant prompt puts the run's outcome (exit code, termination, event
+  count) first and on its own, and spends its event budget from the newest
+  event backwards.
+
+- `premier record` ends with a `protection:` line on stderr saying whether
+  the trace was written encrypted (with the key id) and whether it was signed
+  (with the signer's fingerprint), so a mistyped key variable no longer
+  passes for an encrypted recording.
+- `premier keygen --encryption <path>` writes a trace encryption key file
+  (256 bits from the system random number generator, mode `0600`) for
+  `--key-file`.
+- `premier record --pty` follows resizes of the recorder's terminal: the PTY
+  is resized on SIGWINCH and a `process.resize` event records the new size.
+- `premier record --pty` with redirected stdin now ends the command's input
+  when the pipe or file ends (and no longer echoes forwarded input into the
+  captured output), so `printf 'x\n' | premier record --pty -- cat` finishes.
+- Captured output that is not valid UTF-8 is marked: the event gets
+  `lossy: true` and `replaced_sequences`. The stored text still has U+FFFD
+  in place of each invalid sequence, and the raw bytes are not kept.
+- `premier open`, `premier serve`, and the viewer of `record --open` stop on
+  Ctrl-C and SIGTERM: in-flight requests finish, open connections are dropped
+  after 2 seconds, and the exit status is `0`.
+- `premier list` shows every trace it cannot open, with the reason:
+  `[needs a newer premier: format version N]` or `[unreadable: ...]`, beside
+  the existing `[encrypted: ...]`. The viewer API reports a trace in a later
+  format as `integrity: "unsupported"` instead of as damaged.
+- `premier recover` on an already finalized trace removes the working files
+  an interrupted finalization left behind, once the trace verifies. It can
+  also be repeated after being interrupted itself, and continues from the
+  compressed journal when the active journal is gone.
+- `premier encrypt` puts right what an earlier `encrypt` killed during its
+  final swap left behind: it moves the trace back when nothing is at its
+  path and removes the superseded (possibly plaintext) copy.
+- The collector records the first request of a recording that arrives
+  without its token as a `collector.unauthorized` event, and delays each
+  further refusal in a row (100 ms steps, at most 1 second).
+- `premier verify` notes when a trace was finalized by `premier recover`.
+- Manifest fields a build does not know are kept when a command rewrites the
+  manifest, and are covered by the seal.
+
+- `premier verify --live` checks an unfinalized trace's frames and hash chain
+  without modifying it.
+- `premier recover --sign-key` signs a recovered trace.
+- `premier recover` salvages the valid prefix of a damaged active journal and
+  records what it discarded (`seal.discarded_bytes`, `seal.discarded_frames`,
+  a `journal.recovery_discarded` diagnostic).
+- Streaming readers: `verify`, `query`, `export`, `replay`, finalization, and
+  the viewer server no longer load a whole journal into memory. Finalized
+  journals are written as independently readable blocks, and the viewer API
+  pages through them without rescanning from the start.
+- **Trace format version 2: event hash chain, manifest seal, optional
+  signature.** Every event names the hash of the event before it, and the
+  manifest carries a seal over all of its fields and the chain head.
+  `premier verify` checks both. A trace can also be signed with a local
+  Ed25519 key. An unsigned trace is only self-consistent: whoever can write to
+  it can rebuild the chain and the seal. See
+  [docs/trace-format.md](docs/trace-format.md) and
+  [docs/security.md](docs/security.md#what-verification-proves).
+- `premier keygen <path>` writes an Ed25519 private key (mode `0600`) and
+  `<path>.pub`, and prints the public key and its fingerprint.
+- `premier sign <trace> --sign-key <path>` signs or re-signs a finalized
+  trace that verifies.
+- `premier record --sign-key <path>` and `PREMIER_SIGN_KEY_FILE` sign a trace
+  when it is finalized. `PREMIER_SIGN_KEY_FILE` also applies to
+  `premier recover`, `premier claim`, and `premier encrypt`.
+- `premier verify --public-key <path-or-hex>` requires a valid signature by
+  that key.
+- `premier encrypt --sign-key <path>` re-signs the re-sealed trace. Without a
+  signing key, `encrypt` and `claim` drop an existing signature and print a
+  warning.
+- `premier export` output has a `source` block with the source trace's
+  format version, protection level, journal digest, chain head, seal digest,
+  signature, and signer.
+- Viewer API: `integrity_protection` (`digest_only`, `sealed`, `signed`) and
+  `integrity_signer` on every verified trace. The viewer labels a verified
+  trace `signed by <fingerprint>`, `unsigned, self-consistent only`, or
+  `unsigned, v1 digest only`.
+- **Global `--key-file <path>` option** on every subcommand, the flag form of
+  `PREMIER_TRACE_KEY_FILE`. The flag wins when both are set.
+- `premier list` shows an encrypted trace it cannot open, as
+  `[encrypted: key required]` or `[encrypted: <reason>]`, instead of skipping
+  it. The viewer API reports such a trace as `integrity: "locked"`, and the
+  viewer shows it as locked rather than damaged.
+- `premier record --redact-regex-multiline <regex>`: a redaction regex that
+  may match across line breaks, matched over a 16 KiB sliding window in
+  terminal output. The manifest records the rule count as
+  `redaction.terminal_multiline_regex_count`.
+- `PREMIER_REDACTION_IDLE_FLUSH_MS` sets how long a stream must be quiet
+  before output held for a redaction rule is stored (default 1000).
+- Viewer API: the event stream ends with one terminal event,
+  `trace.complete` or the new `trace.abandoned`, and accepts
+  `?after_sequence=<n>` to resume after events the client already has.
+- Viewer: events load in pages of 5,000 with a progress indicator, the live
+  stream resumes after the last loaded sequence, an open trace is reloaded
+  when its state changes (recovered, finalized, recording again), and a run
+  whose command could not be started is named as such.
+- Adapters: `parent_event_id` and `links` resolved to stored event ids;
+  synthesized `agent.spawn` and `agent.result` events for subagents, marked
+  `payload.synthesized: true`; `payload.lifecycle`, `payload.session_id`, and
+  `payload.native_timestamp`. See [docs/adapters.md](docs/adapters.md).
+- **Record-time redaction of structured shapes.** Secret names are now
+  recognised before the journal write in header-style pairs
+  (`{"name": "Authorization", "value": ...}`, `["Cookie", ...]`), in argument
+  lists inside payloads, and in JSON held inside a string, including each
+  JSON-object line of a multi-line string. `premier export` previously did
+  this for the exported copy only; it now shares the recorder's code and
+  repeats the pass for older traces.
+- More secret field names: `auth`, `jwt`, `passphrase`, `secret_key`,
+  `signing_key`, `private_key_pem`, `access_key`, and `access_key_id`. Names
+  match as a suffix, so `basic_auth` and `x-auth` are redacted while `author`
+  and `auth_method` are not.
+- Built-in value pattern `url-query-credentials`: the value of a URL query
+  parameter named `token`, `access_token`, `api_key`, `client_secret`,
+  `password`, `signature`, `X-Amz-Signature`, and similar.
+- Command-line redaction of `curl -u user:<password>` / `--user` /
+  `--proxy-user` (the user name is kept) and of `-p<password>` after `mysql`,
+  `mysqldump`, `mysqladmin`, `mysqlimport`, `mysqlshow`, `mysqlcheck`,
+  `mariadb`, or `mariadb-dump`.
+- The recorder always redacts the run's own `PREMIER_COLLECTOR_TOKEN` value
+  from everything it stores. The manifest names the rule in the new
+  `redaction.implicit_rules` (`["collector-token"]`).
+- `--redact-literal`, `--redact-regex`, and `--redact-regex-multiline` also
+  apply to the event fields outside the payload (`kind`, `source`,
+  `actor_id`, `actor_type`, `span_id`, `parent_span_id`, `correlation_id`,
+  `status`).
+- `--adapter auto` finds the agent behind `env`, `npx`, `bunx`, `pnpx`,
+  `pnpm dlx`, `yarn dlx`, and `sh -c` with one simple command.
+- `premier record --pty` prints a one-line note on stderr when `--adapter
+  auto` would have activated an adapter, since PTY capture records terminal
+  output only.
+- Adapters: `usage.input_tokens_details.cache_creation_tokens`;
+  `payload.usage_reported_on`; `agent.message` events with `payload.role:
+  "user"` for user lines; Codex `file_change` and `web_search` items as tool
+  events with `payload.paths` / `payload.query`, and `reasoning` items as
+  `model.response` with `payload.reasoning: true`; an `approval.decision`
+  with status `denied` and `payload.synthesized: true` for each entry of
+  Claude Code's `permission_denials` (it has no `approval.request`, so the
+  trace reports `missing_lifecycle_start` for it).
+- Viewer: the masked export uses the recorder's secret field names and masks
+  every built-in value pattern shape.
+- [docs/trace-format.md](docs/trace-format.md), a
+  [documentation index](docs/README.md), and
+  [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Built-in secret value patterns.** Values shaped like well-known
+  credentials (API keys, bearer credentials, URL passwords, credentials in a
+  URL query string, private key blocks, JWTs, GitHub, AWS, and Slack tokens)
+  are redacted from structured
+  event payloads and the recorded command line by default.
+  `premier record --no-default-secret-patterns` turns them off;
+  `--redact-known-secrets` also applies them to stored terminal output. The
+  manifest's `redaction` block records which were active. See
+  [docs/redaction.md](docs/redaction.md).
+- `premier export --no-default-secret-patterns` and `--redact-known-secrets`,
+  and a `redaction.rules` / `redaction.redacted` report of the rules that ran
+  and what they removed.
+- `--allow-unverified` on `premier query`, `export`, `diff`, and `replay`.
+- `--no-assistant` on `premier open` and `premier serve`, and
+  `PREMIER_DISABLE_ASSISTANT`, to remove the local assistant.
+- The recorder now handles SIGHUP and SIGQUIT as well as SIGINT and SIGTERM,
+  and finalizes the trace for each. `PREMIER_STOP_GRACE_MS` sets how long a
+  command may outlive a forwarded SIGTERM, SIGHUP, or SIGQUIT (default 10 s).
+- A command that cannot be started now leaves a finalized trace with a
+  `process.spawn_failed` event, and `premier record` exits `127` (not found)
+  or `126` (not executable).
+- **Abandoned traces.** `premier list`, `premier verify`, and the viewer
+  distinguish a trace whose recorder is gone from one still being recorded,
+  and print the `premier recover` command to run.
+- `process.exit` records `recorder_signal`, `recorder_signal_name`, and
+  `killed_by_recorder` when the recorder itself was told to stop, and
+  `output_open_at_exit` when a descendant still held the output stream.
+- A `journal.write_failed` diagnostic when events could not be written.
+- `PREMIER_EMIT_TIMEOUT` (seconds, default 10) for `premier emit` and
+  `sdk/shell/premier-emit.sh`.
+- SDK: `premier.delegation`, `premier.result`, `premier.join`,
+  `premier.message`, and `premier.approvalDecision` helpers; `childOf`; and
+  the `timeoutMs`, `signal`, and `onError` options.
+- Adapters: normalized `tool`, `command`, `model`, `usage.*`, and
+  `parent_actor` payload fields; subagent actors from `parent_tool_use_id`;
+  `native_truncated` on oversized lines. See
+  [docs/adapters.md](docs/adapters.md).
+- Viewer: navigation by span and link, search by event and span id, and a
+  masked export that states it is best effort and unverified.
+- Reference documentation under `docs/`.
+- SDK: `premier.result`, `premier.join`, and `premier.approvalDecision` name
+  the event they complete on their own. With no causality field in `extra`,
+  `result` is linked to the same actor's open `spawn`, `join` to the same
+  actor's open `delegation`, and `approvalDecision` to the open `approval`
+  when exactly one is open. A helper also accepts the event the new one
+  follows in place of `extra`. See
+  [sdk/js/README.md](sdk/js/README.md#causality).
+- SDK: `span(actor, init?)` returns helpers bound to one actor and span, which
+  carry `actor_type`, `span_id`, and the parent's ids on every event;
+  `newId()` generates span and correlation ids.
+- SDK: `flush()` waits for emits that were not awaited, for use before
+  `process.exit()`. `premierStats()` reports how many events this process
+  delivered, dropped, and truncated.
+- SDK: an event over the collector's 2 MiB limit is sent with its longest
+  payload strings shortened and a `payload.premier_truncated` note, instead of
+  being rejected whole. `MAX_EVENT_BYTES` is exported.
+- SDK: `kind` is typed `PremierKind`, which offers the known kinds and accepts
+  any string. The package's `exports` has a `default` condition, and its type
+  declarations no longer need `@types/node`.
+- `premier emit --parent-event`, `--correlation`, `--link` (repeatable),
+  `--duration-ms`, and `--timestamp`, so a shell script can pair a result with
+  its start and record latency without building JSON.
+- Release archives contain `share/premier/premier-emit.sh`, the shell helper,
+  and the installer puts it in `<prefix>/share/premier/`.
+- Releases include `premier-install.sh`, a single-file installer for a signed
+  archive that needs no source checkout
+  ([docs/releasing.md](docs/releasing.md#install-from-a-signed-archive)).
+- `scripts/update.sh` and `scripts/install.sh --force` keep the binary they
+  replace as `<prefix>/bin/premier.previous`. `--allow-downgrade` permits
+  replacing a newer installed version.
+- The installer prints a note when `<prefix>/bin` is not on `PATH`.
+- `scripts/uninstall.sh` also removes `premier.previous` and the shell helper,
+  and lists what it leaves alone: recorded traces, key files, and copies
+  installed through npm or cargo.
+- Viewer: a run whose adapter could not read some provider output
+  (`adapter.diagnostic`, `adapter.summary`) lists "Provider output was not
+  fully captured" under missing evidence, with the number of lines.
+- The npm launcher's errors on an unsupported system say what is published
+  and what to do instead (a glibc image, WSL 2, or a source build).
+- Linux release metadata records the glibc the binary requires (`GLIBC_MIN`),
+  and the launcher refuses a system with an older glibc, naming both versions.
+
+### Changed
+
+- **Breaking: the local assistant no longer refuses a CLI that cannot be run
+  without tools.** Each installed CLI is run under the strongest containment
+  it supports, and the viewer states what that is before consent. Codex
+  0.162, which keeps `unified_exec` on when told to switch it off and was
+  listed as unavailable for that reason, now runs in its read-only sandbox
+  with approvals off: its shell can read files your user can read, and
+  cannot write or use the network. Grok 1.0, which has no `--no-memory`,
+  runs tool-less with memory on instead of being unavailable. A CLI with
+  neither a tool-less nor a sandboxed mode runs with its own defaults.
+  Trace content is untrusted input to these CLIs, so this is weaker than
+  before for the providers it newly allows; `--assistant-containment
+  no_tools` restores the earlier behaviour. See
+  [docs/security.md](docs/security.md#containment-tiers).
+- **Breaking: what counts as an issue.** One rule, applied by the server
+  (`premier list`, `premier query --issues`, the trace list's issue count)
+  and by the viewer, and tested against one shared set of cases:
+  - status `rejected` is an issue and a refusal, like `denied`: a run with a
+    rejected approval reads `Blocked` instead of `Passed`;
+  - a kind is matched by whole words (`error`, `errors`, `errored`, `fail`,
+    `failed`, `failure`), so `tool.failover` and other kinds that merely
+    contain those letters are no longer issues;
+  - an event recorded **without a status** whose payload states a failure at
+    its top level (`is_error`, a non-empty `error`, a non-zero `exit_code`,
+    or a failing `status`) is an issue. A recorded status still wins.
+  Issue counts of existing traces can change in both directions. See
+  [docs/events.md](docs/events.md#what-counts-as-an-issue).
+- Viewer: a run that ended without an exit status reads `Unknown`, not
+  `Passed`, and a trace list row applies the same outcome rules as the open
+  run (signalled, interrupted and unknown runs included). The open run's row
+  shows the outcome its header shows.
+- Viewer: model usage counts each call once. A call recorded as a request
+  event and a response event is one call with one set of tokens, and an
+  end-of-run total on an event such as `agent.result` is used only when no
+  call reported usage of its own. A total worked out from its parts follows
+  the provider's convention for cached tokens: Anthropic's cache counts are
+  added to `input_tokens`, OpenAI's and Gemini's are already inside the
+  prompt count. Gemini `usageMetadata` is read. Totals for Anthropic-shaped
+  usage without `total_tokens` are higher than before.
+- Viewer: the analytics event mix and latency cards file each event under its
+  recorded family (`Tool`, `Model`, …) like the run header and the filter
+  tabs; the separate `Issue` slice is gone and failures are reported by the
+  issue rate and the chart's markers.
+- Viewer: the comparison lists differences in trace order (its first row is
+  the first divergence) with both sequence numbers on each row, instead of
+  grouping them by status.
+- Viewer: a run title derived from the command no longer shows inline source
+  for `bash -lc`, `python -u -c`, `cmd.exe /c`, `env VAR=… sh -c` and similar
+  forms, masks credential-shaped arguments (`--token x`, `KEY=x`, URL user
+  info), and is at most 80 characters.
+- Viewer: a provider is recognised by whole words of the model name first,
+  so a model served by Ollama, Bedrock or Vertex is no longer attributed to
+  the host (`ollama` + `qwen` is not Meta).
+- `GET /api/assistants` reports every provider as unavailable, with the
+  reason, to credentials without the `assistant:use` scope.
+
+- **Breaking: `premier diff` output.** `--json` is now
+  `format: "premier.semantic-diff.v2"` with `identical`, `alignment`,
+  `first_divergence`, `manifest`, and a `moved` status and count. Items are
+  listed in trace order (an added event where it occurs, no longer after all
+  baseline events), and the `#<n>` in an item's key counts in that order.
+  The text view has a `moved` count, a `first divergence` line, a position
+  column, and one indented line per field change. Events in a different
+  order, which used to be reported as unchanged, are now reported as `moved`.
+- **Breaking: `premier diff` compares captured output per stream.** All
+  `process.stdout`, `process.stderr`, and `process.terminal` text of a stream
+  is one item compared line by line (`text.lines`, `text.line[<n>]`), instead
+  of one item per stored chunk. `payload.instrumentation` of `session.start`
+  is ignored. Two recordings of the same command now compare as identical.
+- **Breaking: `premier demo` no longer replaces a recorded trace.** A
+  finalized trace at `--output` is replaced only when it is an earlier demo;
+  pass `--force` for any other. The demo is written beside the output and
+  moved into place, so a failed `demo` leaves the previous trace intact.
+- **Breaking: `premier list` rows end with the trace's directory name in
+  parentheses**, after an optional `[exit <code>]`, `[<signal>]`, or
+  `[interrupted]`. Directories whose name starts with a dot (working copies
+  of `encrypt` and `demo`) are no longer listed, by `list` or by the viewer.
+- **Breaking: the viewer's links name a trace by its directory name**
+  (`/?trace=run.atrace`), and so does the URL `premier open <trace>` and
+  `record --open` print. Links with a trace id keep working while one served
+  trace has that id.
+- **Breaking: `premier open <trace>` refuses a trace owned by another
+  tenant**, before starting a server or a browser, instead of opening a
+  viewer that answers "not found". `record --tenant <tenant>` no longer
+  prints `next: premier open ...`. Both explain that a tenant's traces are
+  read through the API with that tenant's bearer token, and no longer suggest
+  viewing them in the browser through `serve --auth-config`.
+- **Breaking: `premier export` refuses an `--output` that is a directory or
+  lies inside a trace directory.**
+- The viewer server listens before it prints its URL or starts a browser. A
+  taken address fails with `cannot start the viewer: <address> is already in
+  use ...` and opens nothing. `--bind 127.0.0.1:0` takes a free port and the
+  printed URL shows it. `record --open` checks its bind address and viewer
+  build before running the command.
+- The assistant's CLIs are discovered on the first request that needs them,
+  not when the server starts, and each capability probe is stopped after 5
+  seconds. A server whose assistant is never used runs no CLI.
+- The assistant CLI runs in its own process group, which is killed as a whole
+  on timeout or disconnect. More than 64 KiB of diagnostics on its standard
+  error no longer discards a valid answer. The request body limit is 160 KiB
+  (was 24 KiB), so the documented character limits hold for every script.
+- The viewer's semantic comparison reports a `duration_ms` difference as a
+  field change, as `premier diff` does. Both key an adapter tool event that
+  has no `payload.tool` by the tool its `native` copy names.
+- The demo's reviewer `agent.spawn` is parented to the coordinator's
+  `session.start`, as its `parent_actor` says, and links the patch it reviews.
+- Viewer: the assistant panel is titled "Ask an AI CLI installed here" and
+  its provider selector "Provider CLI".
+- **Default trace directory name.** `premier record` without `--output` now
+  writes `.premier/traces/trace-<unix-milliseconds>-<8 random hex digits>.atrace`
+  (was `trace-<unix-milliseconds>.atrace`), and every trace directory is
+  created exclusively, so recorders started in the same instant can no
+  longer end up in one directory.
+- **Collector request bodies are checked more strictly.** A body that is not
+  a JSON object is rejected with `400` (an array used to be read
+  positionally), and so is an unknown top-level field (it used to be
+  ignored). `trace_id` and `run`, which the SDKs send, are accepted; a
+  `trace_id` naming another trace is rejected with `409`.
+- The collector token is 256 bits from the system random number generator
+  (64 hex characters), no longer a time-ordered UUID from the generator that
+  also produces the public event ids.
+- `premier emit --json` together with `--kind`, `--actor`, or another field
+  option is a usage error. The options used to be ignored.
+- `premier recover` uses the exit status the recorder journaled
+  (`process.exit`) when the kept events hold it, instead of always stamping
+  `interrupted` / `130`. The manifest's `ended_at` is the time the abandoned
+  recording was last written to, not the time of the recovery; the
+  `session.interrupted` payload gains `exit_recorded` and
+  `last_activity_at`.
+- `premier claim` refuses a trace that is not finalized. A claim made while
+  the recorder was running reported success and was undone when the recorder
+  finalized.
+- `premier demo --output` refuses to replace a trace that is being recorded.
+- `premier verify` and the viewer API report the diagnostics of the reading
+  build's validator over the events, keeping only the `journal.*` entries
+  from the manifest, instead of the list stored at finalization.
+- Lifecycle validation pairs a finish with the start it names
+  (`parent_event_id`, `links`), never with a start recorded after it, and
+  otherwise with the most recent start still open rather than the first
+  one. A synthesized `approval.decision` (`payload.synthesized: true`) no
+  longer raises `missing_lifecycle_start`. A status is compared without
+  surrounding whitespace.
+- `premier replay --speed` must be at least `0.001`.
+- `premier list` prints the start time of a trace it cannot open in the same
+  form as every other row.
+- A bearer credential's `tenant_id` may no longer contain `@`, matching the
+  rule for trace tenants.
+- Viewer API: an unclassified server error is answered with
+  `{"error": "internal error; see the premier server log"}`; the detail is
+  logged, not sent. A collector journal failure is answered with
+  `the event could not be recorded`.
+
+- **Breaking:** in `premier export` output the `redaction` block now follows
+  `events`.
+- **Breaking:** a trace recovered with discarded data carries seal fields that
+  earlier builds of this branch do not accept.
+- A truncated finalized journal is an error in every reader instead of reading
+  as fewer events.
+- **Breaking: new traces are written in format version 2.** The manifest has
+  `format_version: 2` and a `seal`, and every event has a `prev_hash`. This
+  version reads and verifies version 1 traces (reported as `v1: digest
+  only`) and does not upgrade them. An older `premier` cannot read a version
+  2 trace.
+- **Breaking: `premier verify` output wording.** The success line no longer
+  starts with `verified <trace id>`. It starts with `verified: chain and seal
+  valid, signed by the supplied key <fingerprint>:` only for a signature by
+  the key given with `--public-key`, and otherwise with `consistent: chain
+  and seal valid, signed by an unknown key <fingerprint>:`, `consistent:
+  chain and seal valid, unsigned:`, or `consistent (v1: digest only):`,
+  followed by a `note:` line. A failed check is now reported as `Error:
+  invalid: <trace> failed verification` with the reason under `Caused by:`.
+  Scripts that match the old text need updating; the exit status is
+  unchanged (`0` on success, `1` on failure). `verify` now also fails for a
+  broken event chain or a manifest field edited after finalization.
+- **Breaking: the collector validates every field.** `kind`, `source`, and
+  `actor_type` accept only ASCII letters, digits, `.`, `_`, `:`, and `-`, up
+  to 128 bytes. `actor_id`, `span_id`, `parent_span_id`, `correlation_id`,
+  `status`, `parent_event_id`, and each `links` entry accept up to 256 bytes
+  and no control characters. An empty `kind` or `source` is rejected. Events
+  that were stored before are now rejected with `400`. See
+  [docs/collector.md](docs/collector.md#field-rules).
+- **Breaking: collector status codes.** A body over 2 MiB is rejected with
+  `413` (was `400`). An empty or blank `kind` is rejected with `400` (was
+  `500`). A body that does not arrive within 10 seconds is rejected with the
+  new `408`.
+- **Breaking: collector event timestamps are always the recorder's receipt
+  time.** A `timestamp` sent by the producer no longer becomes the event's
+  timestamp. It is kept as `payload.producer_timestamp`, must be RFC 3339
+  (`400` otherwise), and requires the payload to be an object or absent
+  (`400` otherwise). The collector's response now includes `prev_hash`.
+- **Breaking: adapter event kinds.** Session start and turn start lines are
+  `agent.turn` with `payload.lifecycle` (`session_start`, `turn_start`). A
+  provider's final result line (`result`, `turn.completed`, `turn.failed`) is
+  `agent.result` with `payload.lifecycle: "run_result"` and the run's usage
+  and cost. Lines whose type names a `turn` are `agent.turn` /
+  `agent.result`; they were `model.request` / `model.response`, so a Codex
+  `turn.completed` moves from `model.response` to `agent.result`. OpenCode
+  `text` parts are `model.response`.
+  Classification matches whole words, so a type such as `pending` no longer
+  counts as completed because it contains `end`. Session-level events use the
+  session id as their `correlation_id`. Queries, diffs, and dashboards keyed
+  on the old kinds need updating.
+- **Breaking: adapter user lines and narrated tool calls.** A provider line
+  whose role is `user` is an `agent.message` (it was a `model.response`),
+  unless it carries tool results. An assistant message with both text and
+  tool calls is a `model.response` followed by one tool event per call; the
+  first call used to stand for the whole line.
+- **Breaking: adapter usage.** `usage.total_tokens`, when the provider does
+  not state a total, now also counts cache tokens the provider reports apart
+  from input (Claude `cache_read_input_tokens` and
+  `cache_creation_input_tokens`, OpenCode `cache.read` and `cache.write`).
+  When a provider repeats one message's usage on several lines, only the
+  first event carries `payload.usage`; the others carry
+  `payload.usage_reported_on`. Sums over `payload.usage` change accordingly.
+- **Breaking: a refused tool result has status `denied`.** An adapter
+  `tool.result` whose provider status is `denied` or `rejected` was `error`.
+  `declined` and `blocked` are now read as refusals too.
+- `--adapter auto` ignores arguments after the command's own `--`, so
+  `codex exec -- --json` is not treated as structured output.
+- **Breaking: `premier query` prints an event without an actor as `-`**, not
+  `root`.
+- **Breaking: text output escapes control characters.** `verify`, `query`,
+  `diff`, and `list` print control characters and invisible Unicode format
+  characters in recorded text as escapes. JSON output is unchanged.
+- **Breaking: `premier replay` caps a recorded gap at 10 seconds** (before
+  `--speed` is applied).
+- **Breaking: an encrypted trace without a key reports a different error:**
+  `encrypted trace requires --key-file or PREMIER_TRACE_KEY_FILE`.
+- **Breaking: the recorder lease format is `<pid> start=<n>`** (process id
+  and process start time) where the platform reports a start time. A lease
+  holding only a process id is still read. `premier recover` now refuses a
+  suspended recorder however stale its lease is, and treats a reused process
+  id as a dead recorder at once.
+- `verify`, `query`, `export`, `diff`, `replay`, and `list` end quietly when
+  their output pipe is closed (shell status `141`) instead of failing with a
+  broken-pipe error.
+- `premier export --output` creates the file with mode `0600`, and `export`
+  warns on stderr that the export of an encrypted trace is plaintext.
+- `premier record` no longer waits for collector clients when the command
+  has exited: requests in flight get 2 seconds, then their connections are
+  dropped.
+- `premier recover` refuses an active journal whose event chain is broken and
+  seals the recovered trace with `seal.recovered: true`. After a
+  `recover --force` underneath a running recorder, that recorder no longer
+  writes its lease back beside the finalized trace.
+- The local assistant marks Codex unavailable unless `codex features list`,
+  run with the assistant's overrides, reports `shell_tool` and
+  `unified_exec` as `false`.
+- Viewer API: the recover hint for an abandoned trace names the trace
+  directory only, not its path on the server. A lookup against a missing
+  trace directory answers `404`, and an unreadable one answers `500` with a
+  fixed message, instead of a `500` that named the path.
+- Adapter events take `duration_ms` from `stats.duration_ms` as well.
+- The adapter fixtures are fuller, and their README states that they are
+  hand-written, not captured from real runs.
+- **Breaking: `query`, `export`, `diff`, and `replay` refuse a finalized trace
+  that fails verification.** They exit `1` and name the failure. Pass
+  `--allow-unverified` to read it anyway. A trace that is still being
+  recorded is read as before, with a note on stderr. `premier encrypt` also
+  refuses such a trace and has no override.
+- **Breaking: the collector rejects recorder-owned events with `422`.** The
+  kinds `session.start`, `session.interrupted`, and `process.*`, and the
+  sources `premier`, `command`, `process`, `recorder`, `premier-recovery`, and
+  `adapter.*`, can no longer be emitted by the recorded process. See
+  [docs/collector.md](docs/collector.md#reserved-kinds-and-sources).
+- **Breaking: `premier export` reports what it actually redacted.**
+  `redaction.applied` used to be `true` on every export. It is now `true` only
+  when that export replaced at least one value; `false` means the rules ran
+  and found nothing left. `redaction.policy` has new text. Use
+  `redaction.redacted` for counts.
+- **Breaking: the assistant prompt uses the `[REDACTED]` marker.** It
+  previously wrote `[REDACTED BY PREMIER]` and used its own field rules. It
+  now shares the secret field names and value patterns used by
+  `premier export`.
+- **Breaking: SDK `emit` and the helpers no longer throw by default.** When
+  the collector is unreachable, slow, or rejects the event they resolve to
+  `null`, and report the failure to `onError` or once through `console.warn`.
+  Requests time out after 5 seconds. Pass `{ required: true }` to get the
+  throwing behaviour back.
+- **Breaking: SDK helper positional arguments win over `extra`.** A helper's
+  `kind`, `actor`, and `payload` can no longer be overridden by `extra.kind`,
+  `extra.actor_id`, or `extra.payload`, and an `undefined` value in `extra` no
+  longer erases a default. Helpers also accept `options` as a fourth argument.
+- **Breaking: `sdk/shell/premier-emit.sh` exits non-zero when the collector
+  rejects an event.** It used to print the error body and exit `0`.
+- `premier record` always exits with the recorded command's own status. A
+  stop signal received by the recorder is recorded separately and no longer
+  stands in for it.
+- A forwarded SIGTERM, SIGHUP, or SIGQUIT escalates to SIGKILL after the grace
+  period, and a third rapid Ctrl-C kills a command that ignores interrupts.
+- `premier recover` reads the recorder lease: it refuses a trace whose
+  recorder is still running, and recovers one whose recorder is dead without
+  waiting for the 300-second idle period.
+- `premier open <trace>` and `premier record --open` serve only that trace,
+  not every trace in the same directory.
+- Redaction rules now apply to adapter events, to the raw stdout copy of an
+  adapter run, and to the recorded command line. `premier export` and the
+  recorder share one list of secret field names.
+- `--redact-field` rejects a name with no letter or digit.
+- The lifecycle validator matches what the SDK, the adapters, and the demo
+  emit: a standalone `model.response` or `tool.result`, and an open
+  `agent.spawn`, are no longer reported.
+- An adapter event that states a failure in its native payload counts as an
+  issue in the trace list and the viewer.
+- The local assistant runs in an empty temporary directory instead of the
+  trace directory, one request at a time, with Premier's server and collector
+  secrets removed from its environment.
+- `premier emit` and `premier-emit.sh` ignore proxy environment variables for
+  a loopback collector.
+- The npm launcher forwards SIGTERM and SIGHUP (and, without a terminal,
+  SIGINT and SIGQUIT) to the native binary instead of leaving it running.
+- `premier demo --output` replaces a directory only when it is recognisably a
+  Premier trace, and never the current directory or one of its ancestors.
+- **Breaking: SDK helpers keep an actor's `actor_type`.** After
+  `premier.spawn(actor)`, `premier.model`, `premier.tool`, `premier.message`,
+  and the other helpers write that actor with the type it was spawned with
+  (`subagent` by default) instead of their own default `agent`. Pass
+  `actor_type` in `extra` to override.
+- **Breaking: the SDK sends `payload: {}` when no payload is given**, and
+  `premier emit --kind ...` does too. An event without an object payload was
+  stored with `null` and reported as `payload_not_object`.
+- **Breaking: the SDK sends the `run` object only when a run variable is
+  set** (`PREMIER_RUN_NAME`, `PREMIER_REPOSITORY`, `PREMIER_BRANCH`,
+  `PREMIER_ENVIRONMENT`, `PREMIER_STARTED_AT`), with only the ones that are.
+  The local collector stores none of it.
+- The SDK README no longer describes a hosted "Premier Cloud" ingestion
+  endpoint; nothing in this repository implements one.
+- **Breaking: `premier-emit.sh` refuses arguments after a JSON event or `-`**
+  (exit `1`). They used to be dropped.
+- **Breaking: the npm launcher refuses a platform package whose version is
+  not its own** (exit `1`), instead of running whatever Node.js resolved.
+- **Breaking: `scripts/update.sh` refuses an archive older than the installed
+  version** unless `--allow-downgrade` is given, and
+  `scripts/version-check.sh` reports such an archive as a downgrade, not as
+  `update available`. A missing install is reported as `not installed`.
+- **Breaking: `scripts/verify-release.sh` fails on a file the signed manifest
+  does not cover.** The manifest now lists the SBOMs and `premier-install.sh`
+  as well as the archives.
+- **Breaking: `scripts/install.sh` refuses a destination that is not a
+  regular file**, and `scripts/uninstall.sh` a prefix that is not an absolute
+  path.
+- `scripts/install.sh` reports `publisher signature verified` only for the
+  pinned release identity. With `--verification-key` or a caller-supplied
+  identity or issuer it names what was used instead.
+- `scripts/install.sh` with no `--archive` picks the highest version in
+  `./dist`, not the last file name, and `./dist` is ignored by git.
+- `scripts/package-release.sh` runs the binary it packages
+  (`premier build-info`) and refuses one whose version, target, or embedded
+  viewer is not what the metadata will say. A binary it cannot run is recorded
+  as `VIEWER=unverified`.
+- Release workflow: the CI suite runs on the tagged commit first; the viewer
+  is built and checked before the release build, which fails rather than
+  embed the placeholder page; the GitHub release is a draft until npm has
+  every package; a prerelease tag is published as a prerelease with the npm
+  dist-tag `next`; SBOMs and the installer are covered by the signed manifest
+  and the attestations; the npm packages are packed, inspected, and the
+  host's one executed before publishing. See
+  [docs/releasing.md](docs/releasing.md#signed-public-release-workflow).
+- The Rust toolchain is pinned in `rust-toolchain.toml`.
+- Viewer: `process.terminal` output (recorded with `--pty`) is collapsed like
+  stdout and stderr, and is no longer chosen as a run's material event.
+- Viewer: a time range no longer changes the System map. The map is inferred
+  once from the whole run; the range (like a filter) dims what is outside it
+  and the scope bar says how many events and connections are inside.
+- Viewer: kinds are filed under filter tabs without regard to case, `llm.*`
+  counts as a model kind, `mcp.*` as a tool kind, and `session.*` and
+  `adapter.*` as runtime. Kinds with any other prefix are under `other`
+  instead of `agents`.
+- Viewer: map nodes say `Agent` instead of `Coordinator` and
+  `No issues recorded` instead of `Healthy`, and mark a role that was
+  inferred. An event without an `actor_id` no longer turns the recorder's
+  `root` process into an agent.
+- Viewer: the run clock ends at the last received event; a reported
+  `duration_ms` no longer extends it. Events whose timestamp cannot be read
+  are left off the time ruler and counted beside it.
+- Viewer: collapsed output rows read `N consecutive stdout output chunks
+  collapsed`, and only output that was consecutive in the journal collapses.
+- Viewer: the inspector's Relations count is the number of related events
+  that can be opened, and following a relation stays on the Relations tab and
+  clears a filter that would hide the target.
+- Viewer: search matches the same text as `premier query --search`,
+  including `parent_event_id`, `links`, and payload strings as displayed.
+- Viewer: Ask AI is disabled until a readable run is open.
+- Viewer: closing the assistant panel no longer discards the conversation,
+  the draft, or an answer that was still on its way; they are kept per trace
+  until the page is reloaded.
+
+### Fixed
+
+- Viewer: with a locked, unsupported, or damaged trace open, the filter bar
+  and the workspace keep their rows. They each moved up one, which left the
+  workspace 48 pixels tall and the run list unable to scroll to runs below
+  the fold.
+- Viewer: the first-divergence line reads `baseline #1 → current #1`; the
+  two positions ran together as `baseline #1,current #1`.
+- `premier diff` no longer attributes one inserted call to every later call
+  of the same kind, and no longer reports reordered events as unchanged.
+- Viewer: a time-cropped System map dropped every connection whose parent
+  event was outside the range, and could show one the full run rejects.
+- Viewer: a live stream that the server refused (404, 401, 502) said
+  `RECONNECTING` forever; it now reads `DISCONNECTED`. A malformed stream
+  frame no longer throws.
+- Viewer: a run's row kept the event and issue counts from page load, so a
+  finished run with issues could read `Passed`.
+- Viewer: after a reload answered `401`, cached events stayed readable and
+  the loading bar never cleared. When the server cannot be reached, the saved
+  copy is labelled as one.
+- Viewer: Back or Forward to a different run dropped the filters and time
+  range of that history entry; recovering from a dead link kept its
+  `event_id`.
+- Viewer: Runs, Ask AI, and `?` on the loading, empty, and error screens made
+  the app bar unusable until Escape.
+- Viewer: elapsed offsets and causal depth in the timeline changed with the
+  active filter; terminal control sequences showed as text in event rows; the
+  `Read full summary` button could not be operated from the keyboard; the
+  events list box contained its column header; a timestamp that is not a date
+  showed as `Invalid Date`; `Failure window` jumped to the last issue instead
+  of the first; map edges between actors of one role ran under the cards and
+  opposite edges overlapped exactly; resizing the window reset a map view the
+  user had moved.
+- An adapter no longer writes a `malformed native JSONL` diagnostic for a
+  line that holds only a terminal control sequence, or rejects an event
+  because a colour reset follows it.
+- An event stream no longer runs blocking file reads on the server's async
+  worker threads.
+- `premier replay` no longer panics on a very small `--speed`.
+- The viewer event stream of a finalized trace always ends with
+  `trace.complete`, also when the trace cannot be read back at that moment.
+- A recorder that loses the race for a trace directory fails before it
+  writes anything, instead of overwriting the winner's manifest.
+- Finalization, recovery, and `encrypt` sync the containing directory after
+  each rename, and the durability of a trace is documented in
+  [docs/trace-format.md](docs/trace-format.md#layout).
+
+- A collector client that left a request half-sent could keep `premier
+  record` from finalizing its trace.
+- `premier replay` slept for the full length of any recorded gap, however
+  long.
+- `query`, `list`, and the other evidence commands failed with a broken-pipe
+  error when piped into a command that exits early, such as `head`.
+- A recorder that was suspended for more than 300 seconds was reported as
+  abandoned and could be recovered underneath itself.
+- The viewer's event stream for an abandoned trace never ended.
+- Viewer: opening a very large trace waited for the whole journal before
+  showing anything.
+- A terminal Ctrl-C was delivered to the recorded command twice.
+- Secrets split across output chunks, or straddling the read buffer, escaped
+  `--redact-literal` and `--redact-regex`.
+- `--pty` started the command in the home directory instead of the current
+  one.
+- Signal names in `process.exit` were wrong on platforms whose numbering
+  differs from Linux.
+- A journal write error (for example a full disk) ended the recording. The
+  command now keeps running and keeps its exit status.
+- Recording did not finish while a descendant of the command kept the output
+  pipe open.
+- A partial output line held back for a redaction rule, such as a prompt, was
+  lost if the recorder was killed before the line ended. It is now stored
+  after 1 second of quiet.
+- Pending approvals in the viewer are settled by a later decision.
+- Viewer: an empty screen that could not be left, a crash on very large
+  traces, and adapter payloads that were not read.
+- The release signer identity checked by the install and verification scripts
+  matches the release workflow.
+- The examples in `sdk/js/README.md` produced validator diagnostics
+  (`missing_causal_link`, `payload_not_object`). They no longer do, and the
+  SDK's tests run every example under `premier record` and `premier verify`.
+- `scripts/install.sh --force` onto a directory moved the binary inside it
+  and reported success; a failed install could leave `.premier.install.<pid>`
+  behind.
+- The release version gate failed without saying which manifest disagreed.
+
+### Security
+
+- The local assistant CLI no longer inherits `PREMIER_SIGN_KEY_FILE`.
+- Documented a limit of encrypted traces: someone without the key who kept
+  a copy of a manifest written during recording can roll a finalized trace
+  back to what looks like an interrupted recording, which `premier recover`
+  then finalizes, marked `seal.recovered`. See
+  [docs/security.md](docs/security.md#encrypted-traces).
+
+- An edit to a manifest field, or to the order or content of events, now
+  fails `premier verify`. Detecting a deliberate rewrite still requires a
+  signature checked against a key the verifier trusts.
+- The collector rejects look-alike names (Unicode inside `kind`, `source`, or
+  `actor_type`) and control characters in identity fields, and a producer can
+  no longer back-date or forward-date an event.
+- Recorded text can no longer send escape sequences to the terminal or forge
+  output lines through the CLI's text output.
+- Exports are created owner-only, and exporting an encrypted trace warns that
+  the result is plaintext.
+- The viewer API no longer reveals the server-side path of the trace
+  directory.
+- Codex is not offered as a local assistant when its command-execution
+  features cannot be confirmed off.
+- The viewer server refuses requests whose `Host` is not a loopback name when
+  no credentials are configured (DNS rebinding), and refuses cross-origin
+  requests to its API.
+- The recorded process can no longer forge its own exit status, terminal
+  output, or adapter events through the collector.
+- Secret-named flags, assignments, and headers on the recorded command line
+  are redacted in the manifest and in `session.start`.
+- A recorded command that prints its environment no longer leaves the
+  collector token in the trace.
+- Credentials in header-style pairs, argument lists, and JSON strings inside
+  event payloads, and in URL query strings, are redacted when recorded
+  rather than only when exported.
+- Assistant answers are sanitized before the viewer renders them as Markdown.
+- The local assistant is confined and capped, and can be disabled.
+- The collector token is not sent through an HTTP proxy for a loopback
+  collector.
+- `premier encrypt` refuses to re-seal a trace that fails verification.
+- `premier-emit.sh` no longer puts the collector token or the event body on
+  `curl`'s command line, where other local users could read them in a process
+  listing.
+- The installer requires an archive's signature to come from the release tag
+  of the version the archive says it is.
+- macOS release binaries are ad hoc signed and not notarized. The release
+  workflow signs and notarizes them when an Apple Developer ID is configured
+  ([docs/releasing.md](docs/releasing.md#macos-signing)); none is yet.

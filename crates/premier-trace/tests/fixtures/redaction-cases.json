@@ -1,0 +1,217 @@
+{
+  "description": "Shared redaction cases. crates/premier-trace/tests/redaction_fixture.rs and apps/viewer/src/lib/safeExport.test.ts both assert against this file, so the recorder, `premier export`, and the viewer's Export safe JSON agree on secret field names and value shapes. Secret-shaped values are stored in pieces and joined at test time so no credential-shaped string is checked in.",
+  "default_redacted_fields": [
+    "password",
+    "passwd",
+    "secret",
+    "clientsecret",
+    "apikey",
+    "accesstoken",
+    "refreshtoken",
+    "token",
+    "authorization",
+    "proxyauthorization",
+    "cookie",
+    "setcookie",
+    "secretaccesskey",
+    "privatekey",
+    "credential",
+    "credentials",
+    "bearer",
+    "auth",
+    "jwt",
+    "passphrase",
+    "secretkey",
+    "signingkey",
+    "privatekeypem",
+    "accesskey",
+    "accesskeyid"
+  ],
+  "secret_field_names": [
+    "password",
+    "db_password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "clientSecret",
+    "webhook_secret",
+    "apiKey",
+    "api_key",
+    "API-KEY",
+    "X-API-Key",
+    "OPENAI_API_KEY",
+    "token",
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "id_token",
+    "session_token",
+    "bearer_token",
+    "GITHUB_TOKEN",
+    "x-auth-token",
+    "Authorization",
+    "Proxy-Authorization",
+    "cookie",
+    "Set-Cookie",
+    "aws_secret_access_key",
+    "secretAccessKey",
+    "aws_access_key_id",
+    "access_key",
+    "private_key",
+    "privateKey",
+    "private_key_pem",
+    "secret_key",
+    "signing_key",
+    "signingKey",
+    "credential",
+    "credentials",
+    "auth",
+    "basic_auth",
+    "jwt",
+    "passphrase",
+    "key_passphrase"
+  ],
+  "ordinary_field_names": [
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "max_tokens",
+    "maxTokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "cached_tokens",
+    "reasoning_tokens",
+    "cache_read_input_tokens",
+    "input_tokens_details",
+    "token_count",
+    "tokens",
+    "tokenizer",
+    "token_usage",
+    "author",
+    "authors",
+    "co_author",
+    "authority",
+    "authorized_by",
+    "authored_by",
+    "auth_method",
+    "authentication_method",
+    "public_key",
+    "key_id",
+    "primary_key",
+    "keyboard",
+    "jwt_algorithm",
+    "passphrase_hint",
+    "usage_reported_on",
+    "model",
+    "name"
+  ],
+  "secret_values": [
+    {
+      "pattern": "github-token",
+      "before": "pushed with ",
+      "secret": ["gh", "p_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"],
+      "after": " today"
+    },
+    {
+      "pattern": "github-fine-grained-pat",
+      "before": "pushed with ",
+      "secret": ["github", "_pat_", "11ABCDEFG0aBcDeFgHiJkL_mNoPqRsT"],
+      "after": " today"
+    },
+    {
+      "pattern": "sk-api-key",
+      "before": "key ",
+      "secret": ["sk", "-", "a1B2c3D4e5F6g7H8i9J0k1L2"],
+      "after": " in output"
+    },
+    {
+      "pattern": "aws-access-key-id",
+      "before": "aws ",
+      "secret": ["AK", "IA", "IOSFODNN7EXAMPLE"],
+      "after": " used"
+    },
+    {
+      "pattern": "slack-token",
+      "before": "posted using ",
+      "secret": ["xo", "xb-", "1234567890-abcdefghijkl"],
+      "after": " ok"
+    },
+    {
+      "pattern": "jwt",
+      "before": "issued ",
+      "secret": ["ey", "JhbGciOiJIUzI1NiJ9", ".", "ey", "JzdWIiOiIxMjM0NTY3ODkwIn0", ".", "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"],
+      "after": " to the client"
+    },
+    {
+      "pattern": "pem-private-key",
+      "before": "material:\n",
+      "secret": ["-----BEGIN ", "PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END ", "PRIVATE KEY-----"],
+      "after": "\ndone"
+    },
+    {
+      "pattern": "authorization-header",
+      "before": "curl -H 'Authorization: Bearer ",
+      "secret": ["a1B2c3D4e5F6", "g7H8i9J0k1L2"],
+      "after": "' https://example.test"
+    },
+    {
+      "pattern": "bearer-token",
+      "before": "sent bearer ",
+      "secret": ["a1B2c3D4e5F6", "g7H8i9J0k1L2"],
+      "after": " upstream"
+    },
+    {
+      "pattern": "url-credentials",
+      "before": "git clone https://deploy:",
+      "secret": ["hunter2", "pw"],
+      "after": "@git.example.test/repo.git"
+    },
+    {
+      "pattern": "url-credentials",
+      "before": "postgres://:",
+      "secret": ["p%40", "ss"],
+      "after": "@db:5432/app"
+    },
+    {
+      "pattern": "url-query-credentials",
+      "before": "GET https://api.example.test/items?page=2&access_token=",
+      "secret": ["ya29.", "a0AfH6SMBx"],
+      "after": "&expires_in=3600"
+    },
+    {
+      "pattern": "url-query-credentials",
+      "before": "https://bucket.example.test/o?X-Amz-Date=20260101T000000Z&X-Amz-Signature=",
+      "secret": ["0a1b2c3d", "4e5f6a7b"],
+      "after": "#fragment"
+    },
+    {
+      "pattern": "url-query-credentials",
+      "before": "https://blob.example.test/c/f?sv=2022&sig=",
+      "secret": ["AbC%2Bdef", "%3D"],
+      "after": "&se=2026"
+    },
+    {
+      "pattern": "url-query-credentials",
+      "before": "https://example.test/v1/data?api_key=",
+      "secret": ["k-", "12345"],
+      "after": ""
+    }
+  ],
+  "ordinary_values": [
+    "input_tokens=1200 output_tokens=400 total 1600",
+    "used 1842 tokens",
+    "550e8400-e29b-41d4-a716-446655440000",
+    "0195f3a2-7b1c-7def-8abc-0123456789ab",
+    "commit 7ebad3a1c0ffee00deadbeef0123456789abcdef",
+    "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "https://example.test:8443/path?user=a@b.test",
+    "http://localhost:3000/callback",
+    "ssh://git@github.com:22/org/repo.git",
+    "https://example.test/search?q=token&page=2",
+    "https://example.test/list?max_tokens=4096&token_count=12",
+    "use bearer authentication for every request",
+    "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----",
+    "eyJhbGciOiJIUzI1NiJ9 alone is not a JWT",
+    "[REDACTED]"
+  ]
+}

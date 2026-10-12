@@ -68,12 +68,86 @@ describe('TraceComparison', () => {
       }
     });
     expect(screen.getByText('No meaningful differences')).toBeInTheDocument();
-    expect(screen.getByText(/generated ids and ordering noise are ignored/i)).toBeInTheDocument();
+    expect(screen.getByText(/in the same order; generated ids are ignored/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('comparison-first-divergence')).not.toBeInTheDocument();
   });
 
   it('handles empty traces without offering dead navigation', () => {
     render(TraceComparison, { props: { baseline: manifest('base'), current: manifest('current'), baselineEvents: [], currentEvents: [] } });
     expect(screen.getByText('No evidence to compare')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /inspect current event/i })).not.toBeInTheDocument();
+  });
+
+  it('lists differences in trace order with both positions, and opens baseline-side events', async () => {
+    const onselectBaseline = vi.fn();
+    const onselectCurrent = vi.fn();
+    const baselineEvents = [
+      event('base', 1, 'agent.turn'),
+      event('base', 2, 'tool.execution', { payload_json: '{"tool":"lint"}' }),
+      event('base', 3, 'model.response', { payload_json: '{"response":"old"}' })
+    ];
+    const currentEvents = [
+      event('current', 1, 'agent.turn'),
+      event('current', 2, 'model.response', { payload_json: '{"response":"new"}' }),
+      event('current', 3, 'tool.execution', { payload_json: '{"tool":"deploy"}' })
+    ];
+    render(TraceComparison, { props: { baseline: manifest('base'), current: manifest('current'), baselineEvents, currentEvents, onselectBaseline, onselectCurrent } });
+
+    const rows = within(screen.getByLabelText('Meaningful differences')).getAllByRole('article');
+    // Trace order, not grouped by status: the removed lint call comes before the changed response.
+    expect(rows.map((row) => row.dataset.status)).toEqual(['removed', 'changed', 'added']);
+    expect(rows[0]).toHaveTextContent('baseline #2');
+    expect(rows[1]).toHaveTextContent('baseline #3 → current #2');
+    expect(rows[2]).toHaveTextContent('current #3');
+    // The first row is the first divergence the header names.
+    expect(screen.getByTestId('comparison-first-divergence')).toHaveTextContent('removed · tool.execution');
+    expect(screen.getByTestId('comparison-first-divergence')).toHaveTextContent('baseline #2');
+    // Both positions, readably separated, when the first divergence exists on both sides.
+    expect(rows[1]).toHaveTextContent(/baseline #3 → current #2/);
+
+    // A removed event exists only in the baseline, and can be opened there.
+    expect(within(rows[0]).queryByRole('button', { name: /inspect current event/i })).not.toBeInTheDocument();
+    await fireEvent.click(within(rows[0]).getByRole('button', { name: /open baseline event #2 tool\.execution/i }));
+    expect(onselectBaseline).toHaveBeenCalledWith(expect.objectContaining({ event_id: 'base-2' }));
+    // A changed event can be opened on either side.
+    await fireEvent.click(within(rows[1]).getByRole('button', { name: /open baseline event #3/i }));
+    expect(onselectBaseline).toHaveBeenLastCalledWith(expect.objectContaining({ event_id: 'base-3' }));
+    await fireEvent.click(within(rows[1]).getByRole('button', { name: /inspect current event/i }));
+    expect(onselectCurrent).toHaveBeenCalledWith(expect.objectContaining({ event_id: 'current-2' }));
+    // An added event has no baseline side.
+    expect(within(rows[2]).queryByRole('button', { name: /open baseline event/i })).not.toBeInTheDocument();
+  });
+
+  it('shows every field change and whole values on request', async () => {
+    const long = 'x'.repeat(200);
+    const fields = (suffix: string) => Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`field_${index}`, `${suffix}-${index}`]));
+    const baselineEvents = [event('base', 1, 'tool.execution', { payload_json: JSON.stringify({ tool: 'build', ...fields('old'), log: `${long}-old` }) })];
+    const currentEvents = [event('current', 1, 'tool.execution', { payload_json: JSON.stringify({ tool: 'build', ...fields('new'), log: `${long}-new` }) })];
+    render(TraceComparison, { props: { baseline: manifest('base'), current: manifest('current'), baselineEvents, currentEvents } });
+    const row = screen.getByTestId('comparison-changed-0');
+    expect(within(row).queryByText('payload.log')).not.toBeInTheDocument();
+    expect(within(row).queryByText(`${long}-new`)).not.toBeInTheDocument();
+    const more = within(row).getByRole('button', { name: 'Show all 9 field changes' });
+    expect(more).toHaveAttribute('aria-expanded', 'false');
+    await fireEvent.click(more);
+    expect(within(row).getByText('payload.log')).toBeInTheDocument();
+    // Whole values, not an 80-character excerpt.
+    expect(within(row).getByText(`${long}-old`)).toBeInTheDocument();
+    expect(within(row).getByText(`${long}-new`)).toBeInTheDocument();
+    await fireEvent.click(within(row).getByRole('button', { name: 'Show less' }));
+    expect(within(row).queryByText('payload.log')).not.toBeInTheDocument();
+  });
+
+  it('renders a long list of differences a page at a time', async () => {
+    const currentEvents = Array.from({ length: 450 }, (_, index) => event('current', index + 1, 'tool.execution', { payload_json: `{"tool":"step-${index}"}` }));
+    render(TraceComparison, { props: { baseline: manifest('base'), current: manifest('current'), baselineEvents: [], currentEvents } });
+    const list = screen.getByLabelText('Meaningful differences');
+    expect(list).toHaveTextContent('450 differences');
+    expect(within(list).getAllByRole('article')).toHaveLength(200);
+    await fireEvent.click(within(list).getByRole('button', { name: 'Show 200 more of 250 remaining differences' }));
+    expect(within(list).getAllByRole('article')).toHaveLength(400);
+    await fireEvent.click(within(list).getByRole('button', { name: 'Show 50 more of 50 remaining differences' }));
+    expect(within(list).getAllByRole('article')).toHaveLength(450);
+    expect(within(list).queryByRole('button', { name: /remaining differences/ })).not.toBeInTheDocument();
   });
 });
