@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use premier_cli::evidence::{
-    DiffStatus, QueryMatcher, QueryOptions, RedactionOptions, diff_events, write_portable_evidence,
+    DiffStatus, ExportDocument, ExportOptions, ExportSelection, MAX_QUERY_LIMIT, QueryMatcher,
+    QueryOptions, QuerySource, RedactionOptions, SourceState, diff_traces as compare_traces,
+    write_portable_evidence_with,
 };
 use premier_cli::liveness::{
     RecorderLiveness, UnfinalizedState, recorder_liveness, unfinalized_state,
@@ -71,7 +73,8 @@ enum Commands {
         /// stdout/stderr ordering as one interactive terminal byte stream.
         #[arg(long)]
         pty: bool,
-        /// Normalize a provider's native JSONL stream into typed evidence.
+        /// Normalize a provider's native JSONL stream into typed evidence:
+        /// auto, none, codex, claude, gemini, grok, opencode, kimi, or droid.
         /// Auto activates only when a recognized CLI already uses structured output.
         #[arg(long, default_value = "auto")]
         adapter: AdapterChoice,
@@ -130,8 +133,14 @@ enum Commands {
     },
     /// Generate a rich local multi-agent trace for product evaluation and onboarding.
     Demo {
+        /// Where to write the demo trace. An earlier demo at this path is
+        /// replaced; any other trace is not, unless --force is given.
         #[arg(short, long, default_value = ".premier/traces/multi-agent-demo.atrace")]
         output: PathBuf,
+        /// Replace a finalized trace at the output path even though it is not
+        /// an earlier demo. A trace that is being recorded is never replaced.
+        #[arg(long)]
+        force: bool,
     },
     /// Emit a typed agent event to the active local collector (`PREMIER_COLLECTOR_*`).
     Emit {
@@ -167,10 +176,14 @@ enum Commands {
     },
     /// Verify a finalized trace's digest, event chain, manifest seal, and signature.
     /// Without a signature a trace is only internally consistent (docs/trace-format.md).
+    /// Given a `premier export` file instead, recompute that export's own digest
+    /// and report which trace it says it was derived from.
     Verify {
+        /// A trace directory, or a JSON file written by `premier export`.
         trace: PathBuf,
         /// Require a valid signature by this Ed25519 public key (64 hex
-        /// characters, or a file containing them).
+        /// characters, or a file containing them). For an export file: require
+        /// that its source block carries a valid signature by this key.
         #[arg(long, value_name = "PATH-OR-HEX")]
         public_key: Option<String>,
         /// For a trace that is not finalized (still recording, or abandoned):
@@ -230,6 +243,7 @@ enum Commands {
     },
     /// Filter local trace evidence without starting the viewer.
     Query {
+        /// A trace directory, or a JSON file written by `premier export`.
         trace: PathBuf,
         /// Exact event kind, matched case-insensitively.
         #[arg(long)]
@@ -240,9 +254,44 @@ enum Commands {
         /// Exact event status, matched case-insensitively.
         #[arg(long)]
         status: Option<String>,
-        /// Case-insensitive search across event metadata and payload JSON.
+        /// Case-insensitive search across event fields, ids, the payload
+        /// JSON text, and every payload string as recorded (so quotes, line
+        /// breaks, and text inside terminal colour codes match as typed).
         #[arg(long)]
         search: Option<String>,
+        /// Exact event id.
+        #[arg(long, value_name = "ID")]
+        event_id: Option<String>,
+        /// Exact span id.
+        #[arg(long, value_name = "ID")]
+        span: Option<String>,
+        /// Exact parent span id: the events directly under a span.
+        #[arg(long, value_name = "ID")]
+        parent_span: Option<String>,
+        /// Exact parent event id: the events caused directly by an event.
+        #[arg(long, value_name = "EVENT-ID")]
+        parent: Option<String>,
+        /// Exact correlation id: for example a tool call and its result.
+        #[arg(long, value_name = "ID")]
+        correlation: Option<String>,
+        /// Only events with a sequence greater than this. With --limit this
+        /// pages through a trace: pass the last sequence of the previous page.
+        #[arg(long, value_name = "N")]
+        after_sequence: Option<u64>,
+        /// Only events with a sequence less than this.
+        #[arg(long, value_name = "N")]
+        before_sequence: Option<u64>,
+        /// Only events at or after this time (RFC 3339, for example
+        /// 2026-07-15T12:00:00Z).
+        #[arg(long, value_name = "TIME", value_parser = parse_query_time)]
+        since: Option<chrono::DateTime<Utc>>,
+        /// Only events before this time (RFC 3339).
+        #[arg(long, value_name = "TIME", value_parser = parse_query_time)]
+        until: Option<chrono::DateTime<Utc>>,
+        /// Only events that count as issues: an error, failed, denied or
+        /// blocked status, an error or failure kind, or a provider-stated failure.
+        #[arg(long)]
+        issues: bool,
         /// Maximum events returned (1-1000).
         #[arg(long, default_value_t = 100, value_parser = parse_query_limit)]
         limit: usize,
@@ -269,17 +318,46 @@ enum Commands {
         /// output, which is otherwise exported as recorded.
         #[arg(long)]
         redact_known_secrets: bool,
+        /// Additional field name whose value is removed wherever it appears
+        /// in the exported manifest and events. Repeatable.
+        #[arg(long = "redact-field", value_name = "NAME")]
+        redact_fields: Vec<String>,
+        /// Exact text removed from every string of the exported manifest and
+        /// events, terminal output included. Repeatable. The text itself is
+        /// not written to the export.
+        #[arg(long = "redact-literal", value_name = "TEXT")]
+        redact_literals: Vec<String>,
+        /// Export only events of this kind (exact, case-insensitive). Repeatable.
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<String>,
+        /// Export only events of this actor id (exact, case-insensitive). Repeatable.
+        #[arg(long, value_name = "ACTOR")]
+        actor: Vec<String>,
+        /// Export only events with a sequence greater than this.
+        #[arg(long, value_name = "N")]
+        after_sequence: Option<u64>,
+        /// Export only events with a sequence less than this.
+        #[arg(long, value_name = "N")]
+        before_sequence: Option<u64>,
         /// Export a finalized trace even though it fails `premier verify`.
         #[arg(long)]
         allow_unverified: bool,
     },
     /// Compare two traces by semantic event structure, ignoring generated identity noise.
+    /// Events are aligned in order, so an inserted, removed or moved event is
+    /// reported as such; captured output is compared per stream, line by line.
     Diff {
+        /// A trace directory, or a JSON file written by `premier export`.
         baseline: PathBuf,
+        /// A trace directory, or a JSON file written by `premier export`.
         current: PathBuf,
         /// Emit the complete structural comparison as JSON.
         #[arg(long)]
         json: bool,
+        /// Exit with status 1 when the traces differ (0 when they do not),
+        /// for use in scripts and CI.
+        #[arg(long)]
+        exit_code: bool,
         /// Compare finalized traces even though one fails `premier verify`.
         #[arg(long)]
         allow_unverified: bool,
@@ -405,7 +483,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Commands::Demo { output } => demo(output),
+        Commands::Demo { output, force } => demo(output, force),
         Commands::Emit {
             json,
             kind,
@@ -435,6 +513,15 @@ async fn main() -> Result<()> {
             public_key,
             live,
         } => {
+            if trace.is_file() {
+                if live {
+                    bail!(
+                        "--live checks a trace that is still being recorded; {} is an export file",
+                        trace.display()
+                    )
+                }
+                return verify_export(&trace, public_key.as_deref());
+            }
             if let Ok(manifest) = read_manifest(&trace)
                 && let Some(state) = unfinalized_state(&trace, &manifest)
             {
@@ -624,37 +711,81 @@ async fn main() -> Result<()> {
             actor,
             status,
             search,
+            event_id,
+            span,
+            parent_span,
+            parent,
+            correlation,
+            after_sequence,
+            before_sequence,
+            since,
+            until,
+            issues,
             limit,
             json,
             allow_unverified,
-        } => {
-            ensure_verified(&trace, allow_unverified)?;
-            query_trace(
-                trace,
-                QueryOptions {
-                    kind,
-                    actor,
-                    status,
-                    search,
-                    limit,
-                },
-                json,
-            )
-        }
+        } => query_trace(
+            trace,
+            QueryOptions {
+                kind,
+                actor,
+                status,
+                search,
+                event_id,
+                span,
+                parent_span,
+                parent,
+                correlation,
+                after_sequence,
+                before_sequence,
+                since,
+                until,
+                issues,
+                limit,
+            },
+            json,
+            allow_unverified,
+        ),
         Commands::Export {
             trace,
             output,
             no_default_secret_patterns,
             redact_known_secrets,
+            redact_fields,
+            redact_literals,
+            kind,
+            actor,
+            after_sequence,
+            before_sequence,
             allow_unverified,
         } => {
-            ensure_verified(&trace, allow_unverified)?;
+            if trace.is_file() {
+                bail!(
+                    "{} is a file, not a trace directory; an export cannot be exported again",
+                    trace.display()
+                )
+            }
+            if redact_literals.iter().any(String::is_empty) {
+                bail!("--redact-literal must not be empty")
+            }
+            let source_state = ensure_verified(&trace, allow_unverified)?;
             export_trace(
                 trace,
                 output,
-                RedactionOptions {
-                    default_secret_patterns: !no_default_secret_patterns,
-                    known_secrets_in_terminal: redact_known_secrets,
+                ExportOptions {
+                    redaction: RedactionOptions {
+                        default_secret_patterns: !no_default_secret_patterns,
+                        known_secrets_in_terminal: redact_known_secrets,
+                    },
+                    selection: ExportSelection {
+                        kind,
+                        actor,
+                        after_sequence,
+                        before_sequence,
+                    },
+                    source_state,
+                    redact_fields,
+                    redact_literals,
                 },
             )
         }
@@ -662,12 +793,9 @@ async fn main() -> Result<()> {
             baseline,
             current,
             json,
+            exit_code,
             allow_unverified,
-        } => {
-            ensure_verified(&baseline, allow_unverified)?;
-            ensure_verified(&current, allow_unverified)?;
-            diff_traces(baseline, current, json)
-        }
+        } => diff_traces(baseline, current, json, exit_code, allow_unverified),
         Commands::Replay {
             trace,
             speed,
@@ -687,10 +815,24 @@ async fn main() -> Result<()> {
         } => {
             let mut options = server_options(no_assistant);
             let (trace_dir, focus) = if let Some(trace) = trace {
-                let manifest = read_manifest(&trace)?;
+                let manifest = read_manifest(&trace)
+                    .with_context(|| format!("cannot open trace {}", trace.display()))?;
+                // The viewer this starts answers as the local identity, which
+                // is never shown another tenant's trace: say so here instead
+                // of opening a browser on a page that answers "not found".
+                if manifest.tenant_id != premier_trace::LOCAL_TENANT {
+                    bail!(
+                        "cannot open {}: it is owned by tenant '{}', and `premier open` serves the local viewer identity, which cannot see it. {TENANT_TRACE_HINT}",
+                        trace.display(),
+                        manifest.tenant_id
+                    )
+                }
                 let (trace_dir, only_artifact) = single_trace_scope(&trace)?;
+                // Address the trace by its directory name: a copy elsewhere
+                // may share its trace id.
+                let focus = only_artifact.to_string_lossy().into_owned();
                 options.only_artifact = Some(only_artifact);
-                (trace_dir, Some(manifest.trace_id))
+                (trace_dir, Some(focus))
             } else {
                 (trace_dir, None)
             };
@@ -716,6 +858,15 @@ async fn main() -> Result<()> {
             tls_key,
             no_assistant,
         } => {
+            if !bind.ip().is_loopback()
+                && password.as_deref().is_some_and(|password| {
+                    password.trim().chars().count() < MIN_REMOTE_PASSWORD_CHARS
+                })
+            {
+                eprintln!(
+                    "warning: the viewer password is shorter than {MIN_REMOTE_PASSWORD_CHARS} characters and this server is reachable from other machines; it is one shared secret for every user, so use a long random one (failed sign-ins are delayed and logged, not locked out)"
+                );
+            }
             let auth = AuthPolicy::from_sources(password, auth_config.as_deref())?;
             let tls = TlsFiles::from_options(tls_cert, tls_key)?;
             let options = server_options(no_assistant);
@@ -723,6 +874,14 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+/// A shorter viewer password on a non-loopback address draws a warning.
+const MIN_REMOTE_PASSWORD_CHARS: usize = 12;
+
+/// How a trace owned by a tenant other than `local` can be read. The browser
+/// viewer cannot: it signs in with the server password, which is the local
+/// identity, and sends no bearer token.
+const TENANT_TRACE_HINT: &str = "A tenant's traces are readable through the HTTP API only: start `premier serve --auth-config <file>` and request `/api/traces` with that tenant's bearer token (`Authorization: Bearer <token>`). The browser viewer signs in with the server password, which is the local identity, so it cannot show tenant-owned traces";
 
 /// Viewer options shared by every command that serves; the environment switch
 /// also covers `record --open`.
@@ -911,7 +1070,7 @@ fn report_resealed_signature(was_signed: bool, manifest: &premier_trace::TraceMa
 /// Gate evidence-reading commands on the same checks as `premier verify`.
 /// A live trace has no digest yet, so it is readable with a note; a finalized
 /// trace that fails verification is refused unless explicitly allowed.
-fn ensure_verified(trace: &std::path::Path, allow_unverified: bool) -> Result<()> {
+fn ensure_verified(trace: &std::path::Path, allow_unverified: bool) -> Result<SourceState> {
     let manifest =
         read_manifest(trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
     if manifest.journal.is_none() {
@@ -919,16 +1078,16 @@ fn ensure_verified(trace: &std::path::Path, allow_unverified: bool) -> Result<()
             "note: {} is not finalized (still recording or interrupted); its events are unverified and may be incomplete",
             trace.display()
         );
-        return Ok(());
+        return Ok(SourceState::NotFinalized);
     }
     match verify(trace) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(SourceState::Verified),
         Err(error) if allow_unverified => {
             eprintln!(
                 "warning: {} failed verification ({error:#}); reading it anyway because --allow-unverified was given",
                 trace.display()
             );
-            Ok(())
+            Ok(SourceState::Failed)
         }
         Err(error) => bail!(
             "trace {} failed verification: {error:#}. Its evidence may have been altered or truncated; pass --allow-unverified to read it anyway",
@@ -940,11 +1099,103 @@ fn ensure_verified(trace: &std::path::Path, allow_unverified: bool) -> Result<()
 fn parse_query_limit(value: &str) -> std::result::Result<usize, String> {
     let limit = value
         .parse::<usize>()
-        .map_err(|_| "limit must be an integer between 1 and 1000".to_owned())?;
-    if !(1..=1_000).contains(&limit) {
-        return Err("limit must be between 1 and 1000".into());
+        .map_err(|_| format!("limit must be an integer between 1 and {MAX_QUERY_LIMIT}"))?;
+    if !(1..=MAX_QUERY_LIMIT).contains(&limit) {
+        return Err(format!("limit must be between 1 and {MAX_QUERY_LIMIT}"));
     }
     Ok(limit)
+}
+
+fn parse_query_time(value: &str) -> std::result::Result<chrono::DateTime<Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|_| {
+            "time must be RFC 3339 with an offset, for example 2026-07-15T12:00:00Z".to_owned()
+        })
+}
+
+/// Read a `premier export` file and check its own digest, as `ensure_verified`
+/// does for a trace. An export is a derived copy, so the reader is told.
+fn load_export(path: &std::path::Path, allow_unverified: bool) -> Result<ExportDocument> {
+    let bytes = fs::read(path).with_context(|| format!("cannot read export {}", path.display()))?;
+    let export = ExportDocument::parse(&bytes)
+        .with_context(|| format!("cannot read {} as an export", path.display()))?;
+    match export.verify() {
+        Ok(verified) => eprintln!(
+            "note: {} is an export (digest sha256:{}): a derived, redacted copy of trace {}, not the sealed trace",
+            path.display(),
+            verified.digest,
+            printable(&verified.source_trace_id)
+        ),
+        Err(error) if allow_unverified => eprintln!(
+            "warning: export {} failed verification ({error:#}); reading it anyway because --allow-unverified was given",
+            path.display()
+        ),
+        Err(error) => bail!(
+            "export {} failed verification: {error:#}. Pass --allow-unverified to read it anyway",
+            path.display()
+        ),
+    }
+    Ok(export)
+}
+
+/// `premier verify <export.json>`: recompute the export's digest and say what
+/// the export claims to be derived from.
+fn verify_export(path: &std::path::Path, public_key: Option<&str>) -> Result<()> {
+    let trusted_key = public_key
+        .map(premier_trace::PublicKey::from_hex_or_file)
+        .transpose()?;
+    let bytes = fs::read(path).with_context(|| format!("cannot read export {}", path.display()))?;
+    let verified = ExportDocument::parse(&bytes)
+        .and_then(|export| export.verify())
+        .with_context(|| format!("invalid: export {} failed verification", path.display()))?;
+    if let Some(trusted) = &trusted_key {
+        match &verified.source_signer {
+            Some(signer) if signer == trusted => {}
+            Some(signer) => bail!(
+                "invalid: the export's source trace is signed by a different key ({}), not the supplied key {}",
+                signer.fingerprint(),
+                trusted.fingerprint()
+            ),
+            None => bail!(
+                "invalid: the export's source block carries no signature, so nothing ties it to the supplied key"
+            ),
+        }
+    }
+    println!(
+        "export consistent: {} ({} events, digest sha256:{})",
+        path.display(),
+        verified.event_count,
+        verified.digest
+    );
+    let selection = match (verified.selection_applied, verified.source_events) {
+        (true, Some(source)) => format!(
+            "; a selection kept {} of the {source} source events",
+            verified.event_count
+        ),
+        _ => String::new(),
+    };
+    println!(
+        "derived from trace {} ({}, source verification when exported: {}){selection}",
+        printable(&verified.source_trace_id),
+        printable(&verified.source_protection),
+        printable(&verified.source_verification),
+    );
+    match &verified.source_signer {
+        Some(signer) if trusted_key.is_some() => println!(
+            "source signature: valid for the source seal, by the supplied key {}",
+            signer.fingerprint()
+        ),
+        Some(signer) => println!(
+            "source signature: valid for the source seal, by an unknown key {} (pass --public-key with a key you trust)",
+            signer.fingerprint()
+        ),
+        None => println!("source signature: none; the source trace was not signed"),
+    }
+    println!(
+        "note: an export is a derived, redacted copy, not the sealed original. Its digest is stored in the file it covers, so this detects damage and careless edits; whoever can rewrite the file can recompute the digest. The source signature, when present, shows that the key's holder signed a trace with that seal; it does not cover the exported events. Verify the original trace for that"
+    );
+    Ok(())
 }
 
 fn parse_replay_speed(value: &str) -> std::result::Result<f64, String> {
@@ -1013,16 +1264,49 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn query_trace(trace: PathBuf, options: QueryOptions, json_output: bool) -> Result<()> {
-    read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
-    // Only the matches up to the limit are kept while the journal streams by.
+fn query_trace(
+    trace: PathBuf,
+    options: QueryOptions,
+    json_output: bool,
+    allow_unverified: bool,
+) -> Result<()> {
+    // Only the matches up to the limit are kept while the events go by.
     let mut matcher = QueryMatcher::new(&options);
-    let mut events = stream_events(&trace)?;
-    for event in &mut events {
-        matcher.push(event?);
-    }
-    events.ensure_intact()?;
-    let result = matcher.finish();
+    let source = if trace.is_file() {
+        let export = load_export(&trace, allow_unverified)?;
+        let verification = match export.verify() {
+            Ok(_) => "verified",
+            Err(_) => "failed",
+        };
+        for event in export.events {
+            matcher.push(event);
+        }
+        QuerySource {
+            kind: "export",
+            finalized: export.document["source"]["finalized"]
+                .as_bool()
+                .unwrap_or(true),
+            verification,
+        }
+    } else {
+        let state = ensure_verified(&trace, allow_unverified)?;
+        let mut events = stream_events(&trace)?;
+        for event in &mut events {
+            matcher.push(event?);
+        }
+        events.ensure_intact()?;
+        QuerySource {
+            kind: "trace",
+            finalized: state != SourceState::NotFinalized,
+            verification: match state {
+                SourceState::NotFinalized => "not_finalized",
+                SourceState::Failed => "failed",
+                _ => "verified",
+            },
+        }
+    };
+    let mut result = matcher.finish();
+    result.source = Some(source);
     if json_output {
         return print_json(&result);
     }
@@ -1048,22 +1332,22 @@ fn query_trace(trace: PathBuf, options: QueryOptions, json_output: bool) -> Resu
         "{} matched; {} returned{}",
         result.matched,
         result.returned,
-        if result.truncated {
-            " (limit reached)"
-        } else {
-            ""
+        match result.next_after_sequence {
+            Some(sequence) =>
+                format!(" (limit reached; continue with --after-sequence {sequence})"),
+            None if result.truncated => " (limit reached)".to_owned(),
+            None => String::new(),
         }
     );
     Ok(())
 }
 
-fn export_trace(
-    trace: PathBuf,
-    output: Option<PathBuf>,
-    redaction: RedactionOptions,
-) -> Result<()> {
+fn export_trace(trace: PathBuf, output: Option<PathBuf>, options: ExportOptions) -> Result<()> {
     let manifest =
         read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
+    if let Some(output) = &output {
+        refuse_export_into_a_trace(output)?;
+    }
     let mut events = stream_events(&trace)?;
     if manifest.encryption.is_some() {
         eprintln!(
@@ -1075,7 +1359,7 @@ fn export_trace(
     // held in memory.
     let Some(output) = output else {
         let mut stdout = BufWriter::new(std::io::stdout().lock());
-        write_portable_evidence(&mut stdout, &manifest, &mut events, redaction)?;
+        write_portable_evidence_with(&mut stdout, &manifest, &mut events, &options)?;
         writeln!(stdout)?;
         stdout.flush()?;
         return events.ensure_intact();
@@ -1088,9 +1372,9 @@ fn export_trace(
             .unwrap_or("premier-export"),
         std::process::id()
     ));
-    let written = write_export_file(&temporary, &output, &manifest, &mut events, redaction);
-    let counts = match written {
-        Ok(counts) => counts,
+    let written = write_export_file(&temporary, &output, &manifest, &mut events, &options);
+    let summary = match written {
+        Ok(summary) => summary,
         Err(error) => {
             let _ = fs::remove_file(&temporary);
             return Err(error);
@@ -1099,9 +1383,46 @@ fn export_trace(
     println!(
         "exported redacted evidence to {} ({} value(s) redacted by this export, {} already redacted when recorded)",
         output.display(),
-        counts.total,
-        counts.already_redacted
+        summary.redacted.total + summary.custom.fields + summary.custom.literals,
+        summary.redacted.already_redacted
     );
+    if summary.exported_events != summary.source_events {
+        println!(
+            "selection: {} of {} events exported",
+            summary.exported_events, summary.source_events
+        );
+    }
+    println!(
+        "export digest: sha256:{} (check with `premier verify {}`)",
+        summary.digest,
+        output.display()
+    );
+    Ok(())
+}
+
+/// An export written into a trace directory would replace one of the trace's
+/// own files (`-o run.atrace/manifest.json`) or leave a stray file in it.
+fn refuse_export_into_a_trace(output: &std::path::Path) -> Result<()> {
+    if output.is_dir() {
+        bail!(
+            "refusing to export to {}: it is a directory; name a JSON file",
+            output.display()
+        )
+    }
+    let mut directory = Some(trace_parent_dir(output));
+    while let Some(candidate) = directory {
+        if candidate.join("manifest.json").is_file() && candidate.join("events").is_dir() {
+            bail!(
+                "refusing to export to {}: {} is a trace directory, and an export must not be written into a trace",
+                output.display(),
+                candidate.display()
+            )
+        }
+        directory = candidate
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf);
+    }
     Ok(())
 }
 
@@ -1111,13 +1432,13 @@ fn write_export_file(
     output: &std::path::Path,
     manifest: &premier_trace::TraceManifest,
     events: &mut premier_trace::EventStream,
-    redaction: RedactionOptions,
-) -> Result<premier_cli::evidence::RedactionCounts> {
+    options: &ExportOptions,
+) -> Result<premier_cli::evidence::ExportSummary> {
     let mut file = BufWriter::new(
         create_private(temporary)
             .with_context(|| format!("cannot write export {}", temporary.display()))?,
     );
-    let counts = write_portable_evidence(&mut file, manifest, &mut *events, redaction)?;
+    let summary = write_portable_evidence_with(&mut file, manifest, &mut *events, options)?;
     events.ensure_intact()?;
     writeln!(file)?;
     file.into_inner()
@@ -1126,7 +1447,7 @@ fn write_export_file(
         .with_context(|| format!("cannot write export {}", temporary.display()))?;
     fs::rename(temporary, output)
         .with_context(|| format!("cannot publish export {}", output.display()))?;
-    Ok(counts)
+    Ok(summary)
 }
 
 /// Create `path` readable and writable by its owner only (0600 on Unix): an
@@ -1147,32 +1468,151 @@ fn create_private(path: &std::path::Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-fn diff_traces(baseline: PathBuf, current: PathBuf, json_output: bool) -> Result<()> {
-    read_manifest(&baseline)
-        .with_context(|| format!("cannot read baseline trace {}", baseline.display()))?;
-    read_manifest(&current)
-        .with_context(|| format!("cannot read current trace {}", current.display()))?;
-    let diff = diff_events(&read_events(&baseline)?, &read_events(&current)?);
-    if json_output {
-        return print_json(&diff);
+/// One side of a diff: its manifest as JSON and its events, from a trace
+/// directory or from an export file.
+fn diff_side(
+    path: &std::path::Path,
+    role: &str,
+    allow_unverified: bool,
+) -> Result<(serde_json::Value, Vec<premier_trace::TraceEvent>)> {
+    if path.is_file() {
+        let export = load_export(path, allow_unverified)?;
+        return Ok((export.manifest().clone(), export.events));
     }
-    println!(
-        "{} added · {} removed · {} changed · {} unchanged",
-        diff.counts.added, diff.counts.removed, diff.counts.changed, diff.counts.unchanged
+    ensure_verified(path, allow_unverified)?;
+    let manifest = read_manifest(path)
+        .with_context(|| format!("cannot read {role} trace {}", path.display()))?;
+    Ok((serde_json::to_value(&manifest)?, read_events(path)?))
+}
+
+/// A diff value on one terminal line.
+fn diff_value(value: &serde_json::Value) -> String {
+    const MAX_CHARS: usize = 120;
+    let text = match value {
+        serde_json::Value::String(text) => format!("{text:?}"),
+        other => other.to_string(),
+    };
+    let text = printable(&text);
+    if text.chars().count() <= MAX_CHARS {
+        return text.into_owned();
+    }
+    let mut shortened: String = text.chars().take(MAX_CHARS).collect();
+    shortened.push('…');
+    shortened
+}
+
+fn diff_position(baseline: Option<u64>, current: Option<u64>) -> String {
+    match (baseline, current) {
+        (Some(baseline), Some(current)) => {
+            format!("baseline #{baseline}, current #{current}")
+        }
+        (Some(baseline), None) => format!("baseline #{baseline}"),
+        (None, Some(current)) => format!("current #{current}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn diff_traces(
+    baseline: PathBuf,
+    current: PathBuf,
+    json_output: bool,
+    exit_code: bool,
+    allow_unverified: bool,
+) -> Result<()> {
+    let (baseline_manifest, baseline_events) = diff_side(&baseline, "baseline", allow_unverified)?;
+    let (current_manifest, current_events) = diff_side(&current, "current", allow_unverified)?;
+    let diff = compare_traces(
+        &baseline_manifest,
+        &baseline_events,
+        &current_manifest,
+        &current_events,
     );
+    if json_output {
+        print_json(&diff)?;
+    } else {
+        print_diff(&diff)?;
+    }
+    if exit_code && !diff.identical {
+        // The comparison itself succeeded; the status reports its result.
+        std::io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn print_diff(diff: &premier_cli::evidence::TraceDiff) -> Result<()> {
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    writeln!(
+        output,
+        "{} added · {} removed · {} changed · {} moved · {} unchanged",
+        diff.counts.added,
+        diff.counts.removed,
+        diff.counts.changed,
+        diff.counts.moved,
+        diff.counts.unchanged
+    )?;
+    match &diff.first_divergence {
+        None if diff.manifest.is_empty() => writeln!(output, "no differences")?,
+        None => writeln!(output, "events do not differ; the manifests do")?,
+        Some(first) => {
+            writeln!(
+                output,
+                "first divergence: {} {} ({})",
+                format!("{:?}", first.status).to_lowercase(),
+                printable(&first.key),
+                diff_position(first.baseline_sequence, first.current_sequence)
+            )?;
+            if let Some(change) = &first.change {
+                writeln!(
+                    output,
+                    "    {}: {} → {}",
+                    printable(&change.field),
+                    diff_value(&change.before),
+                    diff_value(&change.after)
+                )?;
+            }
+        }
+    }
+    if diff.alignment != "ordered" {
+        writeln!(
+            output,
+            "note: the traces differ in too many places to align in order; events were paired per kind and actor, and order was not compared"
+        )?;
+    }
+    for change in &diff.manifest {
+        writeln!(
+            output,
+            "manifest\t{}: {} → {}",
+            printable(&change.field),
+            diff_value(&change.before),
+            diff_value(&change.after)
+        )?;
+    }
     for item in diff
         .items
         .iter()
         .filter(|item| item.status != DiffStatus::Unchanged)
     {
-        println!(
-            "{:?}\t{}\t{} field change{}",
+        writeln!(
+            output,
+            "{:?}\t{}\t{}\t{} field change{}",
             item.status,
             printable(&item.key),
+            diff_position(item.baseline_sequence, item.current_sequence),
             item.changes.len(),
             if item.changes.len() == 1 { "" } else { "s" }
-        );
+        )?;
+        for change in &item.changes {
+            writeln!(
+                output,
+                "    {}: {} → {}",
+                printable(&change.field),
+                diff_value(&change.before),
+                diff_value(&change.after)
+            )?;
+        }
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -1277,15 +1717,29 @@ async fn serve_viewer(
     if !bind.ip().is_loopback() {
         validate_remote_trace_store(&trace_dir)?;
     }
+    // Listen before anything is announced: with the port taken, a browser
+    // sent to the URL would land on whatever already owns it.
+    let listener = std::net::TcpListener::bind(bind).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::anyhow!(
+                "cannot start the viewer: {bind} is already in use, perhaps by another `premier open` or `premier serve`. Stop that process or choose another address with --bind (for example --bind 127.0.0.1:0 for any free port)"
+            )
+        } else {
+            anyhow::anyhow!("cannot start the viewer: cannot listen on {bind}: {error}")
+        }
+    })?;
+    listener.set_nonblocking(true)?;
+    // With port 0 the system chose the port.
+    let bind = listener.local_addr()?;
+    let router = app_with_options(trace_dir, viewer, auth, options);
     let scheme = if tls_enabled { "https" } else { "http" };
     let url = focus_trace
-        .map(|trace_id| format!("{scheme}://{bind}/?trace={trace_id}"))
+        .map(|trace| format!("{scheme}://{bind}/?trace={}", url_component(&trace)))
         .unwrap_or_else(|| format!("{scheme}://{bind}"));
     println!("Premier viewer: {url}");
     if launch_browser && let Err(error) = open_browser(&url) {
         tracing::warn!("could not open browser: {error}");
     }
-    let router = app_with_options(trace_dir, viewer, auth, options);
     // Ctrl-C and SIGTERM stop the server: it stops accepting, lets requests
     // in flight finish, and gives up on the rest (an open event stream)
     // after `VIEWER_SHUTDOWN_DEADLINE`.
@@ -1310,12 +1764,12 @@ async fn serve_viewer(
                 requested.await;
                 shutdown.graceful_shutdown(Some(VIEWER_SHUTDOWN_DEADLINE));
             });
-            axum_server::bind_rustls(bind, config)
+            axum_server::from_tcp_rustls(listener, config)?
                 .handle(handle)
                 .serve(router.into_make_service())
                 .await?;
         } else {
-            let listener = tokio::net::TcpListener::bind(bind).await?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
             axum::serve(listener, router)
                 .with_graceful_shutdown(stopped(stop.clone()))
                 .await?;
@@ -1333,6 +1787,19 @@ async fn serve_viewer(
         eprintln!("premier: viewer stopped");
     }
     Ok(())
+}
+
+/// `value` percent-encoded for use as a URL query value.
+fn url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// How long the viewer server waits for open connections after it was asked
@@ -1536,12 +2003,71 @@ fn refuse_to_replace_a_recording(output: &std::path::Path) -> Result<()> {
     }
 }
 
-fn demo(output: PathBuf) -> Result<()> {
+/// The command recorded in a demo trace's manifest.
+const DEMO_COMMAND: [&str; 2] = ["premier", "demo"];
+
+/// `demo` only ever replaces an earlier demo. Anything else at the output
+/// path is somebody's recording.
+fn refuse_to_replace_a_real_trace(output: &std::path::Path, force: bool) -> Result<()> {
+    let Ok(manifest) = read_manifest(output) else {
+        // Unreadable or not a trace: `prepare_trace_output` decides.
+        return Ok(());
+    };
+    if force || manifest.command == DEMO_COMMAND {
+        return Ok(());
+    }
+    bail!(
+        "refusing to replace {}: it is a recorded trace ({}), not an earlier demo; choose another --output, or pass --force to replace it",
+        output.display(),
+        printable(&manifest.name.unwrap_or_else(|| manifest.command.join(" ")))
+    )
+}
+
+fn demo(output: PathBuf, force: bool) -> Result<()> {
+    // Everything that can refuse the output path is asked first, before
+    // anything is written.
+    premier_trace::check_trace_output(&output)?;
     refuse_to_replace_a_recording(&output)?;
-    prepare_trace_output(&output)?;
+    refuse_to_replace_a_real_trace(&output, force)?;
+    // The demo is written beside its destination and moved into place once
+    // it is complete, so a failure (an unusable key file, a full disk) leaves
+    // whatever was at the output path untouched.
+    let staging = output.with_file_name(format!(
+        ".{}.demo-{}.tmp",
+        output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("the demo output path has no file name")?,
+        std::process::id()
+    ));
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_dir_all(&staging);
+    let written = write_demo(&staging).and_then(|manifest| {
+        prepare_trace_output(&output)?;
+        fs::rename(&staging, &output)
+            .with_context(|| format!("cannot move the demo trace to {}", output.display()))?;
+        Ok(manifest)
+    });
+    let manifest = match written {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    println!("demo trace {} → {}", manifest.trace_id, output.display());
+    println!("next: premier open {}", output.display());
+    Ok(())
+}
+
+fn write_demo(output: &std::path::Path) -> Result<premier_trace::TraceManifest> {
     let mut writer = TraceWriter::create_named(
-        &output,
-        vec!["premier".into(), "demo".into()],
+        output,
+        DEMO_COMMAND.iter().map(|word| (*word).to_owned()).collect(),
         Some("Multi-agent failure investigation".into()),
     )?;
     // Stagger producer times so actor lanes show realistic starts (not wall-clock receipt pile-up).
@@ -1717,8 +2243,11 @@ fn demo(output: PathBuf) -> Result<()> {
             at,
         )
     })?;
+    // The coordinator spawns the reviewer (as its payload says); the patch
+    // under review is what the spawn refers to, not what caused it.
     let reviewer = writer.append_input(EventInput {
-        parent_event_id: patch.event_id.clone(),
+        parent_event_id: root.event_id.clone(),
+        links: vec![patch.event_id.clone()],
         ..event(
             16_000,
             "agent.spawn",
@@ -1777,10 +2306,7 @@ fn demo(output: PathBuf) -> Result<()> {
             at,
         )
     })?;
-    let manifest = writer.finish(1)?;
-    println!("demo trace {} → {}", manifest.trace_id, output.display());
-    println!("next: premier open {}", output.display());
-    Ok(())
+    writer.finish(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1847,8 +2373,13 @@ async fn record(options: RecordOptions) -> Result<()> {
     }
     if open_viewer && tenant != premier_trace::LOCAL_TENANT {
         bail!(
-            "--open serves the default local viewer identity, which cannot see a trace owned by tenant '{tenant}'; record without --open, then use `premier serve --auth-config` to view it"
+            "--open serves the local viewer identity, which cannot see a trace owned by tenant '{tenant}'; record without --open. {TENANT_TRACE_HINT}"
         )
+    }
+    if open_viewer {
+        // Found now, not after the command has run and been recorded.
+        validate_bind(bind.ip(), &AuthPolicy::default(), false)?;
+        resolve_viewer_dir(viewer_dir.clone())?;
     }
     let native_provider = adapter.resolve(executable, &command[1..], pty);
     if pty
@@ -2068,6 +2599,38 @@ async fn record(options: RecordOptions) -> Result<()> {
     let termination = capture.termination;
     let recorder_signals = capture.recorder_signals;
     let mut faults = capture.faults;
+    // The manifest was told an adapter would normalize this run before the
+    // command started. Where its output was not (all) native events, the
+    // manifest and the user are told what was actually captured.
+    if let (Some(provider), Some(summary)) = (native_provider, capture.adapter_summary)
+        && summary.needs_report()
+    {
+        faults.note(
+            writer
+                .lock()
+                .unwrap()
+                .set_adapter(premier_trace::AdapterProvenance {
+                    provider: provider.id().into(),
+                    schema_version: ADAPTER_SCHEMA_VERSION,
+                    transport: "stdout-jsonl".into(),
+                    completeness: summary.completeness().into(),
+                }),
+        );
+        if summary.normalized_lines == 0 {
+            eprintln!(
+                "premier: the {} adapter found no native JSONL events in {} line(s) of output; the trace holds terminal output only. Run the CLI with its structured output flag, or record with --adapter none",
+                provider.id(),
+                summary.lines
+            );
+        } else {
+            eprintln!(
+                "premier: the {} adapter could not read {} of {} output line(s) as native JSONL events; see the adapter.diagnostic and adapter.summary events",
+                provider.id(),
+                summary.rejected_lines,
+                summary.lines
+            );
+        }
+    }
     let code = termination.shell_exit_code();
     let command_success = code == 0;
     let mut exit_payload = json!({
@@ -2156,11 +2719,20 @@ async fn record(options: RecordOptions) -> Result<()> {
         }
     }
     if let Ok(manifest) = finalized {
-        eprintln!("next: premier open {}", output.display());
+        if manifest.tenant_id == premier_trace::LOCAL_TENANT {
+            eprintln!("next: premier open {}", output.display());
+        } else {
+            // `premier open` could not show it.
+            eprintln!(
+                "next: this trace is owned by tenant '{}'. {TENANT_TRACE_HINT}",
+                manifest.tenant_id
+            );
+        }
         if open_viewer && recorder_signals.received.is_none() {
             // Like `premier open <trace>`: publish this recording only, not
             // every other trace that happens to share its directory.
             let (trace_dir, only_artifact) = single_trace_scope(&output)?;
+            let only_artifact_name = only_artifact.to_string_lossy().into_owned();
             let mut options = server_options(false);
             options.only_artifact = Some(only_artifact);
             // The recorder's forwarding handlers are still installed and now
@@ -2181,7 +2753,7 @@ async fn record(options: RecordOptions) -> Result<()> {
                 bind,
                 AuthPolicy::default(),
                 options,
-                Some(manifest.trace_id),
+                Some(only_artifact_name),
                 true,
                 None,
             )
@@ -2324,6 +2896,8 @@ struct CaptureOutcome {
     /// A descendant still held the output stream after the child exited.
     output_open_at_exit: bool,
     faults: RecordingFaults,
+    /// What the native adapter made of the command's output, when one ran.
+    adapter_summary: Option<adapters::AdapterSummary>,
 }
 
 /// Stop requests the recorder itself received while the child was running.
@@ -2543,9 +3117,13 @@ fn capture_pipes(
             pending,
         ));
     }
+    let mut adapter_summary = None;
     if let Some(adapter) = native_adapter.as_mut() {
-        let events = adapter.finish();
+        let mut events = adapter.finish();
+        // Says so in the trace when the lines were not (all) native events.
+        events.extend(adapter.summary_event());
         faults.note(append_adapter_events(writer, adapter, events));
+        adapter_summary = Some(adapter.summary());
     }
     let (status, output_open_at_exit) = drained?;
     let status = match status {
@@ -2572,6 +3150,7 @@ fn capture_pipes(
         core_dumped,
         output_open_at_exit,
         faults,
+        adapter_summary,
     })
 }
 
@@ -2718,6 +3297,7 @@ fn capture_pty(
         core_dumped: status.core_dumped(),
         output_open_at_exit,
         faults,
+        adapter_summary: None,
     })
 }
 
@@ -3375,7 +3955,9 @@ fn list(trace_dir: PathBuf) -> Result<()> {
     let mut unopened = Vec::new();
     for entry in std::fs::read_dir(trace_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        // Dot-prefixed directories are working copies of `encrypt` and
+        // `demo`, not traces.
+        if !entry.file_type()?.is_dir() || entry.file_name().as_encoded_bytes().starts_with(b".") {
             continue;
         }
         match read_manifest(entry.path()) {
@@ -3388,16 +3970,32 @@ fn list(trace_dir: PathBuf) -> Result<()> {
     manifests.sort_by_key(|(_, manifest)| std::cmp::Reverse(manifest.started_at));
     for (path, manifest) in manifests {
         let state = match unfinalized_state(&path, &manifest) {
-            None => String::new(),
+            // How a finished run ended, when it did not end cleanly.
+            None => match (&manifest.termination, manifest.exit_code) {
+                (Some(termination), _) if termination.kind == TerminationKind::Signal => format!(
+                    "  [{}]",
+                    termination
+                        .signal_name
+                        .clone()
+                        .or(termination.signal.map(|signal| format!("signal {signal}")))
+                        .unwrap_or_else(|| "signal".into())
+                ),
+                (Some(termination), _) if termination.kind == TerminationKind::Interrupted => {
+                    "  [interrupted]".into()
+                }
+                (_, Some(code)) if code != 0 => format!("  [exit {code}]"),
+                _ => String::new(),
+            },
             Some(UnfinalizedState::Recording) => "  [recording]".into(),
             Some(state) => format!("  [{}]", state.describe(&path)),
         };
         println!(
-            "{}  {}  {}{}",
+            "{}  {}  {}{}  ({})",
             printable(&manifest.trace_id),
             manifest.started_at,
             printable(&manifest.name.unwrap_or_else(|| manifest.command.join(" "))),
-            printable(&state)
+            printable(&state),
+            printable(&path.file_name().unwrap_or_default().to_string_lossy())
         );
     }
     unopened.sort();

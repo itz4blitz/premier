@@ -68,7 +68,8 @@ describe('TraceComparison', () => {
       }
     });
     expect(screen.getByText('No meaningful differences')).toBeInTheDocument();
-    expect(screen.getByText(/generated ids and ordering noise are ignored/i)).toBeInTheDocument();
+    expect(screen.getByText(/in the same order; generated ids are ignored/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('comparison-first-divergence')).not.toBeInTheDocument();
   });
 
   it('handles empty traces without offering dead navigation', () => {

@@ -1,4 +1,4 @@
-import type { TraceEvent, TraceManifest } from './types';
+import { listKey, type TraceEvent, type TraceManifest } from './types';
 
 const sessionKey = 'premier.viewer.session.v1';
 const maxAgeMs = 30 * 60 * 1000;
@@ -26,7 +26,8 @@ export function readViewSession(traceId?: string | null): ViewSessionSnapshot | 
     const parsed = JSON.parse(raw) as ViewSessionSnapshot;
     if (!parsed || parsed.version !== 1 || !parsed.selectedTrace || !Array.isArray(parsed.events)) return null;
     if (!Number.isFinite(parsed.savedAt) || Date.now() - parsed.savedAt > maxAgeMs) return null;
-    if (traceId && parsed.selectedTrace.trace_id !== traceId) return null;
+    // `traceId` is the trace's artifact name, or its trace id in a link from an older build.
+    if (traceId && listKey(parsed.selectedTrace) !== traceId && parsed.selectedTrace.trace_id !== traceId) return null;
     return parsed;
   } catch {
     return null;

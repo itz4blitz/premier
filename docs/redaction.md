@@ -386,15 +386,23 @@ premier export run.atrace --redact-known-secrets > run.evidence.json
 ```json
 {
   "format": "premier.portable-evidence.v1",
-  "redaction": { "...": "see below" },
+  "exporter": { "name": "premier", "version": "0.1.0" },
   "source": { "...": "see below" },
   "manifest": { "...": "the trace manifest" },
-  "events": [ { "...": "each event, with `payload` decoded from `payload_json`" } ]
+  "events": [ { "...": "each event, with `payload` decoded from `payload_json`" } ],
+  "selection": { "...": "which events were exported; see below" },
+  "redaction": { "...": "see below" },
+  "integrity": { "...": "the export's own digest; see below" }
 }
 ```
 
-Two things to know before sharing the file:
+Three things to know before sharing the file:
 
+- **It is a derived copy, not the sealed original.** The events are redacted
+  and may be a selection, so the trace's seal and signature do not cover the
+  file. It carries a digest of its own instead, which
+  `premier verify <file>` recomputes; see [The `integrity`
+  block](#the-integrity-block).
 - **It is plaintext, also when the trace is encrypted.** `export` decrypts
   the trace and writes ordinary JSON. For an encrypted trace it warns on
   stderr: `warning: <trace> is encrypted, but this export is plaintext;
@@ -418,10 +426,38 @@ recorder did not:
   built-in value patterns are applied to terminal text only with
   `--redact-known-secrets`.
 
-`export` has no literal or regex options, and does not know the literal,
-regex, multi-line regex, or `--redact-field` rules a trace was recorded with,
-nor the collector token. Whatever those rules removed at record time is
-already `[REDACTED]` in the trace.
+`export` has two rules of its own for what a review turned up:
+
+- `--redact-field <name>` replaces the value of that field wherever it
+  appears in the exported manifest and events. Names are compared ignoring
+  case and punctuation, as an exact name (not as a suffix).
+- `--redact-literal <text>` replaces that exact text in every string of the
+  exported manifest and events, captured output included.
+
+Both may be repeated. `export` has no regex option. It does not know the
+literal, regex, multi-line regex, or `--redact-field` rules a trace was
+recorded with, nor the collector token: whatever those rules removed at
+record time is already `[REDACTED]` in the trace.
+
+### Selecting events
+
+`--kind` and `--actor` (repeatable, exact, ignoring case),
+`--after-sequence`, and `--before-sequence` limit the export to matching
+events; an event must satisfy every option given. The `selection` block
+records what was applied:
+
+```json
+"selection": {
+  "applied": true,
+  "filters": { "kind": ["tool.result"], "after_sequence": 10 },
+  "source_events": 240,
+  "exported_events": 12
+}
+```
+
+Without selection options `applied` is `false`, `filters` is `{}`, and the two
+counts are equal. Selected events keep their `parent_event_id` and `links`,
+which may name events that were left out.
 
 ### The `redaction` report
 
@@ -466,6 +502,13 @@ exported redacted evidence to export.json (0 value(s) redacted by this export, 9
 `export` refuses a finalized trace that fails verification unless
 `--allow-unverified` is given; see [cli.md](cli.md#--allow-unverified).
 
+The report gains two entries when the export was given rules of its own:
+`rules.custom_fields` (the `--redact-field` names) and `rules.literal_count`
+(how many `--redact-literal` texts; the texts are not written), and a
+`custom` block, `{"fields": <n>, "literals": <n>}`, counting what they
+replaced. `applied` is `true` when either these or the built-in rules removed
+something.
+
 ### The `source` block
 
 `source` states which trace the export was derived from, by copying the
@@ -483,7 +526,9 @@ tamper-evidence values out of its manifest:
   "signature": "ab43ea1eefde62d3...",
   "public_key": "e5f5b4620cbcf6becd1534a20bf456582509028c5763fa12360247d1071ea926",
   "public_key_fingerprint": "sha256:6f993d9bfe2cbf04ba8e18f506675153",
-  "note": "Copied from the source manifest. This redacted export is not itself covered by the seal or signature; verify the original trace with `premier verify`."
+  "finalized": true,
+  "verification": "verified",
+  "note": "Copied from the source manifest. This export is a derived, redacted copy: the source's seal and signature do not cover it. `integrity` below is the export's own digest; verify the original trace with `premier verify`."
 }
 ```
 
@@ -494,17 +539,57 @@ tamper-evidence values out of its manifest:
 | `journal_sha256` | The journal digest. Absent for a trace that is not finalized. |
 | `chain_head`, `event_count`, `seal` | The seal's chain head, event count, and digest. Absent without a seal. |
 | `signature`, `public_key`, `public_key_fingerprint` | The signature (128 hexadecimal characters, shortened above), and the signer's key and fingerprint. Absent for an unsigned trace. |
+| `finalized` | `false` when the trace was still being recorded or had been interrupted: the events may be incomplete. |
+| `verification` | What `export` established about the source: `verified`, `failed` (exported with `--allow-unverified`), or `not_finalized`. |
 | `note` | The fixed sentence above. |
 
 The values are copied, not checked against a key you trust: `protection:
 "signed"` means the source manifest carries a signature. The export is a
 copy, and redaction changes the events, so the export is not covered by the
-seal or the signature and cannot be verified with `premier verify`. To rely
-on the evidence, verify the original trace.
+seal or the signature. To rely on the evidence, verify the original trace.
+
+### The `integrity` block
+
+```json
+"integrity": {
+  "algorithm": "sha256",
+  "event_count": 12,
+  "events_sha256": "5c1e...",
+  "digest": "52b3c723bc5c1e0a3f93775d64e9ab3c158795e83170f892218a3de2908da9ca",
+  "note": "Recomputed by `premier verify <export.json>`. ..."
+}
+```
+
+| Field | Covers |
+| --- | --- |
+| `events_sha256` | SHA-256 over the exported events in order, each as compact JSON with its keys sorted, followed by a line feed. |
+| `digest` | SHA-256 over the compact, sorted-key JSON of one object holding `format`, `exporter`, `source`, `manifest`, `selection`, `redaction`, `event_count`, and `events_sha256`. This is the export's identity; `export --output` prints it. |
+
+`premier verify <file>` parses the file, recomputes both, and compares them
+and the event count with the block. It also checks that a signature copied
+into `source` is a valid signature over the copied seal digest by the copied
+public key, and `--public-key` requires that key to be yours. See
+[cli.md](cli.md#verifying-an-export).
+
+What this gives, and what it does not:
+
+- A changed, added, removed, or reordered event, or a changed block, is
+  detected, as long as the digest was not recomputed.
+- **The digest is in the file it covers.** Whoever can rewrite the file can
+  recompute it. Record the digest somewhere else (a ticket, a signed message)
+  if a deliberate rewrite has to be noticed.
+- The source signature shows that the key's holder signed a trace with that
+  seal digest. It does not show that these events came from that trace.
+- The same trace exported with the same options gives the same file and the
+  same digest. The export holds no timestamp of its own.
+- An export written before this block existed has none, and fails
+  `premier verify`.
 
 ### Other outputs
 
 - `premier query` and `premier replay` print events exactly as stored.
+  `query` and `diff` also read an export file; what they then show is the
+  export's redacted copy.
 - The viewer's export button builds a different document in the browser
   (`format: "premier.viewer-export.v1"`). It uses the same secret field names
   and masks every value shape in the built-in pattern table (both are tested

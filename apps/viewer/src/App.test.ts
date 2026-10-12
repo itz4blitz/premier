@@ -32,12 +32,14 @@ function mockWorkspace(traces: TraceManifest[] = [trace], eventMap: Record<strin
     const eventsMatch = url.match(/\/api\/traces\/([^/]+)\/events(?:\?.*)?$/);
     if (eventsMatch) {
       const id = decodeURIComponent(eventsMatch[1]);
-      return new Response(JSON.stringify(eventMap[id] ?? []), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      // Like the server: an artifact name, or a trace id.
+      const traceId = traces.find((item) => item.artifact === id)?.trace_id ?? id;
+      return new Response(JSON.stringify(eventMap[traceId] ?? []), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     const detailMatch = url.match(/\/api\/traces\/([^/]+)$/);
     if (detailMatch) {
       const id = decodeURIComponent(detailMatch[1]);
-      const found = traces.find((item) => item.trace_id === id) ?? { ...trace, trace_id: id };
+      const found = traces.find((item) => item.artifact === id) ?? traces.find((item) => item.trace_id === id) ?? { ...trace, trace_id: id };
       return new Response(JSON.stringify(found), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     return new Response('not found', { status: 404 });
@@ -164,6 +166,44 @@ it('keeps secondary investigation tools in More instead of crowding the header',
   expect(await screen.findByRole('region', { name: 'Trace comparison' })).toBeInTheDocument();
 });
 
+it('opens a copied trace by its artifact, not by the trace id both copies share', async () => {
+  const original: TraceManifest = { ...trace, name: 'Original recording', artifact: 'original.atrace' };
+  const copy: TraceManifest = { ...trace, name: 'Copied recording', artifact: 'copy.atrace' };
+  const requested: string[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (url.endsWith('/api/traces')) return json([original, copy]);
+    requested.push(url);
+    // The server refuses the shared id; only an artifact names one trace.
+    if (url.includes(`/api/traces/${trace.trace_id}`)) return new Response(JSON.stringify({ error: 'shared' }), { status: 409 });
+    const artifact = url.includes('/api/traces/copy.atrace') ? copy : original;
+    if (url.includes('/events')) {
+      // The copy was recorded on from where the original stopped.
+      const extra = { ...events[1], event_id: 'event-3', sequence: 3, kind: 'tool.copied' };
+      const all = artifact === copy ? [...events, extra] : events;
+      const after = Number(new URL(url, 'http://localhost').searchParams.get('after_sequence') ?? 0);
+      return json(all.filter((event) => event.sequence > after));
+    }
+    return json(artifact);
+  });
+  render(App);
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('original.atrace');
+  const rows = () => screen.getAllByRole('button', { pressed: true }).filter((button) => /recording/.test(button.textContent ?? ''));
+  expect(rows()).toHaveLength(1);
+  expect(rows()[0]).toHaveTextContent('Original recording');
+
+  await fireEvent.click(screen.getByRole('button', { name: /Copied recording/ }));
+  await waitFor(() => expect(screen.getAllByText('tool.copied').length).toBeGreaterThan(0));
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('copy.atrace');
+  // Only the copy's row is selected, although both rows have the same trace id.
+  expect(rows()).toHaveLength(1);
+  expect(rows()[0]).toHaveTextContent('Copied recording');
+  expect(requested.some((url) => url.includes(`/api/traces/${trace.trace_id}`))).toBe(false);
+  expect(requested.some((url) => url.includes('/api/traces/copy.atrace/events'))).toBe(true);
+});
+
 it('restores and persists every desktop workspace dimension', async () => {
   localStorage.setItem('premier.viewer.workspace.v1', JSON.stringify({ leftWidth: 312, rightWidth: 440, timeNavigatorHeight: 236, leftCollapsed: false, rightCollapsed: true }));
   mockWorkspace();
@@ -188,6 +228,7 @@ it('repaints from the session cache on hard refresh without a skeleton flash', a
   const cachedTrace: TraceManifest = {
     ...trace,
     trace_id: 'cached-trace',
+    artifact: 'cached-trace.atrace',
     name: 'Cached investigation'
   };
   const cachedEvents = events.map((event) => ({ ...event, trace_id: 'cached-trace', event_id: `cached-${event.event_id}` }));
@@ -251,17 +292,17 @@ it('keeps the previous run painted while the next load is in flight', async () =
     if (url.endsWith('/api/traces')) {
       return new Response(JSON.stringify([current, next]), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/current/events')) {
+    if (url.includes('/api/traces/current.atrace/events')) {
       return new Response(JSON.stringify(currentEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/next/events')) {
+    if (url.includes('/api/traces/next.atrace/events')) {
       await nextGate;
       return new Response(JSON.stringify(nextEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/current')) {
+    if (url.endsWith('/api/traces/current.atrace')) {
       return new Response(JSON.stringify(current), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/next')) {
+    if (url.endsWith('/api/traces/next.atrace')) {
       return new Response(JSON.stringify(next), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     return new Response('not found', { status: 404 });
@@ -303,17 +344,17 @@ it('never attributes a slower previous load to a newer selected run', async () =
     if (url.endsWith('/api/traces')) {
       return new Response(JSON.stringify([fast, slow]), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/slow/events')) {
+    if (url.includes('/api/traces/slow.atrace/events')) {
       await slowGate;
       return new Response(JSON.stringify(slowEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.includes('/api/traces/fast/events')) {
+    if (url.includes('/api/traces/fast.atrace/events')) {
       return new Response(JSON.stringify(fastEvents), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/slow')) {
+    if (url.endsWith('/api/traces/slow.atrace')) {
       return new Response(JSON.stringify(slow), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
-    if (url.endsWith('/api/traces/fast')) {
+    if (url.endsWith('/api/traces/fast.atrace')) {
       return new Response(JSON.stringify(fast), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     return new Response('not found', { status: 404 });
@@ -372,7 +413,7 @@ it('leaves the empty state when Refresh runs finds a first recording', async () 
     await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
     expect(screen.queryByText('No traces yet')).not.toBeInTheDocument();
     expect(screen.getByLabelText('Investigation summary')).toBeInTheDocument();
-    expect(new URL(window.location.href).searchParams.get('trace')).toBe('trace-1');
+    expect(new URL(window.location.href).searchParams.get('trace')).toBe('investigation.atrace');
     expect(errors).toEqual([]);
   } finally {
     window.removeEventListener('error', onError);
@@ -416,7 +457,7 @@ it('recovers from a missing shared trace by opening the latest available run', a
   await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
   expect(screen.queryByText('Trace not found')).not.toBeInTheDocument();
   expect(screen.getByLabelText('Investigation summary')).toBeInTheDocument();
-  expect(new URL(window.location.href).searchParams.get('trace')).toBe('trace-1');
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('investigation.atrace');
 });
 
 it('exports token usage intact, masks credentials, and labels the file honestly', async () => {
@@ -492,7 +533,7 @@ function mockPagedWorkspace(
     if (url.pathname === '/api/traces') return json(runs.map((run) => run.manifest));
     const eventsMatch = url.pathname.match(/^\/api\/traces\/([^/]+)\/events$/);
     if (eventsMatch) {
-      const run = runs.find((item) => item.manifest.trace_id === decodeURIComponent(eventsMatch[1]));
+      const run = runs.find((item) => [item.manifest.artifact, item.manifest.trace_id].includes(decodeURIComponent(eventsMatch[1])));
       const afterSequence = Number(url.searchParams.get('after_sequence') ?? 0);
       const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
       requests.push({ traceId: run?.manifest.trace_id ?? '', afterSequence, limit, signal: init?.signal });
@@ -503,7 +544,7 @@ function mockPagedWorkspace(
     }
     const detailMatch = url.pathname.match(/^\/api\/traces\/([^/]+)$/);
     if (detailMatch) {
-      const run = runs.find((item) => item.manifest.trace_id === decodeURIComponent(detailMatch[1]));
+      const run = runs.find((item) => [item.manifest.artifact, item.manifest.trace_id].includes(decodeURIComponent(detailMatch[1])));
       return run ? json(run.manifest) : new Response('not found', { status: 404 });
     }
     return new Response('not found', { status: 404 });
@@ -605,7 +646,7 @@ it('pages a live run to its tail once and then follows the stream from the last 
     window.history.replaceState({}, '', '/?trace=live');
     render(App);
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1), { timeout: 30_000 });
-    expect(FakeEventSource.instances[0].url).toBe('/api/traces/live/stream?after_sequence=6000');
+    expect(FakeEventSource.instances[0].url).toBe('/api/traces/live.atrace/stream?after_sequence=6000');
     expect(requests.map((request) => [request.afterSequence, request.limit])).toEqual([[0, 5_000], [5_000, 5_000]]);
     expect(document.querySelector('.timeline .panel-heading')).toHaveTextContent(/\b6000 events? ·/);
 
@@ -701,7 +742,8 @@ it('closes the event stream when a live trace turns abandoned', async () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
     const stream = FakeEventSource.instances[0];
     // The pages already hold the journal up to the tail; the stream resumes after it.
-    expect(stream.url).toBe('/api/traces/trace-1/stream?after_sequence=2');
+    // Addressed by artifact: a copy of the recording would share its trace id.
+    expect(stream.url).toBe('/api/traces/investigation.atrace/stream?after_sequence=2');
     stream.onopen?.(new Event('open'));
     await waitFor(() => expect(connection()).toHaveTextContent('STREAMING'));
     expect(stream.closed).toBe(false);

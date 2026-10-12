@@ -47,7 +47,13 @@
   const selectedProvider = $derived(providers.find((item) => item.provider === provider) ?? null);
   const displayedMessages = $derived(messages.slice(-MAX_DISPLAY_MESSAGES));
   const hiddenMessageCount = $derived(Math.max(0, messages.length - displayedMessages.length));
-  const canSubmit = $derived(Boolean(traceId && provider && prompt.trim() && !waiting && selectedProvider?.available));
+  /** Who receives what the selected CLI sends: the CLI runs here, the model does not. */
+  const VENDORS: Record<string, string> = { claude: 'Anthropic', codex: 'OpenAI', gemini: 'Google', grok: 'xAI' };
+  const vendor = $derived(VENDORS[provider] ?? 'the provider');
+  /** Providers the user agreed to send trace content to, for as long as this panel is open. */
+  let consented = $state<Record<string, boolean>>({});
+  const hasConsent = $derived(Boolean(provider && consented[provider]));
+  const canSubmit = $derived(Boolean(traceId && provider && prompt.trim() && !waiting && selectedProvider?.available && hasConsent));
 
   $effect(() => {
     if (!selectedEvent && scope === 'event') scope = 'run';
@@ -151,18 +157,18 @@
       </span>
       <div>
         <span class="eyebrow">Trace copilot</span>
-        <h2 id="assistant-title">Ask your local AI</h2>
+        <h2 id="assistant-title">Ask an AI CLI installed here</h2>
       </div>
     </div>
     {#if selectedProvider}
-      <span class="privacy-note"><i aria-hidden="true"></i>{selectedProvider.label} CLI</span>
+      <span class="privacy-note"><i aria-hidden="true"></i>{selectedProvider.label} CLI · sends to {vendor}</span>
     {/if}
     {#if onclose}<button class="assistant-close" type="button" onclick={onclose}>Close AI workspace</button>{/if}
   </header>
 
   <div class="assistant-controls">
     <div class="provider-control">
-      <label for="assistant-provider">Local provider</label>
+      <label for="assistant-provider">Provider CLI</label>
       {#if loadingProviders}
         <div class="provider-loading" role="status"><span aria-hidden="true"></span>Discovering installed CLIs…</div>
       {:else if loadError}
@@ -172,17 +178,13 @@
         </div>
       {:else}
         <PremierSelect
-          label="Local provider"
+          label="Provider CLI"
           value={provider}
           options={availableProviders.length
             ? availableProviders.map((item) => ({
                 value: item.provider,
                 label: item.label,
-                description: item.provider === 'claude'
-                  ? 'Anthropic · verified local CLI'
-                  : item.provider === 'codex'
-                    ? 'OpenAI · verified local CLI'
-                    : 'Capability-checked local CLI'
+                description: `Sends to ${VENDORS[item.provider] ?? 'the provider'} · CLI runs on this machine`
               }))
             : [{ value: '', label: 'No safe provider available', disabled: true }]}
           disabled={!availableProviders.length || waiting}
@@ -204,7 +206,15 @@
         </label>
       </div>
     </fieldset>
-    <p class="context-disclosure">Premier redacts sensitive field names, bounds the context, and invokes the selected CLI with its verified read-only/tool-deny flags. The provider may still use its configured account and network.</p>
+    <div class="context-disclosure">
+      <p>Asking sends trace content off this machine: the run's manifest and its most recent events (or the selected event), redacted by Premier's secret rules, go with your question to {vendor}'s model service through the {selectedProvider?.label ?? 'selected'} CLI and the account it is signed in to. Captured output is sent as recorded. Nothing is sent until you ask.</p>
+      {#if provider}
+        <label class="consent">
+          <input type="checkbox" checked={hasConsent} disabled={waiting} onchange={(event) => { consented = { ...consented, [provider]: event.currentTarget.checked }; }} />
+          <span>Send redacted trace content to {vendor}</span>
+        </label>
+      {/if}
+    </div>
   </div>
 
   {#if unavailableProviders.length && !loadingProviders}
@@ -261,7 +271,7 @@
   </div>
 
   <form class="composer" onsubmit={submit}>
-    <label for="assistant-prompt">Question for your local AI</label>
+    <label for="assistant-prompt">Question for the provider</label>
     <div class="composer-field" class:error={Boolean(sendError)}>
       <textarea
         id="assistant-prompt"
@@ -317,7 +327,10 @@
   .scope-options strong, .scope-options small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .scope-options strong { color: #dce3ed; font-size: 11px; }
   .scope-options small { margin-top: 2px; color: #7f8da1; font-size: 9px; font-weight: 500; }
-  .context-disclosure { grid-column: 1 / -1; margin: -2px 0 0; color: #718096; font-size: 9px; line-height: 1.45; }
+  .context-disclosure { grid-column: 1 / -1; display: grid; gap: 6px; margin: -2px 0 0; padding: 8px 10px; border: 1px solid rgba(241,190,115,.28); border-radius: 6px; background: rgba(241,190,115,.06); }
+  .context-disclosure p { margin: 0; color: #c9d3e1; font-size: 12px; line-height: 1.45; }
+  .context-disclosure .consent { display: flex; align-items: center; gap: 8px; color: #f0f4fa; font-size: 12px; font-weight: 650; text-transform: none; letter-spacing: 0; cursor: pointer; }
+  .context-disclosure .consent input { width: 15px; height: 15px; accent-color: #f1be73; }
   .unavailable-providers { grid-row: 3; border-bottom: 1px solid var(--assistant-line); background: rgba(8,11,16,.64); }
   .unavailable-providers summary { padding: 8px 16px; color: #7f8da1; font-size: 10px; cursor: pointer; }
   .unavailable-providers ul { display: grid; gap: 7px; margin: 0; padding: 0 16px 11px 34px; }
@@ -395,7 +408,9 @@
     .assistant-workspace { grid-template-rows: auto auto 0 minmax(40px, 1fr) 0 auto; overflow: hidden; }
     .assistant-header { min-height: 52px; padding-block: 8px; background: rgba(9, 13, 20, .98); }
     .assistant-controls { grid-template-columns: minmax(130px, .55fr) minmax(280px, 1.45fr); gap: 8px; padding-block: 8px; }
-    .context-disclosure { display: none; }
+    /* The disclosure and its consent stay visible however short the window is. */
+    .context-disclosure { padding: 5px 8px; }
+    .context-disclosure p { font-size: 11px; line-height: 1.3; }
     .unavailable-providers { display: none; }
     .scope-options { grid-template-columns: 1fr 1fr; }
     .scope-options label { height: 36px; min-height: 36px; }

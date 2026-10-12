@@ -92,7 +92,8 @@
   /** Dim evidence only when the painted payload is not a warm stand-in for the request. */
   let contentStale = $state(false);
   /** Optimistic selection while a run is loading (stale-while-revalidate). */
-  let pendingTraceId = $state<string | null>(bootSession?.selectedTrace.trace_id ?? null);
+  // Traces are addressed by `listKey` (the artifact name): copies of a recording share its trace id.
+  let pendingTraceId = $state<string | null>(bootSession ? listKey(bootSession.selectedTrace) : null);
   let liveFlushTimer: number | null = null;
   let pendingLiveEvents: TraceEvent[] = [];
   let filters = $state<EventFilters>(bootInvestigation?.filters ?? emptyFilters());
@@ -252,7 +253,7 @@
     return request.eventId ? `Event ${request.eventId}` : `Event sequence ${request.eventSequence}`;
   }
 
-  function writeUrl(traceId = selectedTrace?.trace_id, event = selectedEvent, mode: 'push' | 'replace' = 'replace') {
+  function writeUrl(traceId = selectedTrace ? listKey(selectedTrace) : undefined, event = selectedEvent, mode: 'push' | 'replace' = 'replace') {
     const href = serializeInvestigationUrl(window.location.href, {
       traceId,
       eventId: event?.event_id ?? null,
@@ -289,7 +290,7 @@
 
   function setViewMode(next: ViewMode) {
     viewMode = next;
-    writeUrl(selectedTrace?.trace_id, selectedEvent, 'push');
+    writeUrl(selectedTrace ? listKey(selectedTrace) : undefined, selectedEvent, 'push');
   }
 
   function setArchitectureWindow(startMs: number | null, endMs: number | null) {
@@ -339,8 +340,8 @@
 
   async function selectTrace(trace: TraceManifest, eventRequest?: EventRequest, pushHistory = false) {
     stopReplay();
-    const switching = Boolean(selectedTrace && selectedTrace.trace_id !== trace.trace_id);
-    const warmPaint = !switching && selectedTrace?.trace_id === trace.trace_id && events.length > 0;
+    const switching = Boolean(selectedTrace && listKey(selectedTrace) !== listKey(trace));
+    const warmPaint = !switching && selectedTrace !== null && listKey(selectedTrace) === listKey(trace) && events.length > 0;
     if (switching) {
       architectureWindowStart = null;
       architectureWindowEnd = null;
@@ -355,7 +356,7 @@
     const epoch = ++loadEpoch;
     // Stale-while-revalidate: keep previous evidence painted until the new payload
     // commits atomically. Only dim when the paint is not already this run.
-    pendingTraceId = trace.trace_id;
+    pendingTraceId = listKey(trace);
     traceLoading = true;
     contentStale = !warmPaint;
     live = false;
@@ -367,12 +368,12 @@
     pendingSelection = null;
     try {
       const pages = eventPages(
-        (afterSequence, limit) => api.eventsPage(trace.trace_id, { afterSequence, limit, signal: abort.signal }),
+        (afterSequence, limit) => api.eventsPage(listKey(trace), { afterSequence, limit, signal: abort.signal }),
         EVENT_PAGE_SIZE,
         abort.signal
       );
       const [detail, first] = await Promise.all([
-        api.trace(trace.trace_id).catch(() => trace),
+        api.trace(listKey(trace)).catch(() => trace),
         pages.next()
       ]);
       if (!shouldCommitLoad(epoch, loadEpoch) || first.done) return;
@@ -426,7 +427,7 @@
       // An abandoned trace has no recorder left to tail.
       if (isRecording(committed)) {
         closeStream = api.stream(
-          committed.trace_id,
+          listKey(committed),
           (event) => enqueueLiveEvent(epoch, event),
           (state) => {
             if (!shouldCommitLoad(epoch, loadEpoch)) return;
@@ -440,7 +441,7 @@
             live = false;
             streamState = 'recorded';
             traces = traces.map((item) =>
-              item.trace_id === complete.trace_id ? { ...item, ...complete } : item
+              listKey(item) === listKey(complete) ? { ...item, ...complete } : item
             );
             persistSessionSoon();
           },
@@ -471,7 +472,7 @@
         traceLoading = false;
         contentStale = false;
         eventLoad = null;
-        if (pendingTraceId === trace.trace_id) pendingTraceId = null;
+        if (pendingTraceId === listKey(trace)) pendingTraceId = null;
       }
     }
   }
@@ -494,14 +495,14 @@
     if ((initial || next) && selectedEvent?.event_id !== next?.event_id) selectedEvent = next;
     if (next) pendingSelection = null;
     // A link that is still loading keeps its own URL; rewriting it now would drop the event.
-    if (next || (initial && !requested)) writeUrl(selectedTrace.trace_id, selectedEvent, initial && pushHistory ? 'push' : 'replace');
+    if (next || (initial && !requested)) writeUrl(listKey(selectedTrace), selectedEvent, initial && pushHistory ? 'push' : 'replace');
   }
 
   function selectEvent(event: TraceEvent) {
     missingEventReference = null;
     pendingSelection = null;
     selectedEvent = event;
-    if (selectedTrace) writeUrl(selectedTrace.trace_id, event);
+    if (selectedTrace) writeUrl(listKey(selectedTrace), event);
   }
 
   function inspectEvent(event: TraceEvent) {
@@ -518,13 +519,13 @@
     missingEventReference = null;
     pendingSelection = null;
     selectedEvent = null;
-    if (selectedTrace) writeUrl(selectedTrace.trace_id, null);
+    if (selectedTrace) writeUrl(listKey(selectedTrace), null);
   }
 
   function openRunOverview() {
     missingEventReference = null;
     selectedEvent = null;
-    if (selectedTrace) writeUrl(selectedTrace.trace_id, null, 'replace');
+    if (selectedTrace) writeUrl(listKey(selectedTrace), null, 'replace');
   }
 
   function changeFilters(next: EventFilters) {
@@ -618,7 +619,7 @@
     baselineId = traceId;
     comparison = null;
     comparisonError = '';
-    const baseline = traces.find((trace) => trace.trace_id === traceId);
+    const baseline = traces.find((trace) => listKey(trace) === traceId);
     if (!baseline) return;
     comparisonLoading = true;
     try {
@@ -633,9 +634,10 @@
 
   function openCompare() {
     compareOpen = true;
-    const initial = traces.find((trace) => trace.trace_id !== selectedTrace?.trace_id && trace.command[0] === selectedTrace?.command[0])
-      ?? traces.find((trace) => trace.trace_id !== selectedTrace?.trace_id);
-    if (initial) void compareAgainst(initial.trace_id);
+    const selectedKey = selectedTrace ? listKey(selectedTrace) : null;
+    const initial = traces.find((trace) => listKey(trace) !== selectedKey && trace.command[0] === selectedTrace?.command[0])
+      ?? traces.find((trace) => listKey(trace) !== selectedKey);
+    if (initial) void compareAgainst(listKey(initial));
   }
 
   function closeMore(restoreFocus = false) {
@@ -704,7 +706,10 @@
     const params = new URLSearchParams(window.location.search);
     parseRequestedState(params);
     const requestedId = params.get('trace');
-    const requested = requestedId ? traces.find((trace) => trace.trace_id === requestedId) : traces[0];
+    // A link names the artifact; one written before artifacts were addressed names the trace id.
+    const requested = requestedId
+      ? traces.find((trace) => listKey(trace) === requestedId) ?? traces.find((trace) => trace.trace_id === requestedId)
+      : traces[0];
     if (!requested) {
       selectedTrace = null;
       selectedEvent = null;
@@ -893,7 +898,7 @@
       <div class="compare-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) compareOpen = false; }}>
         <div class="compare-panel" role="dialog" aria-modal="true" aria-labelledby="compare-title" tabindex="-1" use:focusTrap={{ onEscape: () => compareOpen = false, initialFocus: '.inspector-close' }}>
           <div class="compare-header"><div><span>Regression analysis</span><strong id="compare-title">Compare runs</strong></div><button class="inspector-close" onclick={() => compareOpen = false} aria-label="Close comparison">×</button></div>
-          <div class="compare-controls"><label>Baseline<PremierSelect label="Comparison baseline" value={baselineId} options={traces.filter((trace) => trace.trace_id !== selectedTrace?.trace_id).map((trace) => ({ value: trace.trace_id, label: runTitle(trace), description: `${trace.summary?.event_count ?? trace.journal?.event_count ?? 0} recorded events` }))} onchange={(value) => void compareAgainst(value)} /></label><span>Candidate<strong>{runTitle(selectedTrace)}</strong></span></div>
+          <div class="compare-controls"><label>Baseline<PremierSelect label="Comparison baseline" value={baselineId} options={traces.filter((trace) => !selectedTrace || listKey(trace) !== listKey(selectedTrace)).map((trace) => ({ value: listKey(trace), label: runTitle(trace), description: `${trace.summary?.event_count ?? trace.journal?.event_count ?? 0} recorded events` }))} onchange={(value) => void compareAgainst(value)} /></label><span>Candidate<strong>{runTitle(selectedTrace)}</strong></span></div>
           {#if comparisonLoading}<div class="compare-divergence">Loading baseline evidence…</div>
           {:else if comparisonError}<div class="compare-divergence error">{comparisonError}</div>
           {:else if comparison}
@@ -904,8 +909,8 @@
     {/if}
     {#if assistantOpen && selectedTrace}
       <div class="assistant-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) assistantOpen = false; }}>
-        <div class="assistant-drawer" role="dialog" aria-modal="true" aria-label="Ask your local AI" tabindex="-1" use:focusTrap={{ onEscape: () => assistantOpen = false, initialFocus: '.assistant-close' }}>
-          <LocalAssistant traceId={selectedTrace.trace_id} {selectedEvent} onclose={() => assistantOpen = false} />
+        <div class="assistant-drawer" role="dialog" aria-modal="true" aria-label="Ask an AI CLI installed here" tabindex="-1" use:focusTrap={{ onEscape: () => assistantOpen = false, initialFocus: '.assistant-close' }}>
+          <LocalAssistant traceId={listKey(selectedTrace)} {selectedEvent} onclose={() => assistantOpen = false} />
         </div>
       </div>
     {/if}
@@ -917,7 +922,7 @@
             <button type="button" class="runs-sheet-close inspector-close" onclick={() => runsSheetOpen = false} aria-label="Close runs">×</button>
           </div>
           <div class="runs-sheet-body">
-            <TraceList traces={traces} selectedId={pendingTraceId ?? selectedTrace?.trace_id ?? null} onselect={(trace) => { runsSheetOpen = false; void selectTrace(trace, undefined, true); }} />
+            <TraceList traces={traces} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => { runsSheetOpen = false; void selectTrace(trace, undefined, true); }} />
           </div>
         </div>
       </div>
@@ -988,7 +993,7 @@
         style={`--trace-pane: ${leftCollapsed ? leftRailWidth : leftWidth}px; --left-divider: ${leftCollapsed ? 0 : 8}px; --inspector-pane: ${rightCompact ? rightRailWidth : rightWidth}px; --right-divider: ${rightCompact ? 0 : 8}px;`}
         bind:this={workspaceElement}
       >
-        <TraceList {traces} selectedId={pendingTraceId ?? selectedTrace?.trace_id ?? null} onselect={(trace) => void selectTrace(trace, undefined, true)} compact={leftCollapsed} onrestore={() => togglePane('left')} />
+        <TraceList {traces} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => void selectTrace(trace, undefined, true)} compact={leftCollapsed} onrestore={() => togglePane('left')} />
         <SplitHandle side="left" label="trace list" value={leftWidth} min={leftLimits.min} max={leftLimits.max} collapsed={leftCollapsed} onresize={(value) => resizePane('left', value)} oncollapse={() => togglePane('left')} />
         <section class="evidence-main" aria-label="Trace visualization workspace">
           <div class="evidence-view-toolbar">

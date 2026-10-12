@@ -19,9 +19,19 @@ pub fn prepare_trace_output(output: &Path) -> Result<()> {
     {
         fs::create_dir_all(parent)?;
     }
+    if check_trace_output(output)? {
+        fs::remove_dir_all(output)?;
+    }
+    Ok(())
+}
+
+/// The checks of [`prepare_trace_output`] without its effects: fails when
+/// `output` exists and may not be replaced, and otherwise says whether a
+/// trace is there to replace. Nothing is created or removed.
+pub fn check_trace_output(output: &Path) -> Result<bool> {
     // `symlink_metadata` so a link to a directory is refused rather than followed.
     let Ok(metadata) = fs::symlink_metadata(output) else {
-        return Ok(());
+        return Ok(false);
     };
     if metadata.is_dir() {
         refuse_working_directory(output)?;
@@ -31,8 +41,7 @@ pub fn prepare_trace_output(output: &Path) -> Result<()> {
                 output.display()
             );
         }
-        fs::remove_dir_all(output)?;
-        return Ok(());
+        return Ok(true);
     }
     bail!(
         "refusing to overwrite non-trace path: {} (only an existing Premier .atrace with manifest.json may be replaced)",

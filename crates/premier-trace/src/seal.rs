@@ -159,6 +159,22 @@ impl PublicKey {
         encode_hex(self.0.as_bytes())
     }
 
+    /// Check that `signature` (hex) is this key's signature over a manifest
+    /// seal `digest` (hex), as stored in `seal.signature`. It shows that the
+    /// key's holder signed a trace with that seal digest, and nothing about
+    /// any other copy of that trace's content.
+    pub fn verify_seal_signature(&self, digest: &str, signature: &str) -> Result<()> {
+        let digest = decode_hex::<32>(digest).context("seal digest is not 64 hex characters")?;
+        let signature =
+            decode_hex::<64>(signature).context("signature is not 128 hex characters")?;
+        self.0
+            .verify_strict(
+                &signature_message(&digest),
+                &ed25519_dalek::Signature::from_bytes(&signature),
+            )
+            .map_err(|_| anyhow::anyhow!("manifest signature is invalid"))
+    }
+
     /// Short stable identifier: `sha256:` plus the first 16 bytes of the
     /// SHA-256 of the raw public key.
     pub fn fingerprint(&self) -> String {

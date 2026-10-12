@@ -191,6 +191,21 @@ describe('stream API', () => {
     expect(states).toEqual(['disconnected']);
   });
 
+  it('stops instead of reconnecting when the server reports the trace unreadable', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    const states: string[] = [];
+    const completes: unknown[] = [];
+    api.stream('trace-1', () => undefined, (state) => states.push(state), (manifest) => completes.push(manifest));
+    const source = FakeEventSource.instances[0];
+    source.onopen?.(new Event('open'));
+    source.dispatch('trace.error', { error: 'the trace can no longer be read; see the premier server log' });
+    // The server closes the connection next; EventSource must not be left to retry it.
+    source.onerror?.(new Event('error'));
+    expect(states).toEqual(['live', 'disconnected']);
+    expect(completes).toEqual([]);
+    expect(source.closed).toBe(true);
+  });
+
   it('treats trace.abandoned as the end of the stream', () => {
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
     const states: string[] = [];

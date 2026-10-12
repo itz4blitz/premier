@@ -102,7 +102,8 @@ Native adapters (see [adapters.md](adapters.md)) write these with source
 | `approval.request` / `approval.decision` | A permission or approval event and its outcome. |
 | `approval.decision` with `payload.synthesized: true` | One per entry of Claude Code's `permission_denials`, status `denied`. No `approval.request` precedes it; because it is marked as inferred, the validator does not report that as `missing_lifecycle_start`. See [adapters.md](adapters.md#approvals). |
 | `provider.event` | A provider line that fits none of the above. |
-| `adapter.diagnostic` | A line the adapter could not use (malformed, not an object, or too large). Status `warning`. Payload: `provider`, `adapter_schema_version`, `line`, `message`, and `line_bytes` for oversized lines. |
+| `adapter.diagnostic` | A line the adapter could not use (malformed, not an object, or too large). Status `warning`. Payload: `provider`, `adapter_schema_version`, `line`, `message`, and `line_bytes` for oversized lines. At most 20 per recording; the twentieth carries `further_diagnostics: "suppressed"`. |
+| `adapter.summary` | Written once at the end of an adapter recording in which some or all output lines were not native events. Status `warning`. Payload: `provider`, `adapter_schema_version`, `lines`, `normalized_lines`, `rejected_lines`, `suppressed_diagnostics`, `completeness`, `message`. See [adapters.md](adapters.md#when-an-adapter-runs). |
 
 ## Statuses
 
@@ -292,4 +293,5 @@ Consequences worth knowing:
 - Manifest diagnostics are not issues. They are reported separately as
   missing evidence.
 - `premier query --status error` filters on the exact status only. It is not
-  the issue predicate.
+  the issue predicate; `premier query --issues` is.
+- `adapter.summary` has status `warning` and is not an issue either.

@@ -1,4 +1,4 @@
-import type { TraceEvent, TraceManifest } from './types';
+import { listKey, type TraceEvent, type TraceManifest } from './types';
 
 export interface TraceLoadResult {
   trace: TraceManifest;
@@ -125,6 +125,6 @@ export function applyTraceComplete(
   current: TraceManifest | null,
   complete: TraceManifest
 ): TraceManifest | null {
-  if (!current || current.trace_id !== complete.trace_id) return current;
+  if (!current || listKey(current) !== listKey(complete)) return current;
   return { ...current, ...complete };
 }

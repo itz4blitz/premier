@@ -4,7 +4,9 @@
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use premier_cli::evidence::{RedactionOptions, portable_evidence_with, write_portable_evidence};
+use premier_cli::evidence::{
+    ExportOptions, RedactionOptions, SourceState, portable_evidence_with, write_portable_evidence,
+};
 use premier_cli::{AuthPolicy, app};
 use premier_trace::{
     ACTIVE_JOURNAL, EncryptionKey, FINAL_JOURNAL, RedactionConfig, TraceEvent, TraceWriter,
@@ -512,7 +514,7 @@ fn a_streamed_export_is_the_document_built_in_memory() {
         known_secrets_in_terminal: true,
     };
 
-    let mut expected = serde_json::to_vec_pretty(&portable_evidence_with(
+    let expected = serde_json::to_vec_pretty(&portable_evidence_with(
         &manifest,
         &read_events(&trace).unwrap(),
         options,
@@ -538,7 +540,19 @@ fn a_streamed_export_is_the_document_built_in_memory() {
     assert_eq!(counts.value_patterns["authorization-header"], 1);
     assert_eq!(counts.already_redacted, 2, "{counts:?}");
 
-    // The CLI writes that document, to a file and to stdout alike.
+    // The CLI writes that document, to a file and to stdout alike, and adds
+    // what it established about the source: it verified the trace first.
+    let mut expected = serde_json::to_vec_pretty(&portable_evidence_with(
+        &manifest,
+        &read_events(&trace).unwrap(),
+        ExportOptions {
+            redaction: options,
+            source_state: SourceState::Verified,
+            ..ExportOptions::default()
+        },
+    ))
+    .unwrap();
+    assert_ne!(expected, streamed);
     expected.push(b'\n');
     let file = temp.path().join("export.json");
     let to_file = premier()
@@ -586,14 +600,17 @@ fn a_streamed_export_is_the_document_built_in_memory() {
         document["events"][2]["payload"]["text"],
         "starting\n{\"password\":\"[REDACTED]\",\"type\":\"login\",\"user\":\"sam\"}\n"
     );
-    // `source` leads and `redaction` follows the events it counts.
+    // `source` leads; the blocks that count or cover the events follow them.
     let keys: Vec<_> = document.as_object().unwrap().keys().cloned().collect();
     let position = |key: &str| text.find(&format!("\n  \"{key}\":")).unwrap();
-    assert_eq!(keys.len(), 5, "{keys:?}");
-    assert!(position("format") < position("source"));
+    assert_eq!(keys.len(), 8, "{keys:?}");
+    assert!(position("format") < position("exporter"));
+    assert!(position("exporter") < position("source"));
     assert!(position("source") < position("manifest"));
     assert!(position("manifest") < position("events"));
-    assert!(position("events") < position("redaction"));
+    assert!(position("events") < position("selection"));
+    assert!(position("selection") < position("redaction"));
+    assert!(position("redaction") < position("integrity"));
 }
 
 fn viewer_dir(root: &Path) -> PathBuf {

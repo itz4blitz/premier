@@ -81,6 +81,23 @@ When an adapter is active the manifest records it:
 
 and gains the capability `adapter.<provider>.v1`.
 
+That is written before the command starts. When the run ends, `completeness`
+is corrected to what was actually captured:
+
+| `completeness` | Meaning |
+| --- | --- |
+| `provider-native-best-effort` | Every non-blank line of output was a native event. |
+| `provider-native-partial` | Some lines were native events and some were not. |
+| `no-native-events` | No line was a native event. The trace holds the command's terminal output and no model or tool events from the adapter. |
+
+In the last two cases the journal ends with one `adapter.summary` event
+(status `warning`; payload `lines`, `normalized_lines`, `rejected_lines`,
+`suppressed_diagnostics`, `completeness`, `message`), and `record` says so on
+stderr, for example `premier: the claude adapter found no native JSONL events
+in 60 line(s) of output; the trace holds terminal output only. Run the CLI
+with its structured output flag, or record with --adapter none`. A run whose
+lines were all native events gets neither.
+
 ## Limits
 
 - **Interactive and `--pty` sessions get terminal capture only.** Adapters
@@ -481,6 +498,36 @@ as its parent.
 A malformed line, or a JSON value that is not an object, also produces an
 `adapter.diagnostic` (status `warning`) and nothing else. Adapter problems
 never fail the recording or change its exit status.
+
+At most 20 `adapter.diagnostic` events are stored per recording. The
+twentieth carries `further_diagnostics: "suppressed"`; lines rejected after
+it are counted in the `adapter.summary` event (`suppressed_diagnostics`)
+instead of being stored one event each, so a command recorded with an
+adapter but without its structured output flag does not fill the trace with
+warnings.
+
+## Terminal decorations
+
+Some CLIs wrap their JSON in terminal control output even when it is piped.
+Before a line is parsed, the adapter removes:
+
+- a UTF-8 byte order mark at the start of the line;
+- everything up to the last carriage return that is followed by text (a
+  spinner or progress line overwritten in place), and a trailing carriage
+  return;
+- control sequences, wherever they are in the line: CSI sequences such as
+  colours and cursor movement (`ESC [ ... <final>`), OSC sequences ended by
+  BEL or by ST (`ESC \`), and two- and three-byte escapes such as the charset
+  selection `ESC ( B`. The 8-bit CSI introducer (U+009B) is removed only
+  before the event, since that character may be text inside a JSON string.
+
+A raw escape byte cannot occur inside JSON, where it must be written
+`\u001b`, so this never changes a valid event. An `ESC [` with no complete
+sequence behind it is dropped by itself and the text after it is kept. A line
+that holds nothing but such decorations is blank: it produces no event and no
+diagnostic.
+
+The raw `process.stdout` copy keeps the bytes as the command wrote them.
 
 The raw `process.stdout` copy is not affected by these limits.
 

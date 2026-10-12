@@ -13,7 +13,7 @@ Commands:
   record   Record a command and its terminal output into a portable .atrace directory
   demo     Generate a rich local multi-agent trace for product evaluation and onboarding
   emit     Emit a typed agent event to the active local collector (`PREMIER_COLLECTOR_*`)
-  verify   Verify a finalized trace's digest, event chain, manifest seal, and signature. Without a signature a trace is only internally consistent (docs/trace-format.md)
+  verify   Verify a finalized trace's digest, event chain, manifest seal, and signature. Without a signature a trace is only internally consistent (docs/trace-format.md). Given a `premier export` file instead, recompute that export's own digest and report which trace it says it was derived from
   keygen   Generate an Ed25519 signing key: writes the private key (mode 0600) and `<output>.pub`, and prints the public key. With --encryption, generate a trace encryption key file for --key-file instead
   sign     Sign (or re-sign) the manifest seal of an already finalized trace
   recover  Safely finalize an abandoned active trace, discarding only a torn trailing frame
@@ -21,7 +21,7 @@ Commands:
   encrypt  Atomically encrypt a finalized trace, or rotate it to a new master key
   query    Filter local trace evidence without starting the viewer
   export   Export portable JSON evidence with common secret fields recursively redacted. The `redaction` block reports the active rules and what was removed
-  diff     Compare two traces by semantic event structure, ignoring generated identity noise
+  diff     Compare two traces by semantic event structure, ignoring generated identity noise. Events are aligned in order, so an inserted, removed or moved event is reported as such; captured output is compared per stream, line by line
   replay   Replay recorded evidence timing only; this never re-executes the traced command. A recorded gap longer than 10 seconds is replayed as 10 seconds
   list     List traces in a directory
   open     Open the local viewer, optionally focused on one trace
@@ -44,7 +44,7 @@ Options:
   | Code | Meaning |
   | --- | --- |
   | `0` | Success. |
-  | `1` | The command failed. The reason is printed to stderr as `Error: ...`. |
+  | `1` | The command failed. The reason is printed to stderr as `Error: ...`. Also `diff --exit-code` when the traces differ, with nothing on stderr. |
   | `2` | Invalid command line (unknown flag, missing argument, out-of-range value). |
   | `141` | Unix only, as reported by a shell: `verify`, `query`, `export`, `diff`, `replay`, or `list` was writing to a pipe whose reader went away. See [Text output](#text-output). |
 
@@ -104,7 +104,7 @@ escaped this way and stays exact.
 ```text
 $ premier record -o esc.atrace --name "$(printf 'evil\033[31m name\nline2')" -- true
 $ premier list --trace-dir .
-01a130a7-9ac1-74b0-954c-ced493871dab  2026-10-12 15:07:32.936658 UTC  evil\u{1b}[31m name\nline2
+01a130a7-9ac1-74b0-954c-ced493871dab  2026-10-12 15:07:32.936658 UTC  evil\u{1b}[31m name\nline2  (named.atrace)
 ```
 
 On Unix, `verify`, `query`, `export`, `diff`, `replay`, and `list` restore the
@@ -138,7 +138,7 @@ Options:
       --pty
           Run the command inside a pseudo-terminal (Unix only), preserving stdout/stderr ordering as one interactive terminal byte stream
       --adapter <ADAPTER>
-          Normalize a provider's native JSONL stream into typed evidence. Auto activates only when a recognized CLI already uses structured output [default: auto]
+          Normalize a provider's native JSONL stream into typed evidence: auto, none, codex, claude, gemini, grok, opencode, kimi, or droid. Auto activates only when a recognized CLI already uses structured output [default: auto]
       --viewer-dir <VIEWER_DIR>
           Optional disk viewer (for local UI development). Default: embedded viewer
       --bind <BIND>
@@ -363,7 +363,8 @@ Usage: premier demo [OPTIONS]
 
 Options:
       --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
-  -o, --output <OUTPUT>  [default: .premier/traces/multi-agent-demo.atrace]
+  -o, --output <OUTPUT>  Where to write the demo trace. An earlier demo at this path is replaced; any other trace is not, unless --force is given [default: .premier/traces/multi-agent-demo.atrace]
+      --force            Replace a finalized trace at the output path even though it is not an earlier demo. A trace that is being recorded is never replaced
   -h, --help             Print help
 ```
 
@@ -378,8 +379,18 @@ an ancestor of the current directory is refused. A trace that is being
 recorded is refused too (`refusing to replace <path>: it is being recorded
 right now`), judged from its recorder lease as described under
 [`recover`](#abandoned-traces-and-recover); so is an unfinalized trace with no usable lease that
-was written to less than 300 seconds ago. A finalized trace, or one whose
-recorder is gone, is replaced without confirmation.
+was written to less than 300 seconds ago.
+
+Of finalized traces, `demo` replaces only an earlier demo (a trace whose
+recorded command is `premier demo`). Any other trace at the output path is
+somebody's recording and is refused (`refusing to replace <path>: it is a
+recorded trace (<name>), not an earlier demo`); `--force` replaces it. `--force`
+does not override the refusals in the paragraph above.
+
+The new demo is written to a working directory beside the output
+(`.<name>.demo-<pid>.tmp`) and moved into place when it is complete. When it
+cannot be written, for example because the configured key file is unusable,
+whatever was at the output path is left as it was.
 
 ## `emit`
 
@@ -437,16 +448,17 @@ The body fields and the collector's responses are documented in
 
 ```text
 $ premier verify --help
-Verify a finalized trace's digest, event chain, manifest seal, and signature. Without a signature a trace is only internally consistent (docs/trace-format.md)
+Verify a finalized trace's digest, event chain, manifest seal, and signature. Without a signature a trace is only internally consistent (docs/trace-format.md). Given a `premier export` file instead, recompute that export's own digest and report which trace it says it was derived from
 
 Usage: premier verify [OPTIONS] <TRACE>
 
 Arguments:
-  <TRACE>  
+  <TRACE>  A trace directory, or a JSON file written by `premier export`
 
 Options:
       --key-file <PATH>           Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
-      --public-key <PATH-OR-HEX>  Require a valid signature by this Ed25519 public key (64 hex characters, or a file containing them)
+      --public-key <PATH-OR-HEX>  Require a valid signature by this Ed25519 public key (64 hex characters, or a file containing them). For an export file: require that its source block carries a valid signature by this key
+      --live                      For a trace that is not finalized (still recording, or abandoned): check the frames of its active journal and their hash chain up to the last complete frame, and report the event count. Nothing is modified. A finalized trace is verified as usual
   -h, --help                      Print help
 ```
 
@@ -521,6 +533,37 @@ Diagnostics are warnings about the recorded events (see
 
 What each outcome does and does not prove is covered in
 [security.md](security.md#what-verification-proves).
+
+### Verifying an export
+
+Given a file instead of a trace directory, `verify` checks a
+[`premier export`](#export) document: it recomputes the export's own digest
+over its events and its `format`, `exporter`, `source`, `manifest`,
+`selection`, and `redaction` blocks, and compares the result with the
+`integrity` block in the file.
+
+```text
+$ premier verify a.json
+export consistent: a.json (3 events, digest sha256:52b3c723bc5c1e0a3f93775d64e9ab3c158795e83170f892218a3de2908da9ca)
+derived from trace 01a1311e-7831-76a3-883c-b4dbe162f0a0 (sealed, source verification when exported: verified); a selection kept 3 of the 4 source events
+source signature: none; the source trace was not signed
+note: an export is a derived, redacted copy, not the sealed original. ...
+```
+
+- A changed, removed, added, or reordered event fails with `export events
+  digest mismatch`; a change to another block fails with `export digest
+  mismatch`; a missing `integrity` block fails too (exports written before
+  this check existed have none).
+- When the `source` block carries a signature, `verify` checks that it is a
+  valid signature over the copied seal digest by the copied public key, and
+  prints the signer's fingerprint. `--public-key` requires that signer to be
+  the key you supply.
+- **This is weaker than verifying a trace.** The digest is stored in the file
+  it covers, so whoever can rewrite the file can recompute it. It detects
+  damage and careless edits, and lets two copies be compared. The source
+  signature shows that the key's holder signed a trace with that seal digest;
+  it does not cover the exported events, which are a redacted and possibly
+  filtered copy. To rely on the evidence, verify the original trace.
 
 ### `verify --live`
 
@@ -644,6 +687,8 @@ Options:
           Minimum journal idle time required before recovery [default: 300]
       --force
           Recover even when the journal was modified recently
+      --sign-key <PATH>
+          Ed25519 private key file (from `premier keygen`) used to sign the recovered trace. The signature is the recovering party's statement about what it found, not the recorder's [env: PREMIER_SIGN_KEY_FILE=]
   -h, --help
           Print help
 ```
@@ -734,7 +779,7 @@ recover`, and an unfinalized journal does not commit to its length (see
 
 ```text
 $ premier list --trace-dir .
-01a130a7-90c7-7e40-b2e9-9a029dfb6ed5  2026-10-12 15:07:30.392745 UTC  sh -c echo started; sleep 6  [abandoned: the recorder is no longer running — run `premier recover ./live.atrace`]
+01a130a7-90c7-7e40-b2e9-9a029dfb6ed5  2026-10-12 15:07:30.392745 UTC  sh -c echo started; sleep 6  [abandoned: the recorder is no longer running — run `premier recover ./live.atrace`]  (live.atrace)
 $ premier recover live.atrace
 recovered 01a130a7-90c7-7e40-b2e9-9a029dfb6ed5 (3 events, exit 130)
 ```
@@ -864,18 +909,28 @@ Filter local trace evidence without starting the viewer
 Usage: premier query [OPTIONS] <TRACE>
 
 Arguments:
-  <TRACE>  
+  <TRACE>  A trace directory, or a JSON file written by `premier export`
 
 Options:
-      --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
-      --kind <KIND>       Exact event kind, matched case-insensitively
-      --actor <ACTOR>     Exact actor id, matched case-insensitively
-      --status <STATUS>   Exact event status, matched case-insensitively
-      --search <SEARCH>   Case-insensitive search across event metadata and payload JSON
-      --limit <LIMIT>     Maximum events returned (1-1000) [default: 100]
-      --json              Emit one structured JSON result instead of the compact text view
-      --allow-unverified  Read a finalized trace even though it fails `premier verify`
-  -h, --help              Print help
+      --key-file <PATH>      Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --kind <KIND>          Exact event kind, matched case-insensitively
+      --actor <ACTOR>        Exact actor id, matched case-insensitively
+      --status <STATUS>      Exact event status, matched case-insensitively
+      --search <SEARCH>      Case-insensitive search across event fields, ids, the payload JSON text, and every payload string as recorded (so quotes, line breaks, and text inside terminal colour codes match as typed)
+      --event-id <ID>        Exact event id
+      --span <ID>            Exact span id
+      --parent-span <ID>     Exact parent span id: the events directly under a span
+      --parent <EVENT-ID>    Exact parent event id: the events caused directly by an event
+      --correlation <ID>     Exact correlation id: for example a tool call and its result
+      --after-sequence <N>   Only events with a sequence greater than this. With --limit this pages through a trace: pass the last sequence of the previous page
+      --before-sequence <N>  Only events with a sequence less than this
+      --since <TIME>         Only events at or after this time (RFC 3339, for example 2026-07-15T12:00:00Z)
+      --until <TIME>         Only events before this time (RFC 3339)
+      --issues               Only events that count as issues: an error, failed, denied or blocked status, an error or failure kind, or a provider-stated failure
+      --limit <LIMIT>        Maximum events returned (1-1000) [default: 100]
+      --json                 Emit one structured JSON result instead of the compact text view
+      --allow-unverified     Read a finalized trace even though it fails `premier verify`
+  -h, --help                 Print help
 ```
 
 ```sh
@@ -883,14 +938,40 @@ premier query run.atrace --status error
 premier query run.atrace --kind tool.result --search "exit_code" --json
 ```
 
-- Filters are combined with AND. `--search` matches against kind, source,
-  actor id, actor type, status, and the payload JSON text.
+- Filters are combined with AND. `--kind`, `--actor`, and `--status` match the
+  whole value, ignoring case. The id filters (`--event-id`, `--span`,
+  `--parent-span`, `--parent`, `--correlation`) match the whole value exactly.
+- Following causality: `--parent <event id>` lists the events an event caused
+  directly, `--parent-span <span id>` the events directly under a span, and
+  `--correlation <id>` the events that belong together (a tool call and its
+  result, an approval request and its decision). The ids are in `--json`
+  output.
+- `--since` and `--until` take RFC 3339 times with an offset and select
+  `since <= timestamp < until`. An event whose timestamp is not RFC 3339 is in
+  no time window. `--issues` keeps the events the viewer counts as issues (see
+  [events.md](events.md)).
+- `--search` matches, ignoring case, against kind, source, actor id, actor
+  type, status, the event's ids and timestamp, the payload as JSON text (so a
+  key name matches), and every string in the payload as it was recorded, with
+  and without terminal control sequences. Text containing quotes, line breaks,
+  or backslashes, and text that a program printed in colour, matches as typed.
+- At most `--limit` events are returned (1 to 1000). When more matched, the
+  stderr line names the sequence to continue from and `--json` carries it as
+  `next_after_sequence`; pass it as `--after-sequence` for the next page.
+- The argument may be a file written by `premier export`. Its digest is
+  checked first (see [Verifying an export](#verifying-an-export)) and a note on
+  stderr says the events come from a derived copy.
 - The text view prints `sequence  timestamp  kind  actor  status` per event on
-  stdout and `<n> matched; <m> returned` on stderr. An event with an empty
+  stdout and `<n> matched; <m> returned` on stderr, followed by `(limit
+  reached; continue with --after-sequence <n>)` when more matched. An event with an empty
   `actor_id` shows `-` in the actor column: it is unattributed, not the root
   process. Text is escaped as described under [Text output](#text-output).
-- `--json` prints `{"matched", "returned", "truncated", "events"}`. Events are
-  printed as stored; `query` applies no redaction.
+- `--json` prints `{"matched", "returned", "truncated", "next_after_sequence",
+  "source", "events"}`. `source` is `{"kind": "trace" | "export", "finalized",
+  "verification"}`: `finalized` is `false` for a trace that is still being
+  recorded or was interrupted, and `verification` is `verified`, `failed`
+  (read with `--allow-unverified`), or `not_finalized`. Events are printed as
+  stored; `query` applies no redaction.
 
 ```text
 $ premier query col.atrace --kind agent.message
@@ -917,19 +998,62 @@ Options:
   -o, --output <OUTPUT>             Destination JSON file. Omit to write JSON to stdout
       --no-default-secret-patterns  Do not apply the built-in secret value patterns (API keys, bearer credentials, URL passwords, private key blocks, JWTs) to structured event payloads and the recorded command line
       --redact-known-secrets        Also apply the built-in secret value patterns to captured terminal output, which is otherwise exported as recorded
+      --redact-field <NAME>         Additional field name whose value is removed wherever it appears in the exported manifest and events. Repeatable
+      --redact-literal <TEXT>       Exact text removed from every string of the exported manifest and events, terminal output included. Repeatable. The text itself is not written to the export
+      --kind <KIND>                 Export only events of this kind (exact, case-insensitive). Repeatable
+      --actor <ACTOR>               Export only events of this actor id (exact, case-insensitive). Repeatable
+      --after-sequence <N>          Export only events with a sequence greater than this
+      --before-sequence <N>         Export only events with a sequence less than this
       --allow-unverified            Export a finalized trace even though it fails `premier verify`
   -h, --help                        Print help
 ```
 
-Writes one JSON document with `format: "premier.portable-evidence.v1"`, a
-`redaction` report, a `source` block, the manifest, and every event with its
-payload decoded.
+Writes one JSON document with `format: "premier.portable-evidence.v1"`: an
+`exporter` block, a `source` block, the manifest, the selected events with
+their payloads decoded, and `selection`, `redaction`, and `integrity` blocks.
+
+**An export is a derived copy, not the sealed original.** It is redacted,
+possibly filtered, and plain JSON. The trace's seal and signature do not cover
+it. What it has instead is a digest of its own, described below.
+
+- `--kind`, `--actor`, `--after-sequence`, and `--before-sequence` select the
+  events to export. `--kind` and `--actor` may be repeated; an event must
+  satisfy every option that is given. The `selection` block records the
+  filters, how many events the source had, and how many were exported, and
+  `export` prints `selection: <m> of <n> events exported`. Exported events keep
+  their `parent_event_id` and `links`, which may now name events that were
+  left out.
+- `--redact-field <name>` removes the value of that field wherever it appears
+  in the exported manifest and events (names are compared ignoring case and
+  punctuation). `--redact-literal <text>` replaces that exact text in every
+  string, captured output included. Both may be repeated. The `redaction`
+  block lists the field names and the number of literals, never the literals
+  themselves, and counts what each removed under `custom`.
+- The `integrity` block holds the export's digest (`events_sha256` over the
+  events and `digest` over everything else plus `events_sha256`).
+  `export --output` prints it as `export digest: sha256:<hex>`, and
+  [`premier verify <file>`](#verifying-an-export) recomputes it. The same
+  trace exported with the same options always gives the same file and digest:
+  the export holds no timestamp of its own. Keep the digest somewhere other
+  than the file if you need to notice a deliberate rewrite.
+- `source.finalized` is `false` and `source.verification` is `not_finalized`
+  when the trace was still being recorded or had been interrupted: its events
+  may be incomplete. `verification` is otherwise `verified`, or `failed` for a
+  trace exported with `--allow-unverified`.
+- An event whose stored payload is not JSON is exported with `payload: null`
+  and the stored text in `payload_raw`.
+- `query` and `diff` accept an export file in place of a trace directory.
+- `export` refuses an `--output` that is a directory or lies inside a trace
+  directory (`refusing to export to <path>`), so `-o run.atrace/manifest.json`
+  cannot replace part of a trace. An existing file elsewhere is replaced.
 
 - With `--output` the file is written through a temporary file and a rename,
   and on Unix is created with mode `0600`, whatever the umask.
 - The `source` block copies the source trace's tamper-evidence values
   (protection level, journal digest, chain head, seal digest, signature and
-  signer). The export itself is not covered by the seal or the signature.
+  signer). The export itself is not covered by the seal or the signature;
+  `verify` on the export only checks that the copied signature fits the copied
+  seal digest.
 - **An export of an encrypted trace is plaintext.** `export` says so on
   stderr: `warning: <trace> is encrypted, but this export is plaintext;
   protect or delete it accordingly`.
@@ -947,33 +1071,109 @@ described in [redaction.md](redaction.md#premier-export).
 
 ```text
 $ premier diff --help
-Compare two traces by semantic event structure, ignoring generated identity noise
+Compare two traces by semantic event structure, ignoring generated identity noise. Events are aligned in order, so an inserted, removed or moved event is reported as such; captured output is compared per stream, line by line
 
 Usage: premier diff [OPTIONS] <BASELINE> <CURRENT>
 
 Arguments:
-  <BASELINE>  
-  <CURRENT>   
+  <BASELINE>  A trace directory, or a JSON file written by `premier export`
+  <CURRENT>   A trace directory, or a JSON file written by `premier export`
 
 Options:
       --json              Emit the complete structural comparison as JSON
       --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --exit-code         Exit with status 1 when the traces differ (0 when they do not), for use in scripts and CI
       --allow-unverified  Compare finalized traces even though one fails `premier verify`
   -h, --help              Print help
 ```
 
-Events are matched by a semantic key: kind, actor, and, for `tool.*` events,
-the payload's `tool`, `name`, or `command` (for `approval.*`, its `operation`
-or `action`). The n-th occurrence of a key in the baseline is paired with the
-n-th in the current trace. Matched events are compared on `status`, `source`,
-`actor_type`, `duration_ms`, and the flattened payload. Generated identity
-(`event_id`, `trace_id`, span and correlation ids, timestamps) is ignored, and
-so are provider-generated ids inside an adapter's `native` copy.
+Either argument may be a trace directory or a file written by
+`premier export`.
 
-The text view prints the counts and one line per added, removed, or changed
-event. `--json` prints the full comparison with
-`format: "premier.semantic-diff.v1"`. The exit status is `0` whether or not
-the traces differ.
+**What is compared.** Each event gets a semantic key: its kind, its actor,
+and, for `tool.*` events, the payload's `tool`, `name`, or `command` (failing
+those, the tool named by an adapter's `native` copy); for `approval.*`, its
+`operation` or `action`. Two events with the same key are compared on
+`status`, `source`, `actor_type`, `duration_ms`, the flattened payload, and
+what they refer to:
+
+| Field in the output | Compares |
+| --- | --- |
+| `parent_event` | The event `parent_event_id` names. |
+| `parent_span` | The events of the span `parent_span_id` names. |
+| `correlation` | The other events with the same `correlation_id`. |
+| `links` | The events `links` names. |
+
+Ids are generated per run, so a reference is followed to the events it names
+and two references agree when they lead to the same item of the diff. A
+reference to something that is not in the trace is not compared.
+
+**What is ignored.** `event_id`, `trace_id`, span and correlation ids, and
+timestamps, wherever they appear; provider-generated ids inside an adapter's
+`native` copy; and `payload.instrumentation` of `session.start`, the URL of
+the recorder's collector, which listens on a different port in every run.
+
+**Captured output.** `process.stdout`, `process.stderr`, and `process.terminal`
+events are not compared one by one: where a command's output is cut into
+events depends on timing. All the text of a stream is joined, CRLF is read as
+LF, and the two texts are compared line by line. A stream is one item of the
+diff; a change is reported as `text.lines` (the line counts, when they
+differ) and `text.line[<n>]` (the first line that differs). Which of two
+streams produced output first is not compared.
+
+**Order.** Events are aligned in order: first the events that are equal in
+every compared field, then, between those, events with the same key. An event
+present in only one trace is `added` or `removed` where it occurs, and the
+events after it stay paired with their counterparts. An event with the same
+key on both sides but at a different place is `moved`; its `changes` say what
+else differs. When two traces differ in more than 2,000 places, `diff` pairs
+the n-th event of each key instead, does not compare order, and says so
+(`alignment: "per_key"`).
+
+Two events with the same key and different content are indistinguishable from
+one changed event, so an insertion among same-key events that all changed can
+still be attributed to the wrong pair.
+
+**The manifest.** `command`, `exit_code`, `termination`, `adapter`, and
+`capabilities` are compared and reported as `manifest` changes.
+
+```text
+$ premier diff a.atrace c.atrace --exit-code
+0 added · 0 removed · 2 changed · 0 moved · 1 unchanged
+first divergence: changed process.stdout:root#1 (baseline #2, current #2)
+    text.line[2]: "tests passed" → "2 tests failed"
+manifest	exit_code: 0 → 1
+manifest	termination.exit_code: 0 → 1
+Changed	process.stdout:root#1	baseline #2, current #2	1 field change
+    text.line[2]: "tests passed" → "2 tests failed"
+Changed	process.exit:root#1	baseline #4, current #5	3 field changes
+    status: "ok" → "error"
+    payload.exit_code: 0 → 1
+    payload.success: true → false
+$ echo $?
+1
+```
+
+The text view prints the counts, the first divergence (the first item, in
+trace order, that is not unchanged, with its first differing field), the
+manifest changes, and every added, removed, changed, or moved item with its
+field changes. `#<n>` is an event's sequence in its trace. Values longer than
+120 characters are shortened; `--json` has them whole. Two traces without a
+difference print `no differences`.
+
+`--json` prints the comparison with `format: "premier.semantic-diff.v2"`:
+`identical`, `alignment`, `counts`, `first_divergence` (`index` into `items`,
+`key`, `status`, the sequences, and the first `change`), `manifest`, and
+`items` (each with `key`, `status`, `baseline_sequence`, `current_sequence`,
+and `changes` of `{field, before, after}`).
+
+The exit status is `0` whether or not the traces differ, unless `--exit-code`
+is given: then it is `1` when they differ (`identical` is `false`) and `0`
+when they do not. A failure to read or verify a trace is `1` with an `Error:`
+on stderr either way.
+
+The viewer's comparison (More, Compare runs) applies the same rules; the two
+are tested against one shared set of cases.
 
 ## `replay`
 
@@ -1033,10 +1233,13 @@ Options:
   -h, --help                   Print help
 ```
 
-Prints one line per trace, newest first: trace id, start time, and the run
-name (or the command line when there is no name), followed by `[recording]`
-or `[abandoned: ...]` for a trace that is not finalized. A missing directory
-prints nothing and exits `0`.
+Prints one line per trace, newest first: trace id, start time, the run name
+(or the command line when there is no name), a bracket when the run is not
+finalized or did not end cleanly, and the trace's directory name in
+parentheses. The bracket is `[recording]` or `[abandoned: ...]` for a trace
+that is not finalized, `[exit <code>]` for a non-zero exit status,
+`[<signal name>]` for a run ended by a signal, and `[interrupted]` for a
+recovered one. A missing directory prints nothing and exits `0`.
 
 A trace that cannot be opened is still listed, after the readable ones, from
 whatever its manifest shows. Its name and command are encrypted or
@@ -1046,7 +1249,8 @@ row:
 
 ```text
 $ premier list --trace-dir traces
-01a130a6-5150-7631-b059-e864addfee77  2026-10-12 15:06:08.597934 UTC  sh -c echo hi
+01a130a6-5150-7631-b059-e864addfee77  2026-10-12 15:06:08.597934 UTC  sh -c echo hi  (plain.atrace)
+01a1311e-78ff-76e2-ac6b-4e8df04e8471  2026-10-12 15:06:08.401220 UTC  sh -c exit 1  [exit 1]  (failed.atrace)
 01a130a6-51e5-7a93-bfc3-9903396ca127  2026-10-12 15:06:08.744965 UTC  enc2.atrace  [encrypted: key required]
 0196f000-0000-7000-8000-00000000f009  2026-05-04 03:02:01 UTC  future.atrace  [needs a newer premier: format version 9]
 unknown  unknown  torn.atrace  [unreadable: EOF while parsing a string at line 1 column 28]
@@ -1058,7 +1262,9 @@ unknown  unknown  torn.atrace  [unreadable: EOF while parsing a string at line 1
 | `[needs a newer premier: format version N]` | The trace was written in a later format than this build reads. It is not damaged. |
 | `[unreadable: ...]` | `manifest.json` exists but cannot be read as a trace manifest; the error follows. |
 
-A directory with no `manifest.json` is not a trace and is not listed. `list`
+A directory with no `manifest.json` is not a trace and is not listed. Neither
+is a directory whose name starts with a dot: those are the working copies of
+`encrypt` and `demo`. `list`
 shows the traces of every tenant: it reads the directory, and whoever can do
 that can read the manifests.
 
@@ -1082,7 +1288,13 @@ Options:
   -h, --help                     Print help
 ```
 
-Starts the viewer server, prints its URL, and opens a browser. It runs until
+Starts the viewer server, prints its URL, and opens a browser. The server
+listens before the URL is printed or the browser is started. When the address
+is taken, `open` fails with `cannot start the viewer: <address> is already in
+use ...` and opens nothing, instead of sending the browser to whatever owns
+that port; `--bind 127.0.0.1:0` takes any free port, and the printed URL shows
+which. `record --open` checks its `--bind` address and viewer build before it
+runs the command. It runs until
 it is asked to stop: on Ctrl-C (SIGINT) or SIGTERM it stops accepting
 connections, lets requests in flight finish, drops whatever is still open
 after 2 seconds (an event stream of a live trace, for example), prints
@@ -1091,7 +1303,18 @@ after 2 seconds (an event stream of a live trace, for example), prints
 
 - `premier open` serves every trace in `--trace-dir`.
 - `premier open <trace>` serves only that trace. Other traces in the same
-  directory are not listed and cannot be fetched.
+  directory are not listed and cannot be fetched. The URL names the trace by
+  its directory name (`/?trace=run.atrace`), not by its trace id, which a
+  copy of the trace would share.
+- A trace claimed for a tenant (`premier claim`, or `record --tenant`) cannot
+  be opened: `open` serves the `local` identity, which is not shown other
+  tenants' traces. `open <trace>` fails with `cannot open <trace>: it is owned
+  by tenant '<tenant>' ...` before it starts a server or a browser, and
+  `record` prints the same explanation in place of its `next: premier open`
+  hint. A tenant's traces are read through the HTTP API with that tenant's
+  bearer token (`premier serve --auth-config`); the browser viewer cannot
+  show them, because it signs in with the server password, which is the
+  `local` identity. See [security.md](security.md#the-viewer-server).
 - `open` has no authentication options, so `--bind` must be a loopback
   address. Use `serve` for anything else.
 - `--no-assistant` or `PREMIER_DISABLE_ASSISTANT` removes the local assistant;
@@ -1142,9 +1365,29 @@ checks are described in [security.md](security.md#the-viewer-server).
 | `GET /api/health` | Server status. |
 | `GET /api/assistants` | The local assistant providers and whether each is available. |
 | `GET /api/traces` | One entry per trace: the manifest fields plus a summary and the integrity fields below. |
-| `GET /api/traces/{trace_id}` | The same for one trace. |
-| `GET /api/traces/{trace_id}/events` | The trace's events. See [Paged events](#paged-events). |
-| `GET /api/traces/{trace_id}/stream` | A server-sent event stream. See [Event stream](#event-stream). |
+| `GET /api/traces/{trace}` | The same for one trace. |
+| `GET /api/traces/{trace}/events` | The trace's events. See [Paged events](#paged-events). |
+| `GET /api/traces/{trace}/stream` | A server-sent event stream. See [Event stream](#event-stream). |
+
+### Addressing a trace
+
+`{trace}` is the trace's **artifact**: the name of its directory, which every
+entry of `GET /api/traces` carries as `artifact`. That is the exact address.
+The viewer uses it in every request and in the `?trace=` parameter of its
+links.
+
+A trace id is accepted in its place when exactly one served trace has that
+id. Copying a trace directory gives two traces with one id; a request by that
+id is answered `409` with the artifacts to choose from, and nothing is opened
+by guesswork:
+
+```json
+{"error": "trace id 01a1... is shared by 2 traces in this directory (copies of one recording); request one by its artifact name instead: copy.atrace, original.atrace"}
+```
+
+When a directory is named like another trace's id, the directory wins.
+Directories whose name starts with a dot are working copies (of
+`premier encrypt` and `premier demo`) and are neither listed nor served.
 
 ### Integrity fields
 
@@ -1186,7 +1429,7 @@ manifest. `premier verify` does the same.
 
 ### Paged events
 
-`GET /api/traces/{trace_id}/events` with no query string returns every event.
+`GET /api/traces/{trace}/events` with no query string returns every event.
 With `after_sequence`, `limit`, or both it returns one page: the events whose
 `sequence` is greater than `after_sequence` (default `0`), at most `limit` of
 them (default `500`). A `limit` of `0` or above `10000` is rejected with
@@ -1199,17 +1442,25 @@ being recorded).
 
 ### Event stream
 
-`GET /api/traces/{trace_id}/stream` tails a trace as server-sent events:
+`GET /api/traces/{trace}/stream` tails a trace as server-sent events:
 
 | Event | Data | Sent |
 | --- | --- | --- |
 | `trace.event` | One event. | For each event in the journal, then for each new event as it is recorded. |
-| `trace.complete` | The trace entry, as `GET /api/traces/{trace_id}` returns it. | Once, when the trace is finalized by its recorder or by `premier recover`. The stream then closes. If the finalized trace cannot be read back at that moment, the entry is still sent, with `integrity: "invalid"`, so the stream never closes without a terminal event once the trace is finalized. |
+| `trace.complete` | The trace entry, as `GET /api/traces/{trace}` returns it. | Once, when the trace is finalized by its recorder or by `premier recover`. The stream then closes. If the finalized trace cannot be read back at that moment, the entry is still sent, with `integrity: "invalid"`, so the stream never closes without a terminal event once the trace is finalized. |
 | `trace.abandoned` | The trace entry, with `integrity: "abandoned"`. | Once, when the recorder is gone and the trace is not finalized. The stream then closes. |
+| `trace.error` | `{"error": "<message>"}` | Once, when the trace has been unreadable for 20 polls in a row (5 seconds): deleted, damaged, or its key gone. The stream then closes. The reason is in the server log. |
 
 - `?after_sequence=<n>` skips events whose sequence is `n` or lower, so a
   client that has already paged the journal does not receive it a second
   time. The viewer resumes after the last sequence it loaded.
+- Every `trace.event` carries its sequence as the SSE `id`. A browser that
+  reconnects by itself sends the last one it received as `Last-Event-ID`, and
+  the stream resumes after it (or after `after_sequence`, whichever is
+  greater).
+- Every stream ends with one of the three terminal events. A client that
+  receives one must close the connection; the viewer does, so its
+  `EventSource` does not reconnect to a finished or unreadable trace.
 - The journal is polled every 250 ms. `trace.abandoned` is sent only after two
   consecutive polls classify the trace as abandoned, so a recorder that has
   not written its lease yet is not reported as gone.
@@ -1220,8 +1471,10 @@ being recorded).
 
 | Status | When |
 | --- | --- |
-| `400` | The trace id contains `/` or `\`, or is `.` or `..`; or `limit` is out of range. |
-| `404` | No served trace has that id, the trace belongs to another tenant, or the trace directory does not exist. |
+| `400` | The trace name contains `/` or `\`, or is `.` or `..`; or `limit` is out of range. |
+| `401` | No credentials, or wrong ones. Wrong credentials are answered after a delay; see [security.md](security.md#the-viewer-server). |
+| `404` | No served trace has that artifact name or id, the trace belongs to another tenant, or the trace directory does not exist. |
+| `409` | The trace id belongs to more than one served trace. See [Addressing a trace](#addressing-a-trace). |
 | `500` | The trace directory exists but cannot be read (`cannot read the trace directory`), or anything else failed inside the server (`internal error; see the premier server log`). The detail, which can name server-side paths, is logged on the server and never sent to the client. |
 
 Error bodies are `{"error": "<message>"}`.

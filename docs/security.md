@@ -168,6 +168,21 @@ counts as not configured. A password login acts as the local user: tenant
 `local`, with both scopes. Prefer the environment variable; a `--password`
 argument is visible in the process list.
 
+The password is one secret shared by everyone who signs in: there are no
+per-user accounts, and a sign-in is not attributed to a person. Use a long
+random value. `serve` prints a warning when the password is shorter than 12
+characters and the server listens on a non-loopback address; it does not
+refuse to start.
+
+**Wrong credentials.** A request that presents a wrong password or an unknown
+bearer token is answered `401` after a delay: 250 ms for the first, 250 ms
+more for each further refusal in a row, at most 2 seconds. A successful
+sign-in resets it. The first five refusals in a row and every hundredth after
+that are logged on the server (`refused password credentials for the viewer
+(3 refused in a row)`). A request without credentials, such as a browser's
+first, is answered at once and is not counted. There is no lockout: a
+lockout on a shared secret would let anyone lock everyone out.
+
 **Bearer tokens** (`--auth-config <file>` or `PREMIER_AUTH_CONFIG`). A JSON
 file:
 
@@ -195,6 +210,11 @@ file:
   credential for a tenant no trace can carry would never read anything.
 - `scopes` may contain `trace:read` and `assistant:use`. Any other value is an
   error. The default is no scopes.
+- A `token_sha256` may appear once. Two entries with the same token would
+  make the second unreachable, so `serve` refuses to start.
+- `subject` names the holder of a token in the server log: with
+  `RUST_LOG=debug` every authenticated bearer request logs its subject and
+  tenant. It is not recorded anywhere else.
 
 ```sh
 TOKEN=$(openssl rand -hex 32)
@@ -216,6 +236,11 @@ listings and return `404`.
 
 The embedded viewer UI does not attach a bearer token to its requests. A
 browser signs in with the password; bearer tokens are for API clients.
+Because a password sign-in is the `local` identity, **the browser viewer
+cannot show a trace owned by another tenant**. Such a trace is read through
+the API with that tenant's token. `premier open <trace>` and
+`record --open` refuse a tenant-owned trace with that explanation instead of
+opening a viewer that would answer "not found".
 
 ### Non-loopback binds and TLS
 
@@ -248,9 +273,14 @@ running an agent CLI that is already installed on the machine running
 
 ### What it runs
 
-At startup, unless the assistant is disabled, the server looks on `PATH` for
-`claude`, `codex`, `grok`, and `gemini`, and runs `<cli> --help` (and
-`codex exec --help`) to check that each one supports the flags below. A CLI
+The first time the assistant panel is opened or asked (`GET /api/assistants`
+or a question), unless the assistant is disabled, the server looks on `PATH`
+for `claude`, `codex`, `grok`, and `gemini`, and runs `<cli> --help` (and
+`codex exec --help`) to check that each one supports the flags below. Nothing
+is run when the server starts, and a server whose assistant is never used
+runs no CLI at all. Each probe has standard input closed and 5 seconds to
+finish; a CLI that does not answer in that time is stopped and listed as
+unavailable. The result is kept for the life of the process. A CLI
 that is missing any required flag is listed as unavailable. `opencode` is
 listed but never available, because it has no documented non-interactive
 read-only mode.
@@ -294,12 +324,24 @@ When you submit a question, the server starts the chosen CLI once:
 choose**, using that CLI's own login or API key. Nothing is sent until you
 submit a question.
 
+The panel says so where the question is typed: it names the provider's vendor
+("sends to Anthropic"), states what is sent, and keeps the Ask button disabled
+until the box "Send redacted trace content to <vendor>" is ticked. The
+agreement is per provider and lasts until the panel is closed. The text and
+the box stay visible at every window size.
+
 The prompt contains:
 
 - a fixed instruction to treat trace content as untrusted data;
+- the outcome of the run on its own: trace id, start and end time, exit
+  code, termination, whether the trace is finalized, and its event and
+  diagnostic counts (at most 1,000 characters), so that a long command line
+  cannot push it out of the next item;
 - the trace manifest (at most 4,000 characters);
 - the selected event, if any (at most 8,000 characters);
-- the newest 40 events (at most 24,000 characters in total);
+- the newest events, up to 40 of them and 24,000 characters in total, each
+  at most 6,000 characters. The budget is spent from the newest event
+  backwards, so what does not fit is the oldest;
 - the conversation so far in the panel (at most 12 messages and 12,000
   characters);
 - your question (at most 6,000 characters).
@@ -326,9 +368,14 @@ window.
   and `PREMIER_COLLECTOR_TOKEN` are removed from its environment.
 - The flags above turn off tools, or restrict the CLI to read-only operation,
   and turn off session persistence where the CLI supports it.
-- One request runs at a time; a second gets `429`. The CLI is killed after 45
-  seconds, or when the browser disconnects. An answer over 64 KiB is
-  discarded.
+- One request runs at a time; a second gets `429`. The CLI runs in its own
+  process group, and the whole group is killed after 45 seconds or when the
+  browser disconnects, so a wrapper's helper processes do not outlive the
+  request. An answer over 64 KiB is discarded (`502`); diagnostics the CLI
+  writes to standard error are kept only up to 64 KiB and never void an
+  answer.
+- The request body may be up to 160 KiB, which covers every request the
+  character limits above allow, whatever the script.
 - The endpoint requires the `assistant:use` scope and passes the Host and
   cross-origin checks like every other API route.
 

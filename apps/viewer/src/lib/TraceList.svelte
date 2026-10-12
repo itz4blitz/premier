@@ -20,8 +20,8 @@
     return true;
   }));
   let visibleTraces = $derived.by(() => {
-    const selected = traces.find((trace) => trace.trace_id === selectedId);
-    return selected && !matchingTraces.some((trace) => trace.trace_id === selected.trace_id)
+    const selected = traces.find((trace) => listKey(trace) === selectedId);
+    return selected && !matchingTraces.some((trace) => listKey(trace) === listKey(selected))
       ? [selected, ...matchingTraces]
       : matchingTraces;
   });
@@ -100,8 +100,8 @@
         <button
           type="button"
           class="rail-run"
-          class:active={trace.trace_id === selectedId}
-          aria-pressed={trace.trace_id === selectedId}
+          class:active={listKey(trace) === selectedId}
+          aria-pressed={listKey(trace) === selectedId}
           aria-label={`${title(trace)}. ${outcome(trace)}. ${eventCount(trace) ?? 0} events.`}
           title={`${title(trace)} · ${outcome(trace)}`}
           onclick={() => onselect(trace)}
@@ -121,8 +121,8 @@
     {#each visibleTraces as trace, index (listKey(trace))}
       <button
         class="trace-select"
-        class:active={trace.trace_id === selectedId}
-        aria-pressed={trace.trace_id === selectedId}
+        class:active={listKey(trace) === selectedId}
+        aria-pressed={listKey(trace) === selectedId}
         aria-label={`${title(trace)}. ${outcome(trace)}. ${eventCount(trace) ?? 0} events.`}
         onclick={() => onselect(trace)}
         onkeydown={(event) => selectByKeyboard(event, index)}
@@ -135,7 +135,7 @@
             {:else if trace.integrity === 'locked'}<span class="abandoned-badge" title={trace.integrity_detail || 'This trace is encrypted. Restart premier with --key-file to read it.'}>Locked</span>
             {:else if trace.integrity === 'unsupported'}<span class="abandoned-badge" title={trace.integrity_detail || 'This trace was written by a newer Premier. Upgrade premier to read it.'}>Newer format</span>
             {:else if !trace.ended_at}<span class="live-badge">Live</span>{/if}
-            {#if trace.trace_id === selectedId && !matchingTraces.some((item) => item.trace_id === trace.trace_id)}<span class="outside-badge">Pinned</span>{/if}
+            {#if listKey(trace) === selectedId && !matchingTraces.some((item) => listKey(item) === listKey(trace))}<span class="outside-badge">Pinned</span>{/if}
           </span>
           <span class="run-outcome" data-tone={health(trace).tone}>{outcome(trace)}</span>
           <span class="run-foot" title={new Date(trace.started_at).toLocaleString()}>

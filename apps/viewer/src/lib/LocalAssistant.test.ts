@@ -20,6 +20,11 @@ const providers = [
   { provider: 'opencode', label: 'OpenCode', installed: true, available: false, reason: 'No verified tool-deny mode.' }
 ];
 
+/** Tick the consent box for the provider that is selected now. */
+async function consent(user: ReturnType<typeof userEvent.setup>, vendor: string): Promise<void> {
+  await user.click(screen.getByRole('checkbox', { name: `Send redacted trace content to ${vendor}` }));
+}
+
 describe('LocalAssistant', () => {
   beforeEach(() => {
     mocks.assistants.mockReset().mockResolvedValue(providers);
@@ -30,7 +35,7 @@ describe('LocalAssistant', () => {
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
 
     expect(screen.getByText('Discovering installed CLIs…')).toBeInTheDocument();
-    const provider = await screen.findByRole('button', { name: 'Local provider' });
+    const provider = await screen.findByRole('button', { name: 'Provider CLI' });
     await userEvent.click(provider);
     expect(screen.getByRole('option', { name: /Claude/ })).toBeInTheDocument();
     expect(screen.getByRole('option', { name: /Codex/ })).toBeInTheDocument();
@@ -42,20 +47,21 @@ describe('LocalAssistant', () => {
   it('uses starters to fill the composer without submitting', async () => {
     const user = userEvent.setup();
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
+    await screen.findByRole('button', { name: 'Provider CLI' });
 
     await user.click(screen.getByRole('button', { name: /Summarize the run/ }));
-    expect(screen.getByLabelText('Question for your local AI')).toHaveValue('Summarize the run and identify the highest-impact issue.');
+    expect(screen.getByLabelText('Question for the provider')).toHaveValue('Summarize the run and identify the highest-impact issue.');
     expect(mocks.askAssistant).not.toHaveBeenCalled();
   });
 
   it('sends real history and selected-event scope and renders the measured answer', async () => {
     const user = userEvent.setup();
     render(LocalAssistant, { props: { traceId: 'trace-1', selectedEvent } });
-    await user.click(await screen.findByRole('button', { name: 'Local provider' }));
+    await user.click(await screen.findByRole('button', { name: 'Provider CLI' }));
     await user.click(screen.getByRole('option', { name: /Codex/ }));
     await user.click(screen.getByRole('radio', { name: /Selected event/ }));
-    await user.type(screen.getByLabelText('Question for your local AI'), 'Why did this fail?');
+    await user.type(screen.getByLabelText('Question for the provider'), 'Why did this fail?');
+    await consent(user, 'OpenAI');
     mocks.askAssistant.mockResolvedValueOnce({ provider: 'codex', answer: 'Event 9 contains the compiler failure.', elapsed_ms: 240 });
     await user.click(screen.getByRole('button', { name: 'Ask Codex' }));
 
@@ -65,7 +71,7 @@ describe('LocalAssistant', () => {
     });
     expect(screen.getByText('240 ms')).toBeInTheDocument();
 
-    await user.type(screen.getByLabelText('Question for your local AI'), 'What next?');
+    await user.type(screen.getByLabelText('Question for the provider'), 'What next?');
     await user.click(screen.getByRole('button', { name: 'Ask Codex' }));
     await waitFor(() => expect(mocks.askAssistant).toHaveBeenCalledTimes(2));
     expect(mocks.askAssistant.mock.calls[1][1].history).toEqual([
@@ -82,8 +88,9 @@ describe('LocalAssistant', () => {
       elapsed_ms: 25_400
     });
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    await user.type(screen.getByLabelText('Question for your local AI'), 'Review the run');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    await user.type(screen.getByLabelText('Question for the provider'), 'Review the run');
+    await consent(user, 'Anthropic');
     await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
 
     expect(await screen.findByRole('heading', { level: 2, name: 'Highest-impact issue' })).toBeInTheDocument();
@@ -97,9 +104,10 @@ describe('LocalAssistant', () => {
     const user = userEvent.setup();
     mocks.askAssistant.mockRejectedValueOnce(new Error('Claude exited with status 1: login required'));
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    const input = screen.getByLabelText('Question for your local AI');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    const input = screen.getByLabelText('Question for the provider');
     await user.type(input, 'Diagnose this');
+    await consent(user, 'Anthropic');
     await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Claude exited with status 1: login required');
@@ -111,8 +119,9 @@ describe('LocalAssistant', () => {
     let resolveAnswer!: (value: { provider: string; answer: string; elapsed_ms: number }) => void;
     mocks.askAssistant.mockReturnValueOnce(new Promise((resolve) => { resolveAnswer = resolve; }));
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    await user.type(screen.getByLabelText('Question for your local AI'), 'Inspect latency');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    await user.type(screen.getByLabelText('Question for the provider'), 'Inspect latency');
+    await consent(user, 'Anthropic');
     await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
 
     expect(screen.getByRole('status')).toHaveTextContent('Claude is analyzing the trace');
@@ -127,8 +136,9 @@ describe('LocalAssistant', () => {
       provider: 'claude', answer: `Answer to ${body.prompt}`, elapsed_ms: 10
     }));
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
-    await screen.findByRole('button', { name: 'Local provider' });
-    const input = screen.getByLabelText('Question for your local AI');
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    const input = screen.getByLabelText('Question for the provider');
+    await consent(user, 'Anthropic');
     for (let index = 1; index <= 7; index += 1) {
       await user.type(input, `Question ${index}`);
       await user.click(screen.getByRole('button', { name: 'Ask Claude' }));
@@ -145,10 +155,35 @@ describe('LocalAssistant', () => {
     ]);
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
 
-    const provider = await screen.findByRole('button', { name: 'Local provider' });
+    const provider = await screen.findByRole('button', { name: 'Provider CLI' });
     expect(provider).toHaveTextContent('No safe provider available');
     expect(provider).toBeDisabled();
-    expect(screen.getByLabelText('Question for your local AI')).toBeDisabled();
+    expect(screen.getByLabelText('Question for the provider')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Ask assistant' })).toBeDisabled();
+  });
+
+  it('says where trace content goes and sends nothing until the user agrees, per provider', async () => {
+    const user = userEvent.setup();
+    render(LocalAssistant, { props: { traceId: 'trace-1' } });
+    await screen.findByRole('button', { name: 'Provider CLI' });
+    expect(screen.getByRole('heading', { name: 'Ask an AI CLI installed here' })).toBeInTheDocument();
+    expect(screen.getByText(/Asking sends trace content off this machine/)).toHaveTextContent("Anthropic's model service");
+
+    await user.type(screen.getByLabelText('Question for the provider'), 'Summarize');
+    const ask = screen.getByRole('button', { name: 'Ask Claude' });
+    expect(ask).toBeDisabled();
+    await user.keyboard('{Control>}{Enter}{/Control}');
+    expect(mocks.askAssistant).not.toHaveBeenCalled();
+
+    await consent(user, 'Anthropic');
+    expect(ask).toBeEnabled();
+
+    // Agreeing to one provider is not agreeing to another.
+    await user.click(screen.getByRole('button', { name: 'Provider CLI' }));
+    await user.click(screen.getByRole('option', { name: /Codex/ }));
+    expect(screen.getByText(/Asking sends trace content off this machine/)).toHaveTextContent("OpenAI's model service");
+    expect(screen.getByRole('checkbox', { name: 'Send redacted trace content to OpenAI' })).not.toBeChecked();
+    expect(screen.getByRole('button', { name: 'Ask Codex' })).toBeDisabled();
+    expect(mocks.askAssistant).not.toHaveBeenCalled();
   });
 });

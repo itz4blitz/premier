@@ -183,7 +183,8 @@ export function payloadTotalTokens(payload: Fields): number | null {
   return input === null && output === null ? null : (input ?? 0) + (output ?? 0);
 }
 
-function toolFromNative(native: Fields): string | null {
+/** The tool a provider's own event names. `native_tool` in evidence.rs is the CLI's copy. */
+export function toolFromNative(native: Fields): string | null {
   const direct = firstText(native, ['tool_name', 'tool', 'name']);
   if (direct) return direct;
   const item = record(native.item);

@@ -5,11 +5,11 @@ at [premier.dev/docs](https://premier.dev/docs).
 
 | Page | Read it for |
 | --- | --- |
-| [cli.md](cli.md) | Every `premier` command, flag, environment variable, and exit code. Recording, signals, recovery, signing (`keygen`, `sign`), the global `--key-file` option, and the viewer's HTTP API. |
+| [cli.md](cli.md) | Every `premier` command, flag, environment variable, and exit code. Recording, signals, recovery, signing (`keygen`, `sign`), the global `--key-file` option, querying and paging, what `diff` compares and how it aligns events, verifying an export, and the viewer's HTTP API (including how a trace is addressed). |
 | [collector.md](collector.md) | The local HTTP endpoint a recorded process posts events to: fields, validation rules and limits, timestamps, status codes, lifetime. |
 | [events.md](events.md) | Event fields and kinds, statuses, causality fields, lifecycle validation, and what counts as an issue. |
 | [adapters.md](adapters.md) | Native adapters for agent CLIs: when they run, how lines are classified, parents and links, synthesized subagent events, and the limits. |
-| [redaction.md](redaction.md) | What is redacted when, the built-in patterns, literal, regex, and multi-line regex rules, `premier export`, and what is not caught. |
+| [redaction.md](redaction.md) | What is redacted when, the built-in patterns, literal, regex, and multi-line regex rules, `premier export` (selection, export-time rules, and the export's own digest), and what is not caught. |
 | [security.md](security.md) | The security model: collector, viewer server, local assistant, encryption at rest, signing, and what verification proves. |
 | [trace-format.md](trace-format.md) | The on-disk trace format: layout, frames, the event hash chain, the manifest seal, signatures, version 1 compatibility, and the threat model. |
 | [releasing.md](releasing.md) | How releases are built, signed, and verified. |

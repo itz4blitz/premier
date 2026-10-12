@@ -13,6 +13,9 @@ const TRUNCATED_STRING_BYTES: usize = 8 * 1024;
 const MAX_TRACKED_TOOL_CALLS: usize = 1024;
 /// Bound on remembered stored event ids; per-call entries are dropped first when it is reached.
 const MAX_TRACKED_EVENT_IDS: usize = 4 * MAX_TRACKED_TOOL_CALLS;
+/// Per-line diagnostics stored before further ones are only counted. A command recorded with an
+/// adapter but without its structured output flag prints nothing but non-JSON lines.
+const MAX_LINE_DIAGNOSTICS: u64 = 20;
 const SESSION_KEY: &str = "session";
 const TURN_KEY: &str = "turn";
 
@@ -89,13 +92,8 @@ impl AdapterChoice {
 const MAX_WRAPPER_DEPTH: usize = 4;
 
 fn program_name(word: &str) -> Option<String> {
-    Some(
-        Path::new(word)
-            .file_stem()?
-            .to_str()?
-            .trim_end_matches(".exe")
-            .to_ascii_lowercase(),
-    )
+    // `file_stem` already drops an extension such as `.exe` or `.cmd`.
+    Some(Path::new(word).file_stem()?.to_str()?.to_ascii_lowercase())
 }
 
 /// Arguments up to a `--`: what follows is positional, so a prompt that is literally `--json`
@@ -407,6 +405,38 @@ pub struct NativeAdapter {
     subagents: HashMap<String, bool>,
     /// Message ids whose usage is already attached to an event.
     usage_messages: HashSet<String>,
+    summary: AdapterSummary,
+}
+
+/// What an adapter made of the lines it was given.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdapterSummary {
+    /// Non-blank lines seen.
+    pub lines: u64,
+    /// Lines that were native JSON objects and became events.
+    pub normalized_lines: u64,
+    /// Lines that were not: not JSON, not an object, or too long to keep.
+    pub rejected_lines: u64,
+    /// Rejected lines with no `adapter.diagnostic` event of their own.
+    pub suppressed_diagnostics: u64,
+}
+
+impl AdapterSummary {
+    /// Whether the recording differs from what its adapter provenance promises.
+    pub fn needs_report(&self) -> bool {
+        self.rejected_lines > 0 || self.normalized_lines == 0
+    }
+
+    /// `completeness` for the manifest's adapter provenance.
+    pub fn completeness(&self) -> &'static str {
+        if self.normalized_lines == 0 {
+            "no-native-events"
+        } else if self.rejected_lines > 0 {
+            "provider-native-partial"
+        } else {
+            "provider-native-best-effort"
+        }
+    }
 }
 
 impl NativeAdapter {
@@ -421,7 +451,51 @@ impl NativeAdapter {
             event_ids: HashMap::new(),
             subagents: HashMap::new(),
             usage_messages: HashSet::new(),
+            summary: AdapterSummary::default(),
         }
+    }
+
+    /// Counts of the lines seen so far.
+    pub fn summary(&self) -> AdapterSummary {
+        self.summary
+    }
+
+    /// The `adapter.summary` event closing a recording whose lines were not all native events,
+    /// or `None` when every line was. Call it after [`Self::finish`].
+    pub fn summary_event(&self) -> Option<AdapterEvent> {
+        let summary = self.summary;
+        if !summary.needs_report() {
+            return None;
+        }
+        let message = if summary.normalized_lines == 0 {
+            format!(
+                "none of the {} output line(s) was a native JSONL event; the trace holds no model or tool events from this adapter",
+                summary.lines
+            )
+        } else {
+            format!(
+                "{} of {} output line(s) were not native JSONL events",
+                summary.rejected_lines, summary.lines
+            )
+        };
+        Some(AdapterEvent::unlinked(EventInput {
+            kind: "adapter.summary".into(),
+            source: format!("adapter.{}.v{ADAPTER_SCHEMA_VERSION}", self.provider.id()),
+            actor_id: self.provider.id().into(),
+            actor_type: "agent".into(),
+            status: "warning".into(),
+            payload: json!({
+                "provider": self.provider.id(),
+                "adapter_schema_version": ADAPTER_SCHEMA_VERSION,
+                "lines": summary.lines,
+                "normalized_lines": summary.normalized_lines,
+                "rejected_lines": summary.rejected_lines,
+                "suppressed_diagnostics": summary.suppressed_diagnostics,
+                "completeness": summary.completeness(),
+                "message": message,
+            }),
+            ..EventInput::default()
+        }))
     }
 
     /// Stores `events` in order through `append`, which returns the event id the writer
@@ -497,7 +571,7 @@ impl NativeAdapter {
         for &byte in bytes {
             if self.discarded_bytes > 0 {
                 if byte == b'\n' {
-                    events.push(self.discarded_diagnostic());
+                    events.extend(self.discarded_diagnostic());
                 } else {
                     self.discarded_bytes += 1;
                 }
@@ -520,7 +594,7 @@ impl NativeAdapter {
 
     pub fn finish(&mut self) -> Vec<AdapterEvent> {
         if self.discarded_bytes > 0 {
-            return vec![self.discarded_diagnostic()];
+            return self.discarded_diagnostic().into_iter().collect();
         }
         if self.pending.is_empty() {
             return Vec::new();
@@ -531,30 +605,42 @@ impl NativeAdapter {
     }
 
     fn parse_line(&mut self, line: &[u8]) -> Vec<AdapterEvent> {
+        let line_bytes = line.len();
+        let oversized = (line_bytes > MAX_NATIVE_LINE_BYTES).then_some(line_bytes);
+        // Decorations first: a line that holds nothing but a control sequence is blank.
+        let line = strip_terminal_decorations(line);
         if line.iter().all(u8::is_ascii_whitespace) {
             return Vec::new();
         }
-        let line_bytes = line.len();
-        let oversized = (line_bytes > MAX_NATIVE_LINE_BYTES).then_some(line_bytes);
-        let line = strip_terminal_prefix(line);
-        let native: Value = match serde_json::from_slice(line) {
+        self.summary.lines += 1;
+        let native: Value = match serde_json::from_slice(&line) {
             Ok(Value::Object(object)) => Value::Object(object),
             Ok(_) => {
-                return vec![self.diagnostic("native JSONL event was not an object", oversized)];
+                return self
+                    .rejected("native JSONL event was not an object", oversized)
+                    .into_iter()
+                    .collect();
             }
             Err(error) if oversized.is_some() => {
-                return vec![self.diagnostic(
-                    &format!(
-                        "oversized native JSONL line ({line_bytes} bytes, limit \
-                         {MAX_NATIVE_LINE_BYTES}) could not be parsed: {error}"
-                    ),
-                    oversized,
-                )];
+                return self
+                    .rejected(
+                        &format!(
+                            "oversized native JSONL line ({line_bytes} bytes, limit \
+                             {MAX_NATIVE_LINE_BYTES}) could not be parsed: {error}"
+                        ),
+                        oversized,
+                    )
+                    .into_iter()
+                    .collect();
             }
             Err(error) => {
-                return vec![self.diagnostic(&format!("malformed native JSONL: {error}"), None)];
+                return self
+                    .rejected(&format!("malformed native JSONL: {error}"), None)
+                    .into_iter()
+                    .collect();
             }
         };
+        self.summary.normalized_lines += 1;
         let mut events = self.normalize(native);
         if oversized.is_some() {
             // Status, pairing and identity came from the full line; only the stored copy shrinks.
@@ -568,15 +654,31 @@ impl NativeAdapter {
         events
     }
 
-    fn discarded_diagnostic(&mut self) -> AdapterEvent {
+    fn discarded_diagnostic(&mut self) -> Option<AdapterEvent> {
         let line_bytes = std::mem::take(&mut self.discarded_bytes);
-        self.diagnostic(
+        self.summary.lines += 1;
+        self.rejected(
             &format!(
                 "oversized native JSONL line ({line_bytes} bytes) exceeded the \
                  {MAX_BUFFERED_LINE_BYTES} byte buffer and was discarded"
             ),
             Some(line_bytes),
         )
+    }
+
+    /// Count a line that did not become events, and describe it in a diagnostic event unless
+    /// [`MAX_LINE_DIAGNOSTICS`] were already stored; the summary reports the rest.
+    fn rejected(&mut self, message: &str, line_bytes: Option<usize>) -> Option<AdapterEvent> {
+        self.summary.rejected_lines += 1;
+        if self.summary.rejected_lines > MAX_LINE_DIAGNOSTICS {
+            self.summary.suppressed_diagnostics += 1;
+            return None;
+        }
+        let mut diagnostic = self.diagnostic(message, line_bytes);
+        if self.summary.rejected_lines == MAX_LINE_DIAGNOSTICS {
+            diagnostic.payload["further_diagnostics"] = json!("suppressed");
+        }
+        Some(diagnostic)
     }
 
     fn diagnostic(&self, message: &str, line_bytes: Option<usize>) -> AdapterEvent {
@@ -1139,30 +1241,81 @@ impl NativeAdapter {
     }
 }
 
-fn strip_terminal_prefix(mut line: &[u8]) -> &[u8] {
-    loop {
-        line = line.trim_ascii_start();
-        if !line.starts_with(b"\x1b") {
-            return line;
-        }
-        if line.starts_with(b"\x1b[") {
-            let Some(end) = line[2..]
-                .iter()
-                .position(|byte| (0x40..=0x7e).contains(byte))
-            else {
-                return line;
-            };
-            line = &line[end + 3..];
-            continue;
-        }
-        if line.starts_with(b"\x1b]")
-            && let Some(end) = line[2..].iter().position(|byte| *byte == 0x07)
-        {
-            line = &line[end + 3..];
-            continue;
-        }
-        return line;
+/// A line without what a terminal-minded CLI wraps around its JSON: a byte order mark, text
+/// overwritten by a carriage return (a spinner), and control sequences before or after the
+/// object (CSI such as colours and cursor moves, OSC ended by BEL or ST, charset selections,
+/// the 8-bit CSI). A raw escape byte cannot occur inside JSON, so removing sequences wherever
+/// they are never changes a valid event. A sequence that never ends is left in place.
+fn strip_terminal_decorations(line: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
+    if line.contains(&b'\r') {
+        // What a terminal would show: the last non-blank carriage-return segment.
+        line = line
+            .split(|byte| *byte == b'\r')
+            .rev()
+            .find(|segment| !segment.iter().all(u8::is_ascii_whitespace))
+            .unwrap_or(&[]);
     }
+    let line = line.trim_ascii();
+    let control = |index: usize, leading: bool| -> Option<usize> {
+        // The length of the control sequence starting at `index`, if one starts and ends there.
+        let rest = &line[index..];
+        let (introducer, body) = match rest {
+            [0x1b, b'[', body @ ..] => (2, body),
+            // U+009B may be text inside a JSON string, so only before the event.
+            [0xc2, 0x9b, body @ ..] if leading => (2, body),
+            [0x1b, b']', body @ ..] => {
+                let end = body
+                    .iter()
+                    .position(|byte| *byte == 0x07 || *byte == 0x1b)?;
+                return match body[end..] {
+                    [0x07, ..] => Some(2 + end + 1),
+                    [0x1b, b'\\', ..] => Some(2 + end + 2),
+                    _ => None,
+                };
+            }
+            [0x1b, body @ ..] => {
+                // ESC, intermediates, one final byte: `ESC ( B`, `ESC =`, `ESC 7`.
+                let intermediates = body
+                    .iter()
+                    .take_while(|byte| (0x20..=0x2f).contains(*byte))
+                    .count();
+                return matches!(body.get(intermediates), Some(0x30..=0x7a | 0x7c..=0x7e))
+                    .then_some(1 + intermediates + 1);
+            }
+            _ => return None,
+        };
+        let parameters = body
+            .iter()
+            .take_while(|byte| (0x20..=0x3f).contains(*byte))
+            .count();
+        match body.get(parameters) {
+            // `{` could end a sequence, but here it is far more likely the event itself after
+            // an introducer that was cut short.
+            Some(b'{') | None => None,
+            Some(0x40..=0x7e) => Some(introducer + parameters + 1),
+            Some(_) => None,
+        }
+    };
+    if !line.contains(&0x1b) && !line.starts_with(&[0xc2, 0x9b]) {
+        return line.into();
+    }
+    let mut stripped = Vec::with_capacity(line.len());
+    let mut index = 0;
+    while index < line.len() {
+        match control(index, stripped.is_empty()) {
+            Some(length) => index += length,
+            None if line[index..].starts_with(b"\x1b[") => {
+                // An introducer with no sequence behind it: drop just the introducer.
+                index += 2;
+            }
+            None => {
+                stripped.push(line[index]);
+                index += 1;
+            }
+        }
+    }
+    stripped.trim_ascii().to_vec().into()
 }
 
 /// Shrinks the stored copy of an oversized line: long strings keep a prefix plus an explicit
@@ -3363,6 +3516,238 @@ mod tests {
             (turn.kind.as_str(), turn.status.as_str()),
             ("agent.result", "error")
         );
+    }
+
+    #[test]
+    fn terminal_decorations_around_an_event_do_not_make_it_malformed() {
+        let event = r#"{"type":"result","subtype":"success","result":"ok"}"#;
+        let decorated: Vec<Vec<u8>> = vec![
+            // Colour reset after the object, and around it.
+            format!("{event}\x1b[0m").into_bytes(),
+            format!("\x1b[1;32m{event}\x1b[0m\x1b[K").into_bytes(),
+            // OSC ended by ST instead of BEL, and by BEL.
+            format!("\x1b]0;agent title\x1b\\{event}").into_bytes(),
+            format!("\x1b]8;;https://example.test\x07{event}").into_bytes(),
+            // Charset selection, keypad mode, 8-bit CSI.
+            format!("\x1b(B\x1b={event}").into_bytes(),
+            [b"\xc2\x9b0m".as_slice(), event.as_bytes()].concat(),
+            // Byte order mark, and a spinner overwritten by a carriage return.
+            [b"\xef\xbb\xbf".as_slice(), event.as_bytes()].concat(),
+            format!("working...\r{event}\r").into_bytes(),
+            // An introducer with nothing behind it must not swallow the brace.
+            format!("\x1b[{event}").into_bytes(),
+        ];
+        for line in decorated {
+            let mut adapter = NativeAdapter::new(Provider::Droid);
+            let events = adapter.push(&[line.as_slice(), b"\n"].concat());
+            assert_eq!(events.len(), 1, "{:?}", String::from_utf8_lossy(&line));
+            assert_eq!(
+                events[0].kind,
+                "model.response",
+                "{:?}: {}",
+                String::from_utf8_lossy(&line),
+                events[0].payload
+            );
+            assert_eq!(adapter.summary().normalized_lines, 1);
+        }
+        // Text inside the event is never touched: an escaped escape stays, and so does U+009B.
+        let mut adapter = NativeAdapter::new(Provider::Droid);
+        let events = adapter
+            .push("{\"type\":\"result\",\"result\":\"a\\u001b[31mred \u{9b}0m\"}\n".as_bytes());
+        assert_eq!(
+            events[0].payload["native"]["result"],
+            "a\u{1b}[31mred \u{9b}0m"
+        );
+    }
+
+    #[test]
+    fn lines_holding_only_control_sequences_are_blank_not_malformed() {
+        let mut adapter = NativeAdapter::new(Provider::Claude);
+        let events = adapter.push(b"\x1b[2K\n\x1b[?25l\x1b[0m\n \r\n\xef\xbb\xbf\n");
+        assert!(events.is_empty(), "{:?}", events[0].payload);
+        adapter.push(b"\x1b[0m");
+        assert!(adapter.finish().is_empty());
+        assert_eq!(adapter.summary(), AdapterSummary::default());
+        assert!(adapter.summary_event().is_some(), "nothing was normalized");
+    }
+
+    #[test]
+    fn non_json_output_gets_a_bounded_number_of_diagnostics_and_a_summary() {
+        let mut adapter = NativeAdapter::new(Provider::Claude);
+        let mut events = Vec::new();
+        for line in 0..500 {
+            events.extend(adapter.push(format!("plain text line {line}\n").as_bytes()));
+        }
+        events.extend(adapter.finish());
+        assert_eq!(events.len() as u64, MAX_LINE_DIAGNOSTICS);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind == "adapter.diagnostic")
+        );
+        assert_eq!(
+            events.last().unwrap().payload["further_diagnostics"],
+            "suppressed"
+        );
+        let summary = adapter.summary();
+        assert_eq!(
+            summary,
+            AdapterSummary {
+                lines: 500,
+                normalized_lines: 0,
+                rejected_lines: 500,
+                suppressed_diagnostics: 500 - MAX_LINE_DIAGNOSTICS,
+            }
+        );
+        assert_eq!(summary.completeness(), "no-native-events");
+        let event = adapter.summary_event().unwrap();
+        assert_eq!(event.kind, "adapter.summary");
+        assert_eq!(event.status, "warning");
+        assert_eq!(event.payload["rejected_lines"], 500);
+        assert_eq!(
+            event.payload["suppressed_diagnostics"],
+            500 - MAX_LINE_DIAGNOSTICS
+        );
+        assert_eq!(event.payload["completeness"], "no-native-events");
+
+        // A clean run has nothing to report, and one stray line makes it partial.
+        let mut clean = NativeAdapter::new(Provider::Codex);
+        clean.push(b"{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n");
+        assert!(clean.finish().is_empty());
+        assert!(clean.summary_event().is_none());
+        assert_eq!(
+            clean.summary().completeness(),
+            "provider-native-best-effort"
+        );
+        clean.push(b"warning: deprecated flag\n");
+        assert_eq!(clean.summary().completeness(), "provider-native-partial");
+        let partial = clean.summary_event().unwrap();
+        assert_eq!(partial.payload["normalized_lines"], 1);
+        assert_eq!(partial.payload["rejected_lines"], 1);
+    }
+
+    #[test]
+    fn structured_output_flags_are_matched_as_flags() {
+        // Every provider's flag, in both spellings where there are two.
+        for command in [
+            &["codex", "exec", "--json", "task"][..],
+            &["claude", "-p", "task", "--output-format", "stream-json"],
+            &["claude", "--output-format=stream-json", "-p", "task"],
+            &["gemini", "--output-format", "stream-json"],
+            &["grok", "--output-format", "streaming-json"],
+            &["opencode", "run", "--format", "json"],
+            &["kimi", "--output-format=stream-json"],
+            &["droid", "exec", "-o", "json"],
+            &["droid", "exec", "--output-format", "json"],
+            // A path, another case, and a Windows-style name.
+            &["/usr/local/bin/codex", "exec", "--json"],
+            &["Codex.EXE", "exec", "--json"],
+            &["claude.cmd", "--output-format", "stream-json"],
+        ] {
+            assert!(auto(command).is_some(), "{command:?}");
+        }
+        for command in [
+            // The value of another format, or the flag of another provider.
+            &["claude", "--output-format", "json"][..],
+            &["claude", "--output-format", "text", "stream-json"],
+            &["grok", "--output-format", "stream-json"],
+            &["codex", "exec", "--output-format", "stream-json"],
+            // Only droid has the short form.
+            &["claude", "-o", "json"],
+            // A program that merely starts with a provider's name.
+            &["codex-wrapper", "exec", "--json"],
+            &["claude-code-router", "--output-format", "stream-json"],
+            &["cat", "--json"],
+        ] {
+            assert_eq!(auto(command), None, "{command:?}");
+        }
+        assert!("CODEX".parse::<AdapterChoice>().is_ok());
+        let error = "copilot".parse::<AdapterChoice>().unwrap_err();
+        assert!(error.contains("auto, none, codex"), "{error}");
+    }
+
+    #[test]
+    fn a_line_at_the_buffer_bound_is_kept_and_one_byte_more_is_discarded() {
+        let mut at_bound = NativeAdapter::new(Provider::Codex);
+        at_bound.push(&vec![b' '; MAX_BUFFERED_LINE_BYTES]);
+        assert_eq!(at_bound.pending.len(), MAX_BUFFERED_LINE_BYTES);
+        assert_eq!(at_bound.discarded_bytes, 0);
+        // Blank, however long: no event.
+        assert!(at_bound.push(b"\n").is_empty());
+
+        let mut over = NativeAdapter::new(Provider::Codex);
+        over.push(&vec![b' '; MAX_BUFFERED_LINE_BYTES + 1]);
+        assert!(over.pending.is_empty());
+        let events = over.push(b"\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["line_bytes"], MAX_BUFFERED_LINE_BYTES + 1);
+    }
+
+    /// Every stored field of the events an input produces, for comparing two runs.
+    fn stored_shape(provider: Provider, chunks: &[&[u8]]) -> Vec<String> {
+        let mut adapter = NativeAdapter::new(provider);
+        let mut stored = Vec::new();
+        let mut commit = |adapter: &mut NativeAdapter, events: Vec<AdapterEvent>| {
+            adapter
+                .commit(events, |input| {
+                    stored.push(format!(
+                        "{} {} {} {} {} parent={} links={:?} {}",
+                        input.kind,
+                        input.status,
+                        input.actor_id,
+                        input.span_id,
+                        input.correlation_id,
+                        input.parent_event_id,
+                        input.links,
+                        input.payload
+                    ));
+                    Ok::<_, std::convert::Infallible>(format!("e{}", stored.len()))
+                })
+                .unwrap();
+        };
+        for chunk in chunks {
+            let events = adapter.push(chunk);
+            commit(&mut adapter, events);
+        }
+        let events = adapter.finish();
+        commit(&mut adapter, events);
+        stored
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// How the output is split into reads must not change what is recorded, including what
+        /// `finish` emits for a last line without a line break.
+        #[test]
+        fn events_do_not_depend_on_how_the_stream_is_chunked(
+            cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..24),
+            garbage in prop::collection::vec(any::<u8>(), 0..64),
+            terminated in any::<bool>(),
+        ) {
+            let mut stream = include_bytes!("../tests/fixtures/adapters/claude.jsonl").to_vec();
+            // A line of arbitrary bytes in the middle, and optionally no final line break.
+            stream.extend(garbage.iter().filter(|byte| **byte != b'\n'));
+            stream.extend(b"\n{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"s\"}");
+            if terminated {
+                stream.push(b'\n');
+            }
+            let whole = stored_shape(Provider::Claude, &[&stream]);
+            prop_assert!(whole.len() > 4);
+            let mut positions: Vec<usize> = cuts.iter().map(|cut| cut.index(stream.len())).collect();
+            positions.sort_unstable();
+            positions.dedup();
+            let mut chunks = Vec::new();
+            let mut start = 0;
+            for position in positions {
+                chunks.push(&stream[start..position]);
+                start = position;
+            }
+            chunks.push(&stream[start..]);
+            prop_assert_eq!(&stored_shape(Provider::Claude, &chunks), &whole);
+            let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+            prop_assert_eq!(&stored_shape(Provider::Claude, &bytes), &whole);
+        }
     }
 
     proptest! {

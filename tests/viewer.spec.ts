@@ -69,10 +69,11 @@ test('resizes the workspace and links analytics, topology, and local AI to trace
   await expect(page.getByText('Only actors and links observed in this window')).toBeVisible();
 
   await page.getByRole('button', { name: 'Ask AI', exact: true }).click();
-  const assistant = page.getByRole('dialog', { name: 'Ask your local AI' });
+  const assistant = page.getByRole('dialog', { name: 'Ask an AI CLI installed here' });
   await expect(assistant).toBeVisible();
-  await expect(assistant.getByLabel('Local provider')).toBeVisible();
-  await expect(assistant.getByText(/bounds the context/)).toBeVisible();
+  await expect(assistant.getByLabel('Provider CLI')).toBeVisible();
+  // The disclosure of what leaves the machine is on screen, not tucked away.
+  await expect(assistant.getByText(/Asking sends trace content off this machine/)).toBeVisible();
   await assistant.getByRole('button', { name: 'Close AI workspace' }).click();
   await expect(assistant).toBeHidden();
 });
@@ -133,7 +134,7 @@ test('traps and restores focus for the Ask AI dialog', async ({ page }) => {
   const trigger = page.getByRole('button', { name: 'Ask AI', exact: true });
   await trigger.focus();
   await trigger.click();
-  const dialog = page.getByRole('dialog', { name: 'Ask your local AI' });
+  const dialog = page.getByRole('dialog', { name: 'Ask an AI CLI installed here' });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Close AI workspace' })).toBeFocused();
   for (let index = 0; index < 12; index += 1) await page.keyboard.press('Tab');

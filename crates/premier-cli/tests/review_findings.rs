@@ -235,9 +235,22 @@ fn demo_does_not_replace_a_trace_that_is_being_recorded() {
     let manifest = writer.finish(0).unwrap();
     assert_eq!(manifest.journal.unwrap().event_count, 2);
 
-    // A finalized trace at the path is replaced, as documented.
-    let replaced = premier()
+    // Once finalized it is a recorded trace, which `demo` replaces only when
+    // told to.
+    let refused = premier()
         .args(["demo", "--output"])
+        .arg(&live)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("not an earlier demo"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(read_manifest(&live).unwrap().trace_id, manifest.trace_id);
+    let replaced = premier()
+        .args(["demo", "--force", "--output"])
         .arg(&live)
         .output()
         .unwrap();

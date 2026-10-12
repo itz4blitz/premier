@@ -8,6 +8,82 @@ integrations may depend on.
 
 ### Added
 
+- `premier diff` aligns events in order. An event present in only one trace
+  is reported as `added` or `removed` where it occurs and the events after it
+  stay paired with their counterparts; an event at a different place is
+  reported as `moved`. The output names the **first divergence**: the first
+  item, in trace order, that is not unchanged, with its first differing
+  field. The text view also lists each item's field changes with their
+  values, and manifest differences in `command`, `exit_code`, `termination`,
+  `adapter`, and `capabilities`.
+- `premier diff --exit-code`: exit status `1` when the traces differ, `0` when
+  they do not.
+- `premier diff` compares what events refer to: `parent_event`,
+  `parent_span`, `correlation`, and `links`, each followed to the events it
+  names, so a re-parented event is reported whatever the ids are.
+- `premier export` gives each export a digest of its own (the `integrity`
+  block, printed as `export digest: sha256:...`), and `premier verify
+  <export.json>` recomputes it, reports which trace the export says it was
+  derived from, and checks a copied source signature against the copied seal
+  digest (`--public-key` requires your key). An export is a derived, redacted
+  copy, not the sealed original: its digest is stored in the file it covers.
+  See [docs/redaction.md](docs/redaction.md#the-integrity-block).
+- `premier export --kind`, `--actor`, `--after-sequence`, and
+  `--before-sequence` export a selection of events, recorded in the export's
+  new `selection` block. `--redact-field` and `--redact-literal` apply rules
+  of the export's own, reported in its `redaction` block.
+- Exports record their `exporter` (name and version), and whether the source
+  was finalized and verified (`source.finalized`, `source.verification`). An
+  event whose stored payload is not JSON is exported with the stored text in
+  `payload_raw` instead of only `payload: null`.
+- `premier query` and `premier diff` read a file written by `premier export`
+  in place of a trace directory.
+- `premier query --event-id`, `--span`, `--parent-span`, `--parent`,
+  `--correlation`, `--after-sequence`, `--before-sequence`, `--since`,
+  `--until`, and `--issues`. A truncated result names the sequence to continue
+  from (`next_after_sequence` in `--json`), and `--json` carries a `source`
+  block saying whether the trace was finalized and verified.
+- `premier query --search` also matches event ids and timestamps, and every
+  payload string as it was recorded, with and without terminal control
+  sequences: text with quotes, line breaks, backslashes, or colour codes
+  matches as typed.
+- `premier demo --force` replaces a finalized trace that is not an earlier
+  demo.
+- `premier list` shows how a finished run ended (`[exit 3]`, `[SIGKILL]`,
+  `[interrupted]`) and each trace's directory name.
+- Viewer API: a trace is addressed by its **artifact** (directory name) in
+  `/api/traces/{trace}` and in the viewer's `?trace=` links. A trace id still
+  works when one served trace has it; an id shared by several traces (copies
+  of one recording) is answered `409` with the artifacts to choose from.
+- Viewer API: every `trace.event` of the event stream carries its sequence as
+  the SSE `id`, and the stream resumes after `Last-Event-ID`. A stream on a
+  trace that can no longer be read ends with the new terminal event
+  `trace.error` instead of polling silently.
+- Viewer server: a request with wrong credentials is answered after a delay
+  that grows with each refusal in a row (250 ms steps, at most 2 seconds) and
+  is logged. `serve` warns about a password shorter than 12 characters on a
+  non-loopback address, and refuses an auth config that lists one token
+  twice.
+- Viewer: the comparison shows the first divergence and a `Moved` count, and
+  applies the same rules as `premier diff`; the two are tested against one
+  shared set of cases.
+- Viewer: the assistant panel states that asking sends redacted trace content
+  to the provider's vendor, at a readable size on every window height, and
+  the Ask button stays disabled until that is agreed to for the selected
+  provider.
+- Adapters: at most 20 `adapter.diagnostic` events per recording; the rest are
+  counted in a closing `adapter.summary` event. When some or no output lines
+  were native events, `record` says so on stderr and corrects
+  `adapter.completeness` in the manifest to `provider-native-partial` or
+  `no-native-events`.
+- Adapters read events wrapped in terminal decorations: a byte order mark, a
+  spinner overwritten by a carriage return, control sequences before or
+  after the object (including OSC ended by ST, charset selections, and the
+  8-bit CSI).
+- The assistant prompt puts the run's outcome (exit code, termination, event
+  count) first and on its own, and spends its event budget from the newest
+  event backwards.
+
 - `premier record` ends with a `protection:` line on stderr saying whether
   the trace was written encrypted (with the key id) and whether it was signed
   (with the signer's fingerprint), so a mistyped key variable no longer
@@ -190,6 +266,58 @@ integrations may depend on.
 
 ### Changed
 
+- **Breaking: `premier diff` output.** `--json` is now
+  `format: "premier.semantic-diff.v2"` with `identical`, `alignment`,
+  `first_divergence`, `manifest`, and a `moved` status and count. Items are
+  listed in trace order (an added event where it occurs, no longer after all
+  baseline events), and the `#<n>` in an item's key counts in that order.
+  The text view has a `moved` count, a `first divergence` line, a position
+  column, and one indented line per field change. Events in a different
+  order, which used to be reported as unchanged, are now reported as `moved`.
+- **Breaking: `premier diff` compares captured output per stream.** All
+  `process.stdout`, `process.stderr`, and `process.terminal` text of a stream
+  is one item compared line by line (`text.lines`, `text.line[<n>]`), instead
+  of one item per stored chunk. `payload.instrumentation` of `session.start`
+  is ignored. Two recordings of the same command now compare as identical.
+- **Breaking: `premier demo` no longer replaces a recorded trace.** A
+  finalized trace at `--output` is replaced only when it is an earlier demo;
+  pass `--force` for any other. The demo is written beside the output and
+  moved into place, so a failed `demo` leaves the previous trace intact.
+- **Breaking: `premier list` rows end with the trace's directory name in
+  parentheses**, after an optional `[exit <code>]`, `[<signal>]`, or
+  `[interrupted]`. Directories whose name starts with a dot (working copies
+  of `encrypt` and `demo`) are no longer listed, by `list` or by the viewer.
+- **Breaking: the viewer's links name a trace by its directory name**
+  (`/?trace=run.atrace`), and so does the URL `premier open <trace>` and
+  `record --open` print. Links with a trace id keep working while one served
+  trace has that id.
+- **Breaking: `premier open <trace>` refuses a trace owned by another
+  tenant**, before starting a server or a browser, instead of opening a
+  viewer that answers "not found". `record --tenant <tenant>` no longer
+  prints `next: premier open ...`. Both explain that a tenant's traces are
+  read through the API with that tenant's bearer token, and no longer suggest
+  viewing them in the browser through `serve --auth-config`.
+- **Breaking: `premier export` refuses an `--output` that is a directory or
+  lies inside a trace directory.**
+- The viewer server listens before it prints its URL or starts a browser. A
+  taken address fails with `cannot start the viewer: <address> is already in
+  use ...` and opens nothing. `--bind 127.0.0.1:0` takes a free port and the
+  printed URL shows it. `record --open` checks its bind address and viewer
+  build before running the command.
+- The assistant's CLIs are discovered on the first request that needs them,
+  not when the server starts, and each capability probe is stopped after 5
+  seconds. A server whose assistant is never used runs no CLI.
+- The assistant CLI runs in its own process group, which is killed as a whole
+  on timeout or disconnect. More than 64 KiB of diagnostics on its standard
+  error no longer discards a valid answer. The request body limit is 160 KiB
+  (was 24 KiB), so the documented character limits hold for every script.
+- The viewer's semantic comparison reports a `duration_ms` difference as a
+  field change, as `premier diff` does. Both key an adapter tool event that
+  has no `payload.tool` by the tool its `native` copy names.
+- The demo's reviewer `agent.spawn` is parented to the coordinator's
+  `session.start`, as its `parent_actor` says, and links the patch it reviews.
+- Viewer: the assistant panel is titled "Ask an AI CLI installed here" and
+  its provider selector "Provider CLI".
 - **Default trace directory name.** `premier record` without `--output` now
   writes `.premier/traces/trace-<unix-milliseconds>-<8 random hex digits>.atrace`
   (was `trace-<unix-milliseconds>.atrace`), and every trace directory is
@@ -398,6 +526,13 @@ integrations may depend on.
 
 ### Fixed
 
+- `premier diff` no longer attributes one inserted call to every later call
+  of the same kind, and no longer reports reordered events as unchanged.
+- An adapter no longer writes a `malformed native JSONL` diagnostic for a
+  line that holds only a terminal control sequence, or rejects an event
+  because a colour reset follows it.
+- An event stream no longer runs blocking file reads on the server's async
+  worker threads.
 - `premier replay` no longer panics on a very small `--speed`.
 - The viewer event stream of a finalized trace always ends with
   `trace.complete`, also when the trace cannot be read back at that moment.

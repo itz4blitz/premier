@@ -24,7 +24,7 @@
   let baselineIssues = $derived(baselineEvents.filter(isIssue).length);
   let currentIssues = $derived(currentEvents.filter(isIssue).length);
   let differences = $derived.by(() => {
-    const order = { changed: 0, added: 1, removed: 2, unchanged: 3 } as const;
+    const order = { changed: 0, added: 1, removed: 2, moved: 3, unchanged: 4 } as const;
     return comparison.items.filter((item) => item.status !== 'unchanged')
       .sort((a, b) => order[a.status] - order[b.status] || (a.current ?? a.baseline)!.sequence - (b.current ?? b.baseline)!.sequence);
   });
@@ -70,7 +70,7 @@
 <section class="comparison" aria-label="Trace comparison">
   <header class="comparison-head">
     <div><GitCompareArrows size={15} /><span>Semantic comparison</span></div>
-    <small>Generated IDs, timestamps, and correlation noise are excluded.</small>
+    <small>Events are aligned in order; generated IDs, timestamps, and where output was split are excluded.</small>
   </header>
 
   <div class="run-pair">
@@ -99,8 +99,25 @@
     <div class="changed" aria-label="Changed events"><span>Changed</span><strong>{comparison.counts.changed}</strong></div>
     <div class="added" aria-label="Added events"><span>Added</span><strong>{comparison.counts.added}</strong></div>
     <div class="removed" aria-label="Removed events"><span>Removed</span><strong>{comparison.counts.removed}</strong></div>
+    <div class="moved" aria-label="Moved events"><span>Moved</span><strong>{comparison.counts.moved}</strong></div>
     <div class="unchanged" aria-label="Unchanged events"><span>Unchanged</span><strong>{comparison.counts.unchanged}</strong></div>
   </div>
+
+  {#if comparison.firstDivergence}
+    {@const first = comparison.firstDivergence.item}
+    {@const firstEvent = eventFor(first)}
+    <p class="first-divergence" data-testid="comparison-first-divergence">
+      <b>First divergence</b>
+      <span>{first.status} · {firstEvent.kind} · {firstEvent.actor_id || 'root'}</span>
+      <small>
+        {#if first.baseline}baseline #{first.baseline.sequence}{/if}{#if first.baseline && first.current}, {/if}{#if first.current}current #{first.current.sequence}{/if}
+        {#if first.changes[0]} · <code>{first.changes[0].field}</code>{/if}
+      </small>
+    </p>
+  {/if}
+  {#if comparison.alignment === 'per_key'}
+    <p class="first-divergence">These traces differ in too many places to align in order; events were paired per kind and actor, and order was not compared.</p>
+  {/if}
 
   {#if baselineEvents.length === 0 && currentEvents.length === 0}
     <div class="empty-state">
@@ -112,7 +129,7 @@
     <div class="empty-state success">
       <Check size={22} />
       <strong>No meaningful differences</strong>
-      <p>Semantic evidence matches; generated IDs and ordering noise are ignored.</p>
+      <p>Semantic evidence matches, in the same order; generated IDs are ignored.</p>
     </div>
   {:else}
     <div class="difference-list" aria-label="Meaningful differences">
@@ -182,7 +199,10 @@
   .run-metrics span[data-tone='warning'] { color: #efbc70; }
   .run-metrics small { display: inline-flex; align-items: center; gap: 3px; color: #7e8ca0; font-size: 9px; }
   .run-metrics small.issue { color: #ea918d; }
-  .counts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid #202a3a; }
+  .counts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid #202a3a; }
+  .first-divergence { margin: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 12px; border-bottom: 1px solid #202a3a; color: #cfd9e8; font-size: 12px; }
+  .first-divergence b { color: #f1be73; font-size: 11px; }
+  .first-divergence small { color: #8493a8; font-size: 11px; }
   .counts > div { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 6px; padding: 8px 12px; border-left: 1px solid #202a3a; }
   .counts > div:first-child { border-left: 0; }
   .counts span { color: #78879b; font-size: 9px; font-weight: 700; }
@@ -190,6 +210,7 @@
   .counts .changed strong { color: #f1be73; }
   .counts .added strong { color: #74d8a8; }
   .counts .removed strong { color: #ff8b86; }
+  .counts .moved strong { color: #8fb7f5; }
   .empty-state { min-height: 145px; display: grid; place-items: center; align-content: center; gap: 7px; padding: 24px; color: #738299; text-align: center; }
   .empty-state strong { color: #cbd5e4; font-size: 12px; }
   .empty-state p { max-width: 420px; margin: 0; color: #718096; font-size: 10px; line-height: 1.45; }

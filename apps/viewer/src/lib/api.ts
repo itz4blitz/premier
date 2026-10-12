@@ -29,6 +29,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+/**
+ * `traceId` in every call below is what the server resolves: a trace's artifact name (its
+ * directory, `listKey(trace)`), or a trace id when only one served trace has it. Copies of a
+ * recording share a trace id, and the server answers 409 for an id that names several.
+ */
 export const api = {
   traces: () => request<TraceManifest[]>('/api/traces'),
   trace: (traceId: string) => request<TraceManifest>(`/api/traces/${encodeURIComponent(traceId)}`),
@@ -92,6 +97,13 @@ export const api = {
       const manifest = JSON.parse((message as MessageEvent).data) as TraceManifest;
       onComplete?.(manifest);
       close('abandoned');
+    });
+    // The server gave up on a trace it can no longer read (deleted, damaged, or its key gone):
+    // closing keeps EventSource from reconnecting to the same failure forever.
+    source.addEventListener('trace.error', () => {
+      if (closed) return;
+      completed = true;
+      close('disconnected');
     });
     source.onerror = () => {
       if (closed || completed) return;

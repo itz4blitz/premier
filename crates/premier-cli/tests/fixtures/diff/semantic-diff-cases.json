@@ -1,0 +1,676 @@
+{
+  "description": "Cases that `premier diff` (crates/premier-cli/src/evidence.rs) and the viewer comparison (apps/viewer/src/lib/semanticCompare.ts) must both reproduce. An event lists only the fields a case cares about; both test suites fill the rest with the same defaults: event_id \"<side>-<sequence>\", trace_id \"<side>\", timestamp \"2026-07-15T12:00:00Z\", source \"sdk\", actor_id \"agent\", actor_type \"agent\", status \"ok\", duration_ms 0, payload {}, and empty parent_event_id, span_id, parent_span_id, correlation_id and links. `fields` are the names of an item's changes, in order.",
+  "cases": [
+    {
+      "name": "the same command recorded twice: collector port and output chunking differ",
+      "baseline": [
+        {
+          "sequence": 1,
+          "kind": "session.start",
+          "actor_id": "root",
+          "source": "premier",
+          "payload": {
+            "command": [
+              "sh",
+              "-c",
+              "printf"
+            ],
+            "instrumentation": "http://127.0.0.1:50001/v1/events",
+            "capture_mode": "pipes"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "source": "command",
+          "status": "running",
+          "payload": {
+            "byte_length": 6,
+            "stream": "stdout",
+            "text": "one\ntw"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "source": "command",
+          "status": "running",
+          "payload": {
+            "byte_length": 8,
+            "stream": "stdout",
+            "text": "o\nthree\n"
+          }
+        },
+        {
+          "sequence": 4,
+          "kind": "process.exit",
+          "actor_id": "root",
+          "source": "command",
+          "payload": {
+            "exit_code": 0,
+            "success": true
+          }
+        }
+      ],
+      "current": [
+        {
+          "sequence": 1,
+          "kind": "session.start",
+          "actor_id": "root",
+          "source": "premier",
+          "payload": {
+            "command": [
+              "sh",
+              "-c",
+              "printf"
+            ],
+            "instrumentation": "http://127.0.0.1:50002/v1/events",
+            "capture_mode": "pipes"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "source": "command",
+          "status": "running",
+          "payload": {
+            "byte_length": 4,
+            "stream": "stdout",
+            "text": "one\n"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "source": "command",
+          "status": "running",
+          "payload": {
+            "byte_length": 5,
+            "stream": "stdout",
+            "text": "two\r\n"
+          }
+        },
+        {
+          "sequence": 4,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "source": "command",
+          "status": "running",
+          "payload": {
+            "byte_length": 6,
+            "stream": "stdout",
+            "text": "three\n"
+          }
+        },
+        {
+          "sequence": 5,
+          "kind": "process.exit",
+          "actor_id": "root",
+          "source": "command",
+          "payload": {
+            "exit_code": 0,
+            "success": true
+          }
+        }
+      ],
+      "expected": {
+        "counts": {
+          "added": 0,
+          "removed": 0,
+          "changed": 0,
+          "moved": 0,
+          "unchanged": 3
+        },
+        "first_divergence": null,
+        "items": [
+          {
+            "key": "session.start:root#1",
+            "status": "unchanged",
+            "baseline_sequence": 1,
+            "current_sequence": 1,
+            "fields": []
+          },
+          {
+            "key": "process.stdout:root#1",
+            "status": "unchanged",
+            "baseline_sequence": 2,
+            "current_sequence": 2,
+            "fields": []
+          },
+          {
+            "key": "process.exit:root#1",
+            "status": "unchanged",
+            "baseline_sequence": 4,
+            "current_sequence": 5,
+            "fields": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "one call inserted in a loop is an insertion, not a change to every later call",
+      "baseline": [
+        {
+          "sequence": 1,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "read",
+            "path": "a"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "read",
+            "path": "b"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "read",
+            "path": "c"
+          }
+        }
+      ],
+      "current": [
+        {
+          "sequence": 1,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "read",
+            "path": "a"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "read",
+            "path": "new"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "read",
+            "path": "b"
+          }
+        },
+        {
+          "sequence": 4,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "read",
+            "path": "c"
+          }
+        }
+      ],
+      "expected": {
+        "counts": {
+          "added": 1,
+          "removed": 0,
+          "changed": 0,
+          "moved": 0,
+          "unchanged": 3
+        },
+        "first_divergence": {
+          "index": 1,
+          "key": "tool.invocation:agent:read#2",
+          "status": "added"
+        },
+        "items": [
+          {
+            "key": "tool.invocation:agent:read#1",
+            "status": "unchanged",
+            "baseline_sequence": 1,
+            "current_sequence": 1,
+            "fields": []
+          },
+          {
+            "key": "tool.invocation:agent:read#2",
+            "status": "added",
+            "baseline_sequence": null,
+            "current_sequence": 2,
+            "fields": []
+          },
+          {
+            "key": "tool.invocation:agent:read#3",
+            "status": "unchanged",
+            "baseline_sequence": 2,
+            "current_sequence": 3,
+            "fields": []
+          },
+          {
+            "key": "tool.invocation:agent:read#4",
+            "status": "unchanged",
+            "baseline_sequence": 3,
+            "current_sequence": 4,
+            "fields": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "two events in the other order: one of them is reported as moved",
+      "baseline": [
+        {
+          "sequence": 1,
+          "kind": "agent.turn",
+          "payload": {
+            "task": "x"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "search"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "grep"
+          }
+        },
+        {
+          "sequence": 4,
+          "kind": "agent.result"
+        }
+      ],
+      "current": [
+        {
+          "sequence": 1,
+          "kind": "agent.turn",
+          "payload": {
+            "task": "x"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "grep"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "tool.invocation",
+          "payload": {
+            "tool": "search"
+          }
+        },
+        {
+          "sequence": 4,
+          "kind": "agent.result"
+        }
+      ],
+      "expected": {
+        "counts": {
+          "added": 0,
+          "removed": 0,
+          "changed": 0,
+          "moved": 1,
+          "unchanged": 3
+        },
+        "first_divergence": {
+          "index": 2,
+          "key": "tool.invocation:agent:search#1",
+          "status": "moved"
+        },
+        "items": [
+          {
+            "key": "agent.turn:agent#1",
+            "status": "unchanged",
+            "baseline_sequence": 1,
+            "current_sequence": 1,
+            "fields": []
+          },
+          {
+            "key": "tool.invocation:agent:grep#1",
+            "status": "unchanged",
+            "baseline_sequence": 3,
+            "current_sequence": 2,
+            "fields": []
+          },
+          {
+            "key": "tool.invocation:agent:search#1",
+            "status": "moved",
+            "baseline_sequence": 2,
+            "current_sequence": 3,
+            "fields": []
+          },
+          {
+            "key": "agent.result:agent#1",
+            "status": "unchanged",
+            "baseline_sequence": 4,
+            "current_sequence": 4,
+            "fields": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "captured output is compared as text, and the first differing line is named",
+      "baseline": [
+        {
+          "sequence": 1,
+          "kind": "session.start",
+          "actor_id": "root",
+          "payload": {
+            "command": [
+              "sh"
+            ]
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "payload": {
+            "text": "alpha\nbeta\n"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "process.exit",
+          "actor_id": "root",
+          "payload": {
+            "exit_code": 0
+          }
+        }
+      ],
+      "current": [
+        {
+          "sequence": 1,
+          "kind": "session.start",
+          "actor_id": "root",
+          "payload": {
+            "command": [
+              "sh"
+            ]
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "payload": {
+            "text": "alpha\n"
+          }
+        },
+        {
+          "sequence": 3,
+          "kind": "process.stdout",
+          "actor_id": "root",
+          "payload": {
+            "text": "gamma\n"
+          }
+        },
+        {
+          "sequence": 4,
+          "kind": "process.exit",
+          "actor_id": "root",
+          "payload": {
+            "exit_code": 0
+          }
+        }
+      ],
+      "expected": {
+        "counts": {
+          "added": 0,
+          "removed": 0,
+          "changed": 1,
+          "moved": 0,
+          "unchanged": 2
+        },
+        "first_divergence": {
+          "index": 1,
+          "key": "process.stdout:root#1",
+          "status": "changed"
+        },
+        "items": [
+          {
+            "key": "session.start:root#1",
+            "status": "unchanged",
+            "baseline_sequence": 1,
+            "current_sequence": 1,
+            "fields": []
+          },
+          {
+            "key": "process.stdout:root#1",
+            "status": "changed",
+            "baseline_sequence": 2,
+            "current_sequence": 2,
+            "fields": [
+              "text.line[2]"
+            ]
+          },
+          {
+            "key": "process.exit:root#1",
+            "status": "unchanged",
+            "baseline_sequence": 3,
+            "current_sequence": 4,
+            "fields": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "an event that hangs off a different parent is a change, whatever the ids are",
+      "baseline": [
+        {
+          "sequence": 1,
+          "kind": "agent.spawn",
+          "actor_id": "coordinator",
+          "payload": {
+            "task": "t"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "agent.spawn",
+          "actor_id": "coder"
+        },
+        {
+          "sequence": 3,
+          "kind": "tool.execution",
+          "actor_id": "reviewer",
+          "parent_event_id": "baseline-1",
+          "payload": {
+            "tool": "test"
+          }
+        }
+      ],
+      "current": [
+        {
+          "sequence": 1,
+          "kind": "agent.spawn",
+          "actor_id": "coordinator",
+          "payload": {
+            "task": "t"
+          }
+        },
+        {
+          "sequence": 2,
+          "kind": "agent.spawn",
+          "actor_id": "coder"
+        },
+        {
+          "sequence": 3,
+          "kind": "tool.execution",
+          "actor_id": "reviewer",
+          "parent_event_id": "current-2",
+          "payload": {
+            "tool": "test"
+          }
+        }
+      ],
+      "expected": {
+        "counts": {
+          "added": 0,
+          "removed": 0,
+          "changed": 1,
+          "moved": 0,
+          "unchanged": 2
+        },
+        "first_divergence": {
+          "index": 2,
+          "key": "tool.execution:reviewer:test#1",
+          "status": "changed"
+        },
+        "items": [
+          {
+            "key": "agent.spawn:coordinator#1",
+            "status": "unchanged",
+            "baseline_sequence": 1,
+            "current_sequence": 1,
+            "fields": []
+          },
+          {
+            "key": "agent.spawn:coder#1",
+            "status": "unchanged",
+            "baseline_sequence": 2,
+            "current_sequence": 2,
+            "fields": []
+          },
+          {
+            "key": "tool.execution:reviewer:test#1",
+            "status": "changed",
+            "baseline_sequence": 3,
+            "current_sequence": 3,
+            "fields": [
+              "parent_event"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "generated ids are ignored; status, duration and payload differences are reported",
+      "baseline": [
+        {
+          "sequence": 1,
+          "kind": "model.response",
+          "source": "adapter.claude.v1",
+          "payload": {
+            "model": "m1",
+            "text": "old",
+            "event_id": "x",
+            "native": {
+              "id": "gen-a",
+              "uuid": "u-a",
+              "content": "same"
+            }
+          }
+        }
+      ],
+      "current": [
+        {
+          "sequence": 7,
+          "kind": "model.response",
+          "source": "adapter.claude.v1",
+          "status": "warning",
+          "duration_ms": 5,
+          "payload": {
+            "model": "m1",
+            "text": "new",
+            "event_id": "y",
+            "native": {
+              "id": "gen-b",
+              "uuid": "u-b",
+              "content": "same"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "counts": {
+          "added": 0,
+          "removed": 0,
+          "changed": 1,
+          "moved": 0,
+          "unchanged": 0
+        },
+        "first_divergence": {
+          "index": 0,
+          "key": "model.response:agent#1",
+          "status": "changed"
+        },
+        "items": [
+          {
+            "key": "model.response:agent#1",
+            "status": "changed",
+            "baseline_sequence": 1,
+            "current_sequence": 7,
+            "fields": [
+              "status",
+              "duration_ms",
+              "payload.text"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "a different tool is a removal and an addition, not a change",
+      "baseline": [
+        {
+          "sequence": 1,
+          "kind": "tool.execution",
+          "payload": {
+            "tool": "grep"
+          }
+        }
+      ],
+      "current": [
+        {
+          "sequence": 1,
+          "kind": "tool.execution",
+          "payload": {
+            "tool": "browser"
+          }
+        }
+      ],
+      "expected": {
+        "counts": {
+          "added": 1,
+          "removed": 1,
+          "changed": 0,
+          "moved": 0,
+          "unchanged": 0
+        },
+        "first_divergence": {
+          "index": 0,
+          "key": "tool.execution:agent:grep#1",
+          "status": "removed"
+        },
+        "items": [
+          {
+            "key": "tool.execution:agent:grep#1",
+            "status": "removed",
+            "baseline_sequence": 1,
+            "current_sequence": null,
+            "fields": []
+          },
+          {
+            "key": "tool.execution:agent:browser#1",
+            "status": "added",
+            "baseline_sequence": null,
+            "current_sequence": 1,
+            "fields": []
+          }
+        ]
+      }
+    }
+  ]
+}
