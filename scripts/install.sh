@@ -101,7 +101,7 @@ if [[ -z "$ARCHIVE" ]]; then
   command -v cargo >/dev/null 2>&1 || { echo "no local archive found and cargo is unavailable" >&2; exit 1; }
   command -v npm >/dev/null 2>&1 || { echo "no local archive found and npm is unavailable" >&2; exit 1; }
   if [[ "$SKIP_VIEWER" -eq 0 ]]; then
-    (cd "$ROOT" && [[ -d node_modules ]] || npm install)
+    (cd "$ROOT" && if [[ ! -d node_modules ]]; then npm install; fi)
     (cd "$ROOT" && npm run build)
   elif [[ ! -f "$ROOT/apps/viewer/dist/index.html" ]]; then
     echo "apps/viewer/dist/index.html is missing; omit --skip-viewer" >&2

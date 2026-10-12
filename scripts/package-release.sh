@@ -67,7 +67,7 @@ if [[ -z "$BINARY" ]]; then
   command -v cargo >/dev/null 2>&1 || { echo "cargo is required for a source build" >&2; exit 1; }
   if [[ "$SKIP_VIEWER" -eq 0 ]]; then
     command -v npm >/dev/null 2>&1 || { echo "npm is required to build the embedded viewer" >&2; exit 1; }
-    (cd "$ROOT" && [[ -d node_modules ]] || npm install)
+    (cd "$ROOT" && if [[ ! -d node_modules ]]; then npm install; fi)
     (cd "$ROOT" && npm run build)
   elif [[ ! -f "$ROOT/apps/viewer/dist/index.html" ]]; then
     echo "apps/viewer/dist/index.html is missing; omit --skip-viewer" >&2
