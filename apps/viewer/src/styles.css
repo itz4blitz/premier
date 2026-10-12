@@ -269,6 +269,9 @@ main { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .runs-sheet-trigger { display: none; }
 .inline-error { display: grid; place-content: center; gap: 8px; padding: 30px; color: var(--muted); text-align: center; border-right: 1px solid var(--line); }
 .inline-error strong { color: var(--red); }
+.inline-error.unreadable-trace strong { color: #f0c88a; font-size: 15px; }
+.inline-error.unreadable-trace span { max-width: 560px; justify-self: center; font-size: 12px; line-height: 1.5; }
+.inline-error.unreadable-trace code { justify-self: center; padding: 3px 8px; border: 1px solid var(--line); color: #cbd3e0; background: #090c11; font-size: 11px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* Workspace actions */

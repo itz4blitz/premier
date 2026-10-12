@@ -60,6 +60,29 @@ export interface TraceManifest {
   termination?: ProcessTermination;
   /** Advisory semantic validation findings; unknown/custom event kinds remain valid. */
   diagnostics?: TraceDiagnostic[];
+  /** What the recorder was told to redact. Values it replaced read `[REDACTED]`. */
+  redaction?: RedactionProvenance | null;
+  /** Public encryption envelope; present when the trace is stored encrypted. */
+  encryption?: unknown;
+}
+
+export interface RedactionProvenance {
+  structured_defaults: boolean;
+  custom_fields?: string[];
+  terminal_literal_count?: number;
+  terminal_regex_count?: number;
+  terminal_multiline_regex_count?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * An entry the server lists but cannot serve events for: encrypted without a usable key, written in
+ * a later format, or damaged beyond reading its manifest. Its `integrity_detail` says which.
+ */
+export function isUnreadable(trace: Pick<TraceManifest, 'integrity' | 'journal' | 'format_version' | 'trace_id'>): boolean {
+  if (trace.integrity === 'locked' || trace.integrity === 'unsupported') return true;
+  return trace.integrity === 'invalid' && trace.journal === null
+    && (trace.format_version === 0 || trace.trace_id.startsWith('damaged:'));
 }
 
 export interface TraceListSummary {
@@ -117,11 +140,19 @@ export function isAbandoned(trace: Pick<TraceManifest, 'integrity'>): boolean {
 }
 
 /** Still being written by a running recorder, so there is something to tail. */
-export function isRecording(trace: Pick<TraceManifest, 'ended_at' | 'integrity'>): boolean {
-  return !trace.ended_at && !isAbandoned(trace);
+export function isRecording(
+  trace: Pick<TraceManifest, 'ended_at' | 'integrity'> & Partial<Pick<TraceManifest, 'journal' | 'format_version' | 'trace_id'>>
+): boolean {
+  // A locked, unsupported or damaged entry has no end time either, and nothing to tail.
+  const damaged = trace.integrity === 'invalid' && trace.journal === null
+    && (trace.format_version === 0 || Boolean(trace.trace_id?.startsWith('damaged:')));
+  return !trace.ended_at && !isAbandoned(trace)
+    && trace.integrity !== 'locked' && trace.integrity !== 'unsupported' && !damaged;
 }
 
-export type EventCategory = 'all' | 'agent' | 'model' | 'tool' | 'approval' | 'process' | 'error';
+/** The family a kind is filed under; `other` is every kind the viewer has no tab for. */
+export type EventFamily = 'agent' | 'model' | 'tool' | 'approval' | 'process' | 'other';
+export type EventCategory = 'all' | EventFamily | 'error';
 
 export interface EventFilters {
   search: string;

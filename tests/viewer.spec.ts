@@ -66,7 +66,7 @@ test('resizes the workspace and links analytics, topology, and local AI to trace
   await expect(page.getByText('Exact handoff evidence', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Hot window', exact: true }).click();
   await expect(page).toHaveURL(/from=[\d.]+&to=[\d.]+/);
-  await expect(page.getByText('Only actors and links observed in this window')).toBeVisible();
+  await expect(page.getByText('Range highlighted on the full-run map; structure is unchanged')).toBeVisible();
 
   await page.getByRole('button', { name: 'Ask AI', exact: true }).click();
   const assistant = page.getByRole('dialog', { name: 'Ask an AI CLI installed here' });

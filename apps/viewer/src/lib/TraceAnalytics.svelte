@@ -16,13 +16,13 @@
   type AnalyticsCategory = Exclude<EventCategory, 'all'>;
   type Point = { x: number; y: number; count: number; event: TraceEvent; start: number; end: number };
 
-  const categories: AnalyticsCategory[] = ['agent', 'model', 'tool', 'approval', 'process', 'error'];
+  const categories: AnalyticsCategory[] = ['agent', 'model', 'tool', 'approval', 'process', 'other', 'error'];
   const categoryLabels: Record<AnalyticsCategory, string> = {
-    agent: 'Agent', model: 'Model', tool: 'Tool', approval: 'Approval', process: 'Process', error: 'Issue'
+    agent: 'Agent', model: 'Model', tool: 'Tool', approval: 'Approval', process: 'Process', other: 'Other', error: 'Issue'
   };
   const categoryColors: Record<AnalyticsCategory, string> = {
     agent: 'var(--blue-strong, #9eaaff)', model: 'var(--purple, #c59aff)', tool: 'var(--amber, #f5bc68)',
-    approval: 'var(--cyan, #66d8d5)', process: 'var(--green, #63dca5)', error: 'var(--red, #ff7c78)'
+    approval: 'var(--cyan, #66d8d5)', process: 'var(--green, #63dca5)', other: 'var(--muted, #8a9ab0)', error: 'var(--red, #ff7c78)'
   };
 
   const left = 42;

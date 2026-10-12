@@ -53,9 +53,13 @@
   let dragOriginX = 0;
   let suppressBinClick = false;
 
+  /** Only called for events on the clock: `view.ordered` holds those with a readable timestamp. */
   function timeOf(event: TraceEvent): number {
-    const parsed = Date.parse(event.timestamp);
-    return Number.isFinite(parsed) ? parsed : event.sequence;
+    return Date.parse(event.timestamp);
+  }
+
+  function onClock(event: TraceEvent): boolean {
+    return Number.isFinite(Date.parse(event.timestamp));
   }
 
   function issue(event: TraceEvent): boolean {
@@ -81,12 +85,16 @@
 
   const architectureModel = $derived.by(() => inferArchitecture(events));
   const view = $derived.by(() => {
-    const ordered = [...events].sort((a, b) => timeOf(a) - timeOf(b) || a.sequence - b.sequence);
+    // An event whose timestamp cannot be read has no place on the clock. It is counted, not guessed:
+    // placing it by sequence number would put it in 1970 and stretch the ruler to decades.
+    const ordered = events.filter(onClock).sort((a, b) => timeOf(a) - timeOf(b) || a.sequence - b.sequence);
+    const unplaced = events.length - ordered.length;
     const model = architectureModel;
-    if (!ordered.length) return { ordered, model, start: 0, end: 0, span: 1, bins: [] as Bin[], windowEvents: [] as TraceEvent[], selected: null as TraceEvent | null, hottest: null as Bin | null, firstIssue: null as TraceEvent | null, maxBin: 1 };
+    if (!ordered.length) return { ordered, unplaced, model, start: 0, end: 0, span: 1, bins: [] as Bin[], windowEvents: [] as TraceEvent[], selected: null as TraceEvent | null, hottest: null as Bin | null, firstIssue: null as TraceEvent | null, maxBin: 1 };
     const start = timeOf(ordered[0]);
-    // reduce, not Math.max(...values): spreading a large journal overflows the call stack.
-    const end = ordered.reduce((latest, event) => Math.max(latest, timeOf(event) + Math.max(0, event.duration_ms || 0)), start);
+    // The run ends when its last event was received. A reported duration is elapsed time that ended
+    // at the event, so it is not projected past it (the same rule as analysis.traceTimeBounds).
+    const end = timeOf(ordered[ordered.length - 1]);
     const span = Math.max(1, end - start);
     const binCount = Math.min(24, Math.max(10, Math.ceil(Math.sqrt(ordered.length) * 2.4)));
     const bins: Bin[] = Array.from({ length: binCount }, (_, index) => ({
@@ -105,7 +113,7 @@
     }
     const maxBin = Math.max(1, ...bins.map((bin) => bin.count));
     const hottest = [...bins].sort((a, b) => b.count - a.count || b.issues - a.issues)[0] ?? null;
-    const firstIssue = [...ordered].reverse().find(issue) ?? null;
+    const firstIssue = ordered.find(issue) ?? null;
     const hasWindow = windowStartMs !== null && windowEndMs !== null;
     const windowEvents = hasWindow
       ? ordered.filter((event) => {
@@ -115,7 +123,7 @@
         })
       : ordered;
     const selected = ordered.find((event) => event.event_id === selectedEventId) ?? null;
-    return { ordered, model, start, end, span, bins, maxBin, hottest, firstIssue, windowEvents, selected };
+    return { ordered, unplaced, model, start, end, span, bins, maxBin, hottest, firstIssue, windowEvents, selected };
   });
 
   const activeWindowLabel = $derived(windowStartMs !== null && windowEndMs !== null
@@ -123,6 +131,18 @@
     : 'Entire run');
   const focusIds = $derived(new Set((focusEvents ?? events).map((event) => event.event_id)));
   const focusActive = $derived(focusEvents !== null && focusEvents.length !== events.length);
+  const windowActive = $derived(windowStartMs !== null && windowEndMs !== null);
+  /** What the map highlights: the events inside the time range that the filters also keep. */
+  const diagramFocus = $derived.by(() => {
+    if (!windowActive) return focusEvents;
+    return focusEvents === null ? view.windowEvents : view.windowEvents.filter((event) => focusIds.has(event.event_id));
+  });
+  /** Connections with at least one of their events inside the time range. */
+  const windowConnections = $derived.by(() => {
+    if (!windowActive) return view.model.connections.length;
+    const inWindow = new Set(view.windowEvents.map((event) => event.event_id));
+    return view.model.connections.filter((connection) => connection.eventIds.some((id) => inWindow.has(id))).length;
+  });
   const displayedStart = $derived(dragMode ? draftStart : windowStartMs);
   const displayedEnd = $derived(dragMode ? draftEnd : windowEndMs);
   const rulerActors = $derived.by(() => {
@@ -251,7 +271,7 @@
     </div>
   </header>{/if}
 
-  {#if !view.ordered.length}
+  {#if !events.length}
     <div class="empty" role="status">
       <strong>No architecture evidence yet</strong>
       <span>Record actor IDs plus delegation, spawn, or parent links to reconstruct the system.</span>
@@ -338,23 +358,25 @@
           <span><i class="legend-issue"></i>Issue</span>
           <span><i class="legend-range"></i>Selected range</span>
         </div>
-        <strong>{activeWindowLabel} · {view.windowEvents.length} event{view.windowEvents.length === 1 ? '' : 's'}</strong>
+        <strong>{activeWindowLabel} · {view.windowEvents.length} event{view.windowEvents.length === 1 ? '' : 's'}{view.unplaced ? ` · ${view.unplaced} without a readable timestamp, not on the ruler` : ''}</strong>
       </div>
     </section>{/if}
 
     {#if showDiagram}
       <div class="architecture-scope">
-        <div><span>Diagram scope</span><strong>{activeWindowLabel}</strong><small>{windowStartMs === null ? 'All recorded evidence' : 'Only actors and links observed in this window'}</small></div>
+        <div><span>Diagram scope</span><strong>{activeWindowLabel}</strong><small>{windowStartMs === null ? 'All recorded evidence' : 'Range highlighted on the full-run map; structure is unchanged'}</small></div>
+        {#if windowActive}<div class="window-truth"><span>In this range</span><strong>{view.windowEvents.length} event{view.windowEvents.length === 1 ? '' : 's'} · {windowConnections} of {view.model.connections.length} connection{view.model.connections.length === 1 ? '' : 's'}</strong><small>Actors and links outside it are dimmed, not removed</small></div>{/if}
         {#if focusActive}<div class="focus-truth"><span>Active focus</span><strong>{focusEvents?.length ?? 0} of {events.length} events highlighted</strong><small>Filters dim evidence; they do not rewrite the topology</small></div>{/if}
         <div><span>Timing truth</span><strong>Collector receipt time</strong><small>Actor bands are derived—not execution latency</small></div>
         {#if view.model.unresolvedParents.length}<div class="warning"><span>Coverage</span><strong>{view.model.unresolvedParents.length} unresolved parent{view.model.unresolvedParents.length === 1 ? '' : 's'}</strong><small>No relationship was invented</small></div>{/if}
+        {#if view.unplaced}<div class="warning"><span>Timing coverage</span><strong>{view.unplaced} event{view.unplaced === 1 ? '' : 's'} without a readable timestamp</strong><small>Counted on the map, left off the time ruler</small></div>{/if}
       </div>
 
-      {#if view.windowEvents.length}
-        <AgentTopology events={view.windowEvents} focusEvents={focusEvents === null ? null : view.windowEvents.filter((event) => focusIds.has(event.event_id))} {selectedActor} {onactor} {onselect} />
-      {:else}
+      {#if windowActive && !view.windowEvents.length}
         <div class="window-empty" role="status"><strong>No evidence in this range</strong><button onclick={() => onwindow(null, null)}>Clear range</button></div>
       {/if}
+      <!-- The map is always the whole run: a time range or filter highlights, it never re-infers. -->
+      <AgentTopology {events} model={view.model} focusEvents={diagramFocus} {selectedActor} {onactor} {onselect} />
     {/if}
   {/if}
 </section>
@@ -369,6 +391,7 @@
   .detection-summary span, .detection-summary strong { padding: 4px 7px; border: 1px solid rgba(255,255,255,.08); border-radius: 999px; color: #8796aa; background: rgba(255,255,255,.025); font-size: 9px; font-weight: 700; }
   .detection-summary strong { display: inline-flex; align-items: center; gap: 5px; color: #8de3bc; }
   .detection-summary strong i { width: 5px; height: 5px; border-radius: 50%; background: #63dca5; box-shadow: 0 0 9px rgba(99,220,165,.5); }
+  .window-empty { min-height: 72px !important; }
   .empty, .window-empty { display: grid; min-height: 260px; place-content: center; justify-items: center; gap: 8px; padding: 30px; border: 1px solid rgba(255,255,255,.075); color: #7f8da1; text-align: center; }
   .empty strong, .window-empty strong { color: #dfe6f0; font-size: 14px; }
   .empty span { max-width: 420px; font-size: 11px; line-height: 1.5; }

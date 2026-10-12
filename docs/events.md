@@ -140,7 +140,27 @@ When `actor_type` is empty or anything else, the viewer treats the actor as a
 process if its `actor_id` is empty or `root`, or the kind starts with
 `process.`, and as an agent otherwise. The viewer groups an empty `actor_id`
 under `root`. `premier query` prints it as `-`, because an event without an
-actor is unattributed, not the root process.
+actor is unattributed, not the root process. In the topology an event without
+an `actor_id` never changes the role of the actor it is grouped under, and
+that actor is marked as inferred instead of recorded.
+
+## Viewer categories
+
+The viewer's filter tabs file an event by the text before the first `.` of
+its `kind`, compared without regard to case:
+
+| Kind starts with | Tab |
+| --- | --- |
+| `agent.` | agents |
+| `model.`, `llm.` | models |
+| `tool.`, `mcp.` | tools |
+| `approval.` | decisions |
+| `process.`, `session.`, `adapter.` | runtime |
+| anything else, or no `.` | other |
+
+The `other` tab appears only when a run has such events. `issues` is not a
+family: it holds every event that [counts as an issue](#what-counts-as-an-issue),
+whatever its kind, and such an event is also counted under its own tab.
 
 ## Causality fields
 
@@ -155,9 +175,9 @@ resolved to the ids of events the adapter stored earlier (see
 | --- | --- | --- |
 | `parent_event_id` | The `event_id` of the event that directly caused this one. | The inspector's parent and children. Timeline nesting depth. The ancestors and effects of a failure in the investigation chain. Connections between actors in the topology and architecture views. |
 | `span_id` | Names a unit of work. Several events can share one span; the earliest is the span's opener. | Resolves `parent_span_id` references. Settles pending approvals. Pairs lifecycle events in the validator. |
-| `parent_span_id` | The span this event's work belongs under. | Used as the parent when `parent_event_id` is absent or does not resolve: the parent is the opener of that span. For actor connections it is used only when every event in that span has the same actor; otherwise the reference is reported as ambiguous instead of guessed. |
+| `parent_span_id` | The span this event's work belongs under. | Used as the parent when `parent_event_id` is absent or does not resolve: the parent is the opener of that span. For actor connections it is used only when every event in that span has the same actor; otherwise the reference is reported as ambiguous instead of guessed. When `parent_event_id` resolves and the span belongs to a third actor, that actor gets a derived connection as well. |
 | `correlation_id` | Ties together several records of one logical operation: a tool call and its result, a request and its decision. | The inspector lists the other events with the same id, and can filter the timeline to them. Settles pending approvals. Pulls nearby correlated events into the investigation chain. First choice for pairing lifecycle events in the validator. |
-| `links` | Other events this one refers to, by event id or span id, without a parent/child meaning. | The inspector shows outgoing links and the events that link to this one, and marks a link whose target is not in the trace. Links never create connections between actors. |
+| `links` | Other events this one refers to, by event id or span id, without a parent/child meaning. | The inspector shows outgoing links and the events that link to this one, and marks a link whose target is not in the trace. In the topology a link between two actors, like a shared `correlation_id`, is drawn as a dotted reference without direction; it is never a causal connection. |
 
 Notes:
 
@@ -168,8 +188,18 @@ Notes:
   way; `--parent-event`, `--correlation`, and `--link` set the other
   causality fields. The native adapters set spans and, where an earlier stored event is
   the cause, `parent_event_id` as well.
-- The viewer's search box matches `event_id`, `span_id`, `parent_span_id`, and
-  `correlation_id` as well as kind, source, actor, status, and payload text.
+- The viewer's search box matches what `premier query --search` matches:
+  `event_id`, `span_id`, `parent_span_id`, `parent_event_id`,
+  `correlation_id`, `links`, and the timestamp, as well as kind, source,
+  actor, status, the payload as JSON text (so key names match), and every
+  payload string as recorded, with and without terminal control sequences.
+- The inspector, the timeline's nesting depth, and the topology resolve a
+  parent by one rule. Depth and elapsed time in the timeline are measured
+  against the whole run, so they do not change with a filter or time range.
+- The inspector's Relations count is the number of related events that can be
+  opened: the parent, children, correlated events, resolved links, and events
+  linking here. Identifiers that resolve to nothing are listed but not
+  counted.
 - `premier diff` ignores all of these fields.
 
 ## Lifecycle validation

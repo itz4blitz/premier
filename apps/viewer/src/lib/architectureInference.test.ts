@@ -182,3 +182,72 @@ it('infers architecture for journals larger than the argument-spread limit', () 
   expect(model.scope.endMs).toBe(origin + 139_999 * 10 + 500);
   expect(model.actors.find((actor) => actor.id === 'worker')?.window?.endMs).toBe(origin + 139_999 * 10 + 500);
 }, 60_000);
+
+describe('review findings: windows, references, attribution, and downstream issues', () => {
+  it('keeps the full-run structure when a predicate narrows what is shown', () => {
+    const delegation = event(1, 'coordinator', 'agent.delegation');
+    const spawn = event(2, 'researcher', 'agent.spawn', { parent_event_id: delegation.event_id });
+    const late = event(3, 'coordinator', 'agent.turn');
+    const work = event(4, 'researcher', 'tool.execution', { parent_event_id: delegation.event_id });
+    const journal = [delegation, spawn, late, work];
+    // Inferring on the cropped subset loses the edge: its parent event is outside the crop.
+    expect(inferArchitecture([late, work]).connections).toHaveLength(0);
+    // Inferring on the journal with the crop as a predicate keeps it and says the parent is out of view.
+    const cropped = inferArchitecture(journal, { predicate: (candidate) => candidate.sequence >= 3 });
+    expect(cropped.connections).toEqual([expect.objectContaining({
+      sourceActorId: 'coordinator', targetActorId: 'researcher', eventIds: [work.event_id], parentEvidenceInScope: false
+    })]);
+    expect(cropped.unresolvedParents).toEqual([]);
+  });
+
+  it('turns links and shared correlation ids into undirected references, never into causal connections', () => {
+    const request = event(1, 'coordinator', 'agent.message', { correlation_id: 'job-1' });
+    const answer = event(2, 'researcher', 'agent.turn', { correlation_id: 'job-1' });
+    const finding = event(3, 'auditor', 'agent.turn');
+    const join = event(4, 'coordinator', 'agent.join', { links: [finding.event_id, 'not-recorded'] });
+    const result = inferArchitecture([request, answer, finding, join]);
+    expect(result.connections).toEqual([]);
+    expect(result.references).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceActorId: 'coordinator', targetActorId: 'researcher', sources: ['correlation'], eventIds: [answer.event_id], causallyConnected: false }),
+      expect.objectContaining({ sourceActorId: 'coordinator', targetActorId: 'auditor', sources: ['link'], eventIds: [join.event_id], confidence: 'recorded' })
+    ]));
+    expect(result.references).toHaveLength(2);
+  });
+
+  it('falls back to the parent span when the parent event id is not in the journal', () => {
+    const parent = event(1, 'coordinator', 'agent.delegation', { span_id: 'delegation' });
+    const child = event(2, 'researcher', 'agent.spawn', { parent_event_id: 'not-recorded', parent_span_id: 'delegation' });
+    const result = inferArchitecture([parent, child]);
+    expect(result.connections[0]).toMatchObject({ sourceActorId: 'coordinator', targetActorId: 'researcher', sources: ['parent-span'], confidence: 'high' });
+    expect(result.unresolvedParents).toEqual([]);
+  });
+
+  it('keeps a parent span owned by a third actor instead of dropping it for the event parent', () => {
+    const plan = event(1, 'planner', 'agent.turn', { span_id: 'plan' });
+    const call = event(2, 'coordinator', 'tool.call');
+    const work = event(3, 'researcher', 'tool.execution', { parent_event_id: call.event_id, parent_span_id: 'plan' });
+    const result = inferArchitecture([plan, call, work]);
+    expect(result.connections).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceActorId: 'coordinator', targetActorId: 'researcher', confidence: 'recorded' }),
+      expect.objectContaining({ sourceActorId: 'planner', targetActorId: 'researcher', sources: ['parent-span'], confidence: 'high' })
+    ]));
+  });
+
+  it('does not let an event without actor_id relabel the recorder process as an agent', () => {
+    const start = event(1, 'root', 'session.start', { actor_type: 'process' });
+    const stray = event(2, '', 'agent.turn', { actor_id: '', actor_type: 'agent' });
+    const [root] = inferArchitecture([start, stray]).actors;
+    expect(root).toMatchObject({ id: 'root', role: 'process', eventCount: 2, unattributedEventCount: 1, confidence: 'high', source: 'fallback-root' });
+    const typed = inferArchitecture([event(1, 'helper', 'agent.turn', { actor_type: 'Worker' })]).actors[0];
+    expect(typed).toMatchObject({ role: 'agent', roleSource: 'inferred', recordedTypes: ['Worker'] });
+    expect(inferArchitecture([event(1, 'helper', 'agent.turn', { actor_type: 'subagent' })]).actors[0]).toMatchObject({ role: 'subagent', roleSource: 'recorded' });
+  });
+
+  it('rolls issues recorded downstream of a handoff into the connection', () => {
+    const delegation = event(1, 'coordinator', 'agent.delegation');
+    const spawn = event(2, 'researcher', 'agent.spawn', { parent_event_id: delegation.event_id });
+    const failed = event(3, 'researcher', 'tool.error', { parent_event_id: spawn.event_id, status: 'error' });
+    const [connection] = inferArchitecture([delegation, spawn, failed]).connections;
+    expect(connection).toMatchObject({ issueCount: 0, downstreamIssueCount: 1 });
+  });
+});

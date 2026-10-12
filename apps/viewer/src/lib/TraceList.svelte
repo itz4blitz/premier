@@ -1,6 +1,6 @@
 <script lang="ts">
   import { deriveRunIdentity } from './runIdentity';
-  import { isAbandoned, isRecording, listKey, type TraceManifest } from './types';
+  import { isAbandoned, isRecording, isUnreadable, listKey, type TraceManifest } from './types';
   import { PanelLeftOpen } from '@lucide/svelte';
 
   type RunFilter = 'all' | 'issues' | 'live';
@@ -28,6 +28,8 @@
 
   function duration(trace: TraceManifest): string {
     if (isAbandoned(trace)) return 'Abandoned — run premier recover';
+    // A locked, unsupported or damaged entry has no end time because it could not be read, not because it is running.
+    if (isUnreadable(trace)) return 'Not readable here';
     if (!trace.ended_at) return 'Live';
     const milliseconds = Math.max(0, Date.parse(trace.ended_at) - Date.parse(trace.started_at));
     if (milliseconds < 1000) return `${milliseconds} ms`;
@@ -55,7 +57,7 @@
   }
 
   function health(trace: TraceManifest): { label: string; tone: 'success' | 'warning' | 'error' | 'live' } {
-    if (trace.integrity === 'invalid') return { label: 'Unverified', tone: 'error' };
+    if (trace.integrity === 'invalid') return { label: isUnreadable(trace) ? 'Damaged' : 'Unverified', tone: 'error' };
     if (trace.integrity === 'locked') return { label: 'Encrypted · key required', tone: 'warning' };
     if (trace.integrity === 'unsupported') return { label: 'Needs a newer Premier', tone: 'warning' };
     if (isAbandoned(trace)) return { label: 'Abandoned', tone: 'warning' };
@@ -63,6 +65,16 @@
     if ((trace.summary?.issue_count ?? 0) > 0) return { label: 'Needs attention', tone: 'warning' };
     if (!trace.ended_at || trace.integrity === 'live') return { label: 'Running', tone: 'live' };
     return { label: 'Passed', tone: 'success' };
+  }
+
+  /** Why an entry cannot be opened, in the server's words, with a fallback per state. */
+  function unreadableReason(trace: TraceManifest): string | null {
+    if (!isUnreadable(trace)) return null;
+    const detail = trace.integrity_detail?.trim();
+    if (detail) return detail;
+    if (trace.integrity === 'locked') return 'This trace is encrypted. Restart premier with --key-file to read it.';
+    if (trace.integrity === 'unsupported') return 'This trace was written by a newer Premier. Upgrade premier to read it.';
+    return 'This trace is damaged: its manifest or journal cannot be read.';
   }
 
   function outcome(trace: TraceManifest): string {
@@ -134,10 +146,12 @@
             {#if isAbandoned(trace)}<span class="abandoned-badge" title={trace.integrity_detail || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.'}>Abandoned</span>
             {:else if trace.integrity === 'locked'}<span class="abandoned-badge" title={trace.integrity_detail || 'This trace is encrypted. Restart premier with --key-file to read it.'}>Locked</span>
             {:else if trace.integrity === 'unsupported'}<span class="abandoned-badge" title={trace.integrity_detail || 'This trace was written by a newer Premier. Upgrade premier to read it.'}>Newer format</span>
-            {:else if !trace.ended_at}<span class="live-badge">Live</span>{/if}
+            {:else if isUnreadable(trace)}<span class="abandoned-badge" title={unreadableReason(trace)}>Damaged</span>
+            {:else if isRecording(trace)}<span class="live-badge">Live</span>{/if}
             {#if listKey(trace) === selectedId && !matchingTraces.some((item) => listKey(item) === listKey(trace))}<span class="outside-badge">Pinned</span>{/if}
           </span>
           <span class="run-outcome" data-tone={health(trace).tone}>{outcome(trace)}</span>
+          {#if unreadableReason(trace)}<span class="run-reason">{unreadableReason(trace)}</span>{/if}
           <span class="run-foot" title={new Date(trace.started_at).toLocaleString()}>
             <time datetime={trace.started_at}>{when(trace)}</time>
             <span aria-hidden="true">·</span><span>{trace.ended_at && !isAbandoned(trace) ? `captured ${duration(trace)}` : duration(trace)}</span>
@@ -157,6 +171,7 @@
 </aside>
 
 <style>
+  .run-reason { display: block; margin-top: 3px; color: #c9a676; font-size: 10px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
   .trace-list { container-type: inline-size; display: grid; grid-template-rows: auto minmax(0, 1fr); background: #050505; }
   .trace-list.compact {
     width: 100%;

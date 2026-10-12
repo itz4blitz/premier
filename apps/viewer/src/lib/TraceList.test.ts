@@ -102,4 +102,28 @@ describe('TraceList', () => {
     await userEvent.click(run);
     expect(onselect).toHaveBeenCalledWith(trace);
   });
+
+  it('shows why a locked, unsupported or damaged entry cannot be opened, and never calls it live', async () => {
+    const unreadable = { ...trace, format_version: 0, ended_at: null, exit_code: null, journal: null, summary: undefined };
+    const locked = { ...unreadable, trace_id: 'locked:sealed.atrace', artifact: 'sealed.atrace', name: 'Sealed run', integrity: 'locked' as const, integrity_detail: 'This trace is encrypted and premier was started without --key-file.' };
+    const newer = { ...unreadable, trace_id: 'unsupported:next.atrace', artifact: 'next.atrace', name: 'Next run', integrity: 'unsupported' as const, integrity_detail: 'Format version 9; this build reads 1 and 2.' };
+    const damaged = { ...unreadable, trace_id: 'damaged:broken.atrace', artifact: 'broken.atrace', name: 'Broken run', integrity: 'invalid' as const, integrity_detail: 'manifest.json is not valid JSON.' };
+    render(TraceList, { props: { traces: [locked, newer, damaged], selectedId: null, onselect: vi.fn() } });
+
+    for (const [name, badge, detail] of [
+      ['Sealed run', 'Locked', locked.integrity_detail],
+      ['Next run', 'Newer format', newer.integrity_detail],
+      ['Broken run', 'Damaged', damaged.integrity_detail]
+    ]) {
+      const row = screen.getByRole('button', { name: new RegExp(name) });
+      expect(row.querySelector('.abandoned-badge')).toHaveTextContent(badge);
+      expect(row.querySelector('.live-badge')).toBeNull();
+      // The reason is text on the row, not only a hover title.
+      expect(row.querySelector('.run-reason')).toHaveTextContent(detail);
+      expect(row).not.toHaveTextContent(/\bLive\b|Running/);
+    }
+    expect(screen.getByRole('button', { name: /Broken run/ })).toHaveAccessibleName(/Damaged/);
+    await userEvent.click(screen.getByRole('button', { name: 'Live' }));
+    expect(screen.getByRole('status')).toHaveTextContent('No live runs');
+  });
 });

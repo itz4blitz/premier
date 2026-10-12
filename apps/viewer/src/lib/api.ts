@@ -8,6 +8,14 @@ import type {
 
 export type StreamState = 'connecting' | 'live' | 'reconnecting' | 'recorded' | 'abandoned' | 'disconnected';
 
+/** A failed request, with the HTTP status so callers can tell "sign in" from "try again". */
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -24,7 +32,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const message = response.status === 401
       ? 'Authentication is required.'
       : detail || `Request failed (${response.status}).`;
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   return response.json() as Promise<T>;
 }
@@ -75,18 +83,29 @@ export const api = {
       onState(state);
     };
 
+    /** A frame that is not JSON is dropped: one bad frame must not throw inside the listener. */
+    const decode = <T>(message: Event): T | null => {
+      try {
+        return JSON.parse((message as MessageEvent).data) as T;
+      } catch {
+        return null;
+      }
+    };
+
     source.onopen = () => {
       if (!closed) onState('live');
     };
     source.addEventListener('trace.event', (message) => {
       if (closed) return;
-      onEvent(JSON.parse((message as MessageEvent).data) as TraceEvent);
+      const event = decode<TraceEvent>(message);
+      if (event) onEvent(event);
     });
     source.addEventListener('trace.complete', (message) => {
       if (closed) return;
+      const manifest = decode<TraceManifest>(message);
+      // Without its manifest the stream is over all the same; the list poll supplies the final state.
       completed = true;
-      const manifest = JSON.parse((message as MessageEvent).data) as TraceManifest;
-      onComplete?.(manifest);
+      if (manifest) onComplete?.(manifest);
       close('recorded');
     });
     // The server's other terminal event: the recorder is gone, so nothing more will arrive. Its
@@ -94,8 +113,8 @@ export const api = {
     source.addEventListener('trace.abandoned', (message) => {
       if (closed) return;
       completed = true;
-      const manifest = JSON.parse((message as MessageEvent).data) as TraceManifest;
-      onComplete?.(manifest);
+      const manifest = decode<TraceManifest>(message);
+      if (manifest) onComplete?.(manifest);
       close('abandoned');
     });
     // The server gave up on a trace it can no longer read (deleted, damaged, or its key gone):
@@ -107,7 +126,13 @@ export const api = {
     });
     source.onerror = () => {
       if (closed || completed) return;
-      // EventSource reconnects automatically; surface reconnecting until complete arrives.
+      // A response the browser will not retry (a 404, 401 or 502, or one that is not an event
+      // stream) leaves the source CLOSED. Saying "reconnecting" then would never come true.
+      if (source.readyState === 2 /* EventSource.CLOSED */) {
+        close('disconnected');
+        return;
+      }
+      // Otherwise EventSource reconnects automatically; surface reconnecting until complete arrives.
       onState('reconnecting');
     };
     return () => close(completed ? 'recorded' : 'disconnected');

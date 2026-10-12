@@ -221,4 +221,36 @@ describe('stream API', () => {
     expect(states).toEqual(['live', 'abandoned']);
     expect(source.closed).toBe(true);
   });
+
+  it('reports disconnected when the browser has given up on the stream', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    const states: string[] = [];
+    api.stream('trace-1', () => undefined, (state) => states.push(state));
+    const source = FakeEventSource.instances[0] as unknown as { readyState: number; onerror: ((event: Event) => void) | null; closed: boolean };
+    // What a 404, 401 or 502 answer leaves behind: EventSource.CLOSED, with no retry scheduled.
+    source.readyState = 2;
+    source.onerror?.(new Event('error'));
+    source.onerror?.(new Event('error'));
+    expect(states).toEqual(['disconnected']);
+    expect(source.closed).toBe(true);
+  });
+
+  it('drops a frame that is not JSON instead of throwing inside the listener', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    const events: unknown[] = [];
+    const states: string[] = [];
+    api.stream('trace-1', (event) => events.push(event), (state) => states.push(state));
+    const source = FakeEventSource.instances[0] as unknown as { listeners: Map<string, Array<(event: MessageEvent) => void>> };
+    const send = (type: string, data: string) => source.listeners.get(type)?.forEach((listener) => listener({ data } as MessageEvent));
+    expect(() => send('trace.event', '{"event_id": tru')).not.toThrow();
+    send('trace.event', '{"event_id":"ok"}');
+    expect(events).toEqual([{ event_id: 'ok' }]);
+    expect(() => send('trace.complete', 'not json')).not.toThrow();
+    expect(states).toEqual(['recorded']);
+  });
+
+  it('carries the HTTP status on a failed request', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 401 }));
+    await expect(api.traces()).rejects.toMatchObject({ name: 'ApiError', status: 401, message: 'Authentication is required.' });
+  });
 });

@@ -832,3 +832,171 @@ it('reloads the open trace when a live trace is finalized without a stream compl
     vi.unstubAllGlobals();
   }
 });
+
+function capturePolls() {
+  const polls: Array<() => void> = [];
+  const realSetInterval = window.setInterval.bind(window);
+  vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler, timeout?: number, ...rest: unknown[]) => {
+    if (timeout === 4000 && typeof handler === 'function') {
+      polls.push(handler as () => void);
+      return 0;
+    }
+    return realSetInterval(handler, timeout, ...rest);
+  }) as typeof window.setInterval);
+  return polls;
+}
+
+it('shows why a locked trace cannot be opened instead of "trace not found" and "Running"', async () => {
+  const locked: TraceManifest = {
+    format_version: 0, trace_id: 'locked:sealed.atrace', artifact: 'sealed.atrace', name: 'Sealed run', command: ['agent'],
+    started_at: '2026-01-01T00:00:00Z', ended_at: null, exit_code: null, journal: null,
+    integrity: 'locked', integrity_detail: 'This trace is encrypted and premier was started without --key-file.'
+  };
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify([locked]), { status: 200 });
+    // What the server answers for an entry it cannot read.
+    return new Response(JSON.stringify({ error: 'trace not found' }), { status: 404 });
+  });
+  const sources: string[] = [];
+  vi.stubGlobal('EventSource', class { constructor(url: string) { sources.push(url); } addEventListener() {} close() {} });
+  try {
+    render(App);
+    const reason = await screen.findByRole('status', { name: 'Why this trace cannot be opened' });
+    expect(reason).toHaveTextContent('This trace is encrypted and no key that opens it was given');
+    expect(reason).toHaveTextContent('premier was started without --key-file');
+    expect(screen.queryByText('Trace could not be opened')).not.toBeInTheDocument();
+    expect(screen.queryByText(/trace not found/i)).not.toBeInTheDocument();
+    const header = screen.getByLabelText('Current run');
+    expect(header).toHaveTextContent('Locked');
+    expect(header).not.toHaveTextContent('Running');
+    expect(document.querySelector('.connection')).toHaveTextContent('LOCKED');
+    expect(screen.getByRole('button', { name: 'Ask AI' })).toBeDisabled();
+    // Nothing was requested for it, and no stream was opened on it.
+    expect(fetchMock.mock.calls.map(([input]) => String(input)).filter((url) => !url.endsWith('/api/traces'))).toEqual([]);
+    expect(sources).toEqual([]);
+    expect(new URL(window.location.href).searchParams.get('trace')).toBe('sealed.atrace');
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+function seedSession() {
+  sessionStorage.setItem('premier.viewer.session.v1', JSON.stringify({
+    version: 1, savedAt: Date.now(), traces: [trace], selectedTrace: trace, events, selectedSequence: 2
+  }));
+  window.history.replaceState({}, '', '/?trace=investigation.atrace');
+}
+
+it('drops cached evidence and clears the loading state when a reload is answered 401', async () => {
+  seedSession();
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 401 }));
+  render(App);
+  expect(await screen.findByText('Viewer unavailable')).toBeInTheDocument();
+  expect(screen.getByText('Authentication is required.')).toBeInTheDocument();
+  expect(document.querySelector('.run-shell')).not.toBeInTheDocument();
+  expect(screen.queryByText('tool.execution')).not.toBeInTheDocument();
+  expect(document.querySelector('[aria-busy="true"]')).not.toBeInTheDocument();
+  expect(sessionStorage.getItem('premier.viewer.session.v1')).toBeNull();
+});
+
+it('labels a saved copy as such when the server cannot be reached on reload', async () => {
+  seedSession();
+  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'));
+  render(App);
+  const notice = await screen.findByRole('alert');
+  expect(notice).toHaveTextContent('Viewer server unreachable');
+  expect(notice).toHaveTextContent('copy of the run saved in this tab');
+  expect(screen.queryByText('Trace could not be opened')).not.toBeInTheDocument();
+  expect(document.querySelector('.run-shell')).toHaveAttribute('aria-busy', 'false');
+  expect(document.querySelector('.trace-load-progress')).not.toBeInTheDocument();
+  expect(document.querySelector('.connection')).toHaveTextContent('DISCONNECTED');
+});
+
+it('keeps the app bar usable on the empty screen and opens the dialogs its buttons promise', async () => {
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+  render(App);
+  expect(await screen.findByText('No traces yet')).toBeInTheDocument();
+  const bar = document.querySelector('.app-bar') as HTMLElement;
+  expect(screen.getByRole('button', { name: 'Ask AI' })).toBeDisabled();
+
+  await fireEvent.click(screen.getByRole('button', { name: 'Runs' }));
+  expect(screen.getByRole('dialog', { name: 'All runs' })).toBeInTheDocument();
+  expect(bar.inert).toBe(true);
+  await fireEvent.click(screen.getByRole('button', { name: 'Close runs' }));
+  expect(bar.inert).toBe(false);
+
+  await fireEvent.keyDown(window, { key: '?' });
+  expect(screen.getByRole('dialog', { name: 'Keyboard shortcuts' })).toBeInTheDocument();
+  await fireEvent.keyDown(window, { key: 'Escape' });
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(bar.inert).toBe(false);
+});
+
+it('refreshes a run row when the poll brings new counts, so a run with issues is not left reading Passed', async () => {
+  const listed = (issues: number, count: number): TraceManifest => ({ ...trace, summary: { display_name: null, actor_count: 2, issue_count: issues, event_count: count } });
+  let available = [listed(0, 2)];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify(available), { status: 200 });
+    if (url.includes('/events')) return new Response(JSON.stringify(events), { status: 200 });
+    return new Response(JSON.stringify(trace), { status: 200 });
+  });
+  const polls = capturePolls();
+  render(App);
+  const row = await screen.findByRole('button', { name: /Investigation\. Passed.*2 events/ });
+  expect(row).toBeInTheDocument();
+  await waitFor(() => expect(polls).toHaveLength(1));
+  // Same run, same end time, same integrity: only the counts moved.
+  available = [listed(3, 9)];
+  polls[0]();
+  expect(await screen.findByRole('button', { name: /Investigation\. Needs attention · 3 issues.*9 events/ })).toBeInTheDocument();
+});
+
+it('keeps the scope a history entry carries when Back lands on a different run', async () => {
+  const other: TraceManifest = { ...trace, trace_id: 'trace-2', artifact: 'other.atrace', name: 'Other run' };
+  const otherEvents = events.map((event) => ({ ...event, trace_id: 'trace-2', event_id: `other-${event.event_id}`, parent_event_id: event.parent_event_id ? `other-${event.parent_event_id}` : '' }));
+  mockWorkspace([trace, other], { 'trace-1': events, 'trace-2': otherEvents });
+  render(App);
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Investigation'));
+
+  // What Back does: the URL becomes an earlier entry, here a scoped view of the other run.
+  window.history.replaceState({}, '', '/?trace=other.atrace&kind=tool&actor=agent');
+  window.dispatchEvent(new PopStateEvent('popstate'));
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Other run'));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'tools' })).toHaveAttribute('aria-pressed', 'true'));
+  const params = new URL(window.location.href).searchParams;
+  expect(params.get('kind')).toBe('tool');
+  expect(params.get('actor')).toBe('agent');
+  expect(screen.getAllByRole('option')).toHaveLength(1);
+
+  // A switch made in the app still starts the next run unscoped.
+  await fireEvent.click(screen.getByRole('button', { name: /^Investigation\./ }));
+  await waitFor(() => expect(new URL(window.location.href).searchParams.get('trace')).toBe('investigation.atrace'));
+  expect(new URL(window.location.href).searchParams.has('kind')).toBe(false);
+});
+
+it('drops a stale event_id when recovering from a dead link', async () => {
+  window.history.replaceState({}, '', '/?trace=missing-trace&event_id=event-from-elsewhere');
+  mockWorkspace([trace]);
+  render(App);
+  expect(await screen.findByText('Trace not found')).toBeInTheDocument();
+  await fireEvent.click(screen.getByRole('button', { name: 'Open the latest available run' }));
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(screen.queryByText('Linked event not found')).not.toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('event_id')).not.toBe('event-from-elsewhere');
+});
+
+it('reveals a related event that the active filter was hiding', async () => {
+  window.history.replaceState({}, '', '/?trace=investigation.atrace&kind=tool&event_id=event-2');
+  mockWorkspace();
+  render(App);
+  await waitFor(() => expect(screen.getByRole('complementary', { name: 'Event inspector' })).toHaveTextContent('rg'));
+  expect(screen.getAllByRole('option')).toHaveLength(1);
+  await fireEvent.click(screen.getByRole('tab', { name: /Relations/ }));
+  await fireEvent.click(screen.getByRole('button', { name: /event-1/ }));
+  // The parent is a session event, outside the tools filter: the scope is cleared to show it.
+  await waitFor(() => expect(screen.getByRole('option', { name: /session\.start/ })).toHaveAttribute('aria-selected', 'true'));
+  expect(new URL(window.location.href).searchParams.has('kind')).toBe(false);
+  expect(screen.getByRole('tab', { name: /Relations/ })).toHaveAttribute('aria-selected', 'true');
+});

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actorInventory, awaitingApprovals, categoryOf, countByCategory, eventSummary, filterEvents, isIssue, isProcessNoise, materialEvent, runHealth, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
+import { actorInventory, awaitingApprovals, categoryOf, countByCategory, eventSummary, familyOf, filterEvents, isIssue, isProcessNoise, materialEvent, runHealth, stripControlSequences, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
 import type { TraceEvent, TraceManifest } from './types';
 
 function event(sequence: number, actor: string, kind: string, status = 'ok'): TraceEvent {
@@ -262,7 +262,8 @@ describe('traceTimeBounds', () => {
   it('measures journals larger than the argument-spread limit', () => {
     // Math.min(...values) throws a RangeError above roughly 125k arguments.
     const bounds = traceTimeBounds(largeJournal(140_000));
-    expect(bounds).toEqual({ start: Date.parse('2026-07-13T12:00:00.000Z'), span: 139_999 * 10 + 500 });
+    // The last event reports 500 ms of elapsed work; that ended when it was received.
+    expect(bounds).toEqual({ start: Date.parse('2026-07-13T12:00:00.000Z'), span: 139_999 * 10 });
   }, 60_000);
 
   it('ignores unparseable timestamps and reports null when none are usable', () => {
@@ -297,5 +298,66 @@ describe('process.spawn_failed', () => {
     expect(eventSummary({ ...spawnFailed, payload_json: '{"exit_code":126}' })).toBe('Failed to start the command');
     // A real exit keeps its own wording.
     expect(eventSummary({ ...spawnFailed, kind: 'process.exit', payload_json: '{"exit_code":127}' })).toBe('Exited with status 127');
+  });
+});
+
+describe('review findings: categories, search, clock, and terminal text', () => {
+  const none = { search: '', category: 'all' as const, actorId: null, errorsOnly: false, correlationId: null };
+
+  it('files kinds by a documented, case-insensitive prefix and keeps unknown ones out of agents', () => {
+    const family = (kind: string) => familyOf(event(1, 'a', kind));
+    expect(family('Tool.Call')).toBe('tool');
+    expect(family('MODEL.response')).toBe('model');
+    expect(family('llm.completion')).toBe('model');
+    expect(family('mcp.request')).toBe('tool');
+    expect(family('session.start')).toBe('process');
+    expect(family('adapter.diagnostic')).toBe('process');
+    expect(family('billing.charge')).toBe('other');
+    expect(family('constructor.x')).toBe('other');
+    expect(family('heartbeat')).toBe('other');
+    const custom = event(2, 'a', 'billing.charge');
+    expect(filterEvents([custom], { ...none, category: 'agent' })).toEqual([]);
+    expect(filterEvents([custom], { ...none, category: 'other' })).toEqual([custom]);
+    expect(countByCategory([custom], 'other')).toBe(1);
+  });
+
+  it('searches payload text as it is displayed, plus parent ids and links', () => {
+    const output = {
+      ...event(1, 'root', 'process.terminal'), parent_event_id: 'cause-77', links: ['ref-alpha'],
+      payload_json: JSON.stringify({ text: '\u001b[31mbuild "failed"\u001b[0m\nline two' })
+    };
+    const other = event(2, 'root', 'process.terminal');
+    const search = (query: string) => filterEvents([output, other], { ...none, search: query });
+    for (const query of ['build "failed"', 'failed"\nline two', 'cause-77', 'REF-ALPHA']) {
+      expect(search(query), query).toEqual([output]);
+    }
+  });
+
+  it('shows terminal output without control sequences', () => {
+    const chunk = { ...event(1, 'root', 'process.terminal'), payload_json: JSON.stringify({ text: '\u001b]0;title\u0007\u001b[1;32mok\u001b[0m done\r\n' }) };
+    expect(eventSummary(chunk)).toBe('ok done');
+    expect(stripControlSequences('plain text')).toBe('plain text');
+  });
+
+  it('measures elapsed time and causal depth against the whole run, not the filtered rows', () => {
+    const at = (second: number) => `2026-07-13T12:00:0${second}.000Z`;
+    const first = { ...event(1, 'lead', 'agent.turn'), event_id: 'a', span_id: 'sa', timestamp: at(0) };
+    const middle = { ...event(2, 'lead', 'tool.call'), event_id: 'b', span_id: 'sb', parent_event_id: 'a', timestamp: at(2) };
+    const last = { ...event(3, 'worker', 'tool.result'), event_id: 'c', span_id: 'sc', parent_event_id: 'b', timestamp: at(5) };
+    const layout = timelineLayout([last], [first, middle, last]);
+    expect(layout.events[0]).toMatchObject({ depth: 2, elapsedMs: 5000 });
+    expect(timelineLayout([first, middle, last]).events.map((row) => row.depth)).toEqual([0, 1, 2]);
+  });
+
+  it('ends the run clock at the last received event and skips timestamps it cannot place', () => {
+    const [first, second] = largeJournal(2);
+    expect(traceTimeBounds([first, { ...second, duration_ms: 60_000 }])).toEqual({ start: Date.parse(first.timestamp), span: 10 });
+    expect(traceTimeBounds([first, { ...second, timestamp: 'garbage' }])).toEqual({ start: Date.parse(first.timestamp), span: 1 });
+  });
+
+  it('names a locked or unsupported trace instead of calling it running', () => {
+    const base = { format_version: 0, trace_id: 'locked:a.atrace', command: [], started_at: '2026-01-01T00:00:00Z', ended_at: null, exit_code: null, journal: null };
+    expect(runHealth({ ...base, integrity: 'locked', integrity_detail: 'No key file was given.' }, [])).toMatchObject({ label: 'Locked', detail: 'No key file was given.' });
+    expect(runHealth({ ...base, integrity: 'unsupported' }, [])).toMatchObject({ label: 'Unsupported', tone: 'warning' });
   });
 });

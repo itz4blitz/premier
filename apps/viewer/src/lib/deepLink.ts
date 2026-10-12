@@ -106,7 +106,7 @@ export function parseInvestigationParams(params: URLSearchParams): Investigation
       eventParam !== null && Number.isFinite(Number(eventParam)) ? Number(eventParam) : null,
     filters: {
       search: params.get('q') ?? '',
-      category: (['agent', 'model', 'tool', 'approval', 'process', 'error'] as EventCategory[]).includes(
+      category: (['agent', 'model', 'tool', 'approval', 'process', 'other', 'error'] as EventCategory[]).includes(
         (requestedCategory ?? '') as EventCategory
       )
         ? (requestedCategory as EventCategory)

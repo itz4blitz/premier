@@ -35,6 +35,28 @@ export function resolveSelectedEvent(
   return materialEvent(scopedEvents);
 }
 
+/**
+ * Whether a freshly polled run list differs from the one on screen in anything a row shows: which
+ * runs there are, their state, and their counts. A live run's counts change with every event, and
+ * a finished run's issue count decides whether its row reads Passed.
+ */
+export function traceListChanged(current: TraceManifest[], next: TraceManifest[]): boolean {
+  if (current.length !== next.length) return true;
+  return next.some((item, index) => {
+    const shown = current[index];
+    return listKey(item) !== listKey(shown)
+      || item.trace_id !== shown.trace_id
+      || (item.ended_at ?? null) !== (shown.ended_at ?? null)
+      || item.exit_code !== shown.exit_code
+      || item.integrity !== shown.integrity
+      || (item.integrity_detail ?? null) !== (shown.integrity_detail ?? null)
+      || item.summary?.event_count !== shown.summary?.event_count
+      || item.summary?.issue_count !== shown.summary?.issue_count
+      || item.summary?.actor_count !== shown.summary?.actor_count
+      || item.summary?.display_name !== shown.summary?.display_name;
+  });
+}
+
 /** Events requested per page. The server rejects limits above 10,000. */
 export const EVENT_PAGE_SIZE = 5_000;
 

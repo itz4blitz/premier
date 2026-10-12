@@ -16,12 +16,24 @@
   let models = $derived(countByCategory(events, 'model'));
   let participants = $derived(inventory.agents + inventory.subagents + inventory.humans + inventory.processes + inventory.systems);
   let participantDetail = $derived(
-    `${inventory.agents} coordinator${inventory.agents === 1 ? '' : 's'} · ${inventory.subagents} delegate${inventory.subagents === 1 ? '' : 's'} · ${inventory.humans} human${inventory.humans === 1 ? '' : 's'} · ${inventory.processes} runtime · ${inventory.systems} system`
+    `${inventory.agents} agent${inventory.agents === 1 ? '' : 's'} · ${inventory.subagents} delegate${inventory.subagents === 1 ? '' : 's'} · ${inventory.humans} human${inventory.humans === 1 ? '' : 's'} · ${inventory.processes} runtime · ${inventory.systems} system`
   );
   let evidenceLabel = $derived(errors ? `${errors} issue${errors === 1 ? '' : 's'}` : `${events.length} event${events.length === 1 ? '' : 's'}`);
   let evidenceDetail = $derived(
-    `${events.length} captured · ${models} model${models === 1 ? '' : 's'} · ${tools} tool${tools === 1 ? '' : 's'}${trace.integrity === 'verified' ? ` · ${integrityProtectionLabel(trace)}` : trace.integrity === 'invalid' ? ' · integrity failed' : trace.integrity === 'abandoned' ? ' · abandoned' : trace.integrity === 'live' ? ' · live' : ''}`
+    `${events.length} captured · ${models} model${models === 1 ? '' : 's'} · ${tools} tool${tools === 1 ? '' : 's'}${trace.integrity === 'verified' ? ` · ${integrityProtectionLabel(trace)}` : trace.integrity === 'invalid' ? ' · integrity failed' : trace.integrity === 'abandoned' ? ' · abandoned' : trace.integrity === 'locked' ? ' · locked' : trace.integrity === 'unsupported' ? ' · newer format' : trace.integrity === 'live' ? ' · live' : ''}`
   );
+  /** What the recorder was told to redact, from the manifest. Null for traces that predate it. */
+  let redactionDetail = $derived.by(() => {
+    const redaction = trace.redaction;
+    if (!redaction) return null;
+    const custom = redaction.custom_fields?.length ?? 0;
+    const terminal = (redaction.terminal_literal_count ?? 0) + (redaction.terminal_regex_count ?? 0) + (redaction.terminal_multiline_regex_count ?? 0);
+    return [
+      redaction.structured_defaults ? 'default secret fields' : null,
+      custom ? `${custom} custom field${custom === 1 ? '' : 's'}` : null,
+      terminal ? `${terminal} terminal rule${terminal === 1 ? '' : 's'}` : null
+    ].filter(Boolean).join(', ') || 'no rules';
+  });
   let abandoned = $derived(isAbandoned(trace));
   let abandonedDetail = $derived(trace.integrity_detail?.trim() || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.');
 </script>
@@ -36,7 +48,7 @@
       <small>Actors</small>
       <strong>{participants}</strong>
     </span>
-    <span class="stat" class:error={errors > 0 || trace.integrity === 'invalid'} title={evidenceDetail}>
+    <span class="stat" class:error={errors > 0 || trace.integrity === 'invalid'} title={`${evidenceDetail}${redactionDetail ? ` · redacted at capture: ${redactionDetail}` : ''}`}>
       <small>Evidence</small>
       <strong>{evidenceLabel}</strong>
     </span>
@@ -55,7 +67,7 @@
     <div class="run-metrics">
       <div class="outcome"><span>Outcome</span><strong data-tone={health.tone}>{health.label}</strong><small title={health.detail}>{health.detail}</small></div>
       <div class="participants"><span>Participants</span><strong>{participants}</strong><small>{participantDetail}</small></div>
-      <div class="evidence"><span>Evidence</span><strong class:error={errors > 0 || trace.integrity === 'invalid'}>{evidenceLabel}</strong><small>{evidenceDetail}</small></div>
+      <div class="evidence"><span>Evidence</span><strong class:error={errors > 0 || trace.integrity === 'invalid'}>{evidenceLabel}</strong><small>{evidenceDetail}</small>{#if redactionDetail}<small class="redaction">Redacted at capture: {redactionDetail}. Replaced values read [REDACTED].</small>{/if}</div>
     </div>
     {#if trace.integrity === 'invalid'}
       <div class="integrity-banner" role="status">

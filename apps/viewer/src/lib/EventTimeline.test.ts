@@ -235,3 +235,55 @@ it('re-windows when filters or search narrow a large trace', async () => {
   await rerender({ events: [], selectedSequence: null, onselect: vi.fn() });
   expect(screen.getByText('No matching evidence')).toBeInTheDocument();
 });
+
+function output(sequence: number, text = `line ${sequence}`): TraceEvent {
+  return { ...event, event_id: `out-${sequence}`, sequence, actor_id: 'root', actor_type: 'process', parent_event_id: '', span_id: '', parent_span_id: '', payload_json: JSON.stringify({ text }), duration_ms: 0 };
+}
+
+it('collapses output that was consecutive in the journal and calls it chunks', () => {
+  render(EventTimeline, { props: { events: [1, 2, 3, 4].map((sequence) => output(sequence)), selectedSequence: null, onselect: vi.fn() } });
+  expect(screen.getAllByRole('option')).toHaveLength(1);
+  expect(screen.getByText('4 consecutive stdout output chunks collapsed')).toBeInTheDocument();
+});
+
+it('does not fold search hits that were not consecutive in the journal', () => {
+  // What a search leaves behind: three matching chunks with other output between them.
+  render(EventTimeline, { props: { events: [output(2, 'error a'), output(40, 'error b'), output(97, 'error c')], selectedSequence: null, onselect: vi.fn() } });
+  expect(screen.getAllByRole('option')).toHaveLength(3);
+  expect(screen.queryByText(/collapsed/)).not.toBeInTheDocument();
+});
+
+it('measures elapsed time and depth against the whole run when given a filtered slice', () => {
+  const start = { ...event, event_id: 'start', sequence: 1, kind: 'agent.turn', span_id: 'root-span', parent_event_id: '', parent_span_id: '', timestamp: '2026-07-13T12:00:00Z', duration_ms: 0 };
+  const child = { ...event, event_id: 'child', sequence: 2, kind: 'tool.call', span_id: 'call', parent_event_id: 'start', parent_span_id: '', timestamp: '2026-07-13T12:00:03Z', duration_ms: 0 };
+  const { rerender } = render(EventTimeline, { props: { events: [start, child], selectedSequence: null, onselect: vi.fn() } });
+  const full = screen.getByRole('option', { name: /tool.call/ });
+  expect(full).toHaveTextContent('+3.00 s');
+  expect(full).toHaveTextContent('d1');
+  // Filtered to the child alone: same offset, same depth.
+  void rerender({ events: [child], journal: [start, child], selectedSequence: null, onselect: vi.fn() });
+  return waitFor(() => {
+    const only = screen.getByRole('option', { name: /tool.call/ });
+    expect(screen.getAllByRole('option')).toHaveLength(1);
+    expect(only).toHaveTextContent('+3.00 s');
+    expect(only).toHaveTextContent('d1');
+  });
+});
+
+it('lets the keyboard toggle the summary button inside a row and keeps the header out of the listbox', async () => {
+  const onselect = vi.fn();
+  const longText = `Beginning ${'full captured evidence '.repeat(12)}ending`;
+  render(EventTimeline, { props: { events: [{ ...event, payload_json: JSON.stringify({ text: longText }) }], selectedSequence: null, onselect } });
+  const toggle = screen.getByRole('button', { name: 'Read full summary' });
+  toggle.focus();
+  await userEvent.keyboard('{Enter}');
+  expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await userEvent.keyboard(' ');
+  expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  expect(onselect).not.toHaveBeenCalled();
+
+  const listbox = screen.getByRole('listbox', { name: 'Events' });
+  expect([...listbox.children].every((child) => child.getAttribute('role') === 'option' || child.getAttribute('aria-hidden') === 'true')).toBe(true);
+  expect(listbox.querySelector('.lane-key')).toBeNull();
+  expect(document.querySelector('.timeline-scroll .lane-key')).toBeInTheDocument();
+});

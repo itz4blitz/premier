@@ -67,6 +67,34 @@ integrations may depend on.
 - Viewer: the comparison shows the first divergence and a `Moved` count, and
   applies the same rules as `premier diff`; the two are tested against one
   shared set of cases.
+- Viewer: opening a locked, unsupported, or damaged trace shows why it cannot
+  be opened (the server's `integrity_detail`) instead of `trace not found`.
+  Its outcome reads `Locked`, `Unsupported`, or `Unverified` instead of
+  `Running`, its row shows the reason as text and a `Damaged` badge where it
+  used to show `Live`, and nothing is requested for it.
+- Viewer: the System map explains a run whose actors have no causal links
+  (what was recorded, why a plain process capture has none, and how to record
+  them), marks actors nothing links to, and names them when only some are
+  unlinked.
+- Viewer: the System map draws a connection derived from parent spans as a
+  dashed arrow and a recorded one as a solid arrow, lists which is which in
+  the connection ledger, and draws `links` and shared correlation ids between
+  actors as dotted references with their own ledger. An arrow turns amber
+  when an issue was recorded downstream of it.
+- Viewer: an `other` filter tab for kinds that are not agent, model, tool,
+  approval, or runtime kinds, shown when a run has some. The mapping is
+  documented in [docs/events.md](docs/events.md#viewer-categories).
+- Viewer: values the recorder replaced (`[REDACTED]`) carry a
+  `Redacted by Premier` chip in the inspector.
+- Viewer: the Raw tab shows the first 200,000 characters of a larger payload
+  with `Show all`; Copy still copies all of it.
+- Viewer: Ctrl or Cmd + scroll zooms the System map about the pointer, Fit
+  can show much larger maps, and a role with more than six actors wraps into
+  further columns.
+- Viewer: the reload cache is documented in
+  [docs/cli.md](docs/cli.md#the-reload-cache). It no longer stores the events
+  of an encrypted trace, and is cleared when a write to it fails or the
+  server answers `401`.
 - Viewer: the assistant panel states that asking sends redacted trace content
   to the provider's vendor, at a readable size on every window height, and
   the Ask button stays disabled until that is agreed to for the selected
@@ -612,11 +640,56 @@ integrations may depend on.
 - The Rust toolchain is pinned in `rust-toolchain.toml`.
 - Viewer: `process.terminal` output (recorded with `--pty`) is collapsed like
   stdout and stderr, and is no longer chosen as a run's material event.
+- Viewer: a time range no longer changes the System map. The map is inferred
+  once from the whole run; the range (like a filter) dims what is outside it
+  and the scope bar says how many events and connections are inside.
+- Viewer: kinds are filed under filter tabs without regard to case, `llm.*`
+  counts as a model kind, `mcp.*` as a tool kind, and `session.*` and
+  `adapter.*` as runtime. Kinds with any other prefix are under `other`
+  instead of `agents`.
+- Viewer: map nodes say `Agent` instead of `Coordinator` and
+  `No issues recorded` instead of `Healthy`, and mark a role that was
+  inferred. An event without an `actor_id` no longer turns the recorder's
+  `root` process into an agent.
+- Viewer: the run clock ends at the last received event; a reported
+  `duration_ms` no longer extends it. Events whose timestamp cannot be read
+  are left off the time ruler and counted beside it.
+- Viewer: collapsed output rows read `N consecutive stdout output chunks
+  collapsed`, and only output that was consecutive in the journal collapses.
+- Viewer: the inspector's Relations count is the number of related events
+  that can be opened, and following a relation stays on the Relations tab and
+  clears a filter that would hide the target.
+- Viewer: search matches the same text as `premier query --search`,
+  including `parent_event_id`, `links`, and payload strings as displayed.
+- Viewer: Ask AI is disabled until a readable run is open.
 
 ### Fixed
 
 - `premier diff` no longer attributes one inserted call to every later call
   of the same kind, and no longer reports reordered events as unchanged.
+- Viewer: a time-cropped System map dropped every connection whose parent
+  event was outside the range, and could show one the full run rejects.
+- Viewer: a live stream that the server refused (404, 401, 502) said
+  `RECONNECTING` forever; it now reads `DISCONNECTED`. A malformed stream
+  frame no longer throws.
+- Viewer: a run's row kept the event and issue counts from page load, so a
+  finished run with issues could read `Passed`.
+- Viewer: after a reload answered `401`, cached events stayed readable and
+  the loading bar never cleared. When the server cannot be reached, the saved
+  copy is labelled as one.
+- Viewer: Back or Forward to a different run dropped the filters and time
+  range of that history entry; recovering from a dead link kept its
+  `event_id`.
+- Viewer: Runs, Ask AI, and `?` on the loading, empty, and error screens made
+  the app bar unusable until Escape.
+- Viewer: elapsed offsets and causal depth in the timeline changed with the
+  active filter; terminal control sequences showed as text in event rows; the
+  `Read full summary` button could not be operated from the keyboard; the
+  events list box contained its column header; a timestamp that is not a date
+  showed as `Invalid Date`; `Failure window` jumped to the last issue instead
+  of the first; map edges between actors of one role ran under the cards and
+  opposite edges overlapped exactly; resizing the window reset a map view the
+  user had moved.
 - An adapter no longer writes a `malformed native JSONL` diagnostic for a
   line that holds only a terminal control sequence, or rejects an event
   because a colour reset follows it.

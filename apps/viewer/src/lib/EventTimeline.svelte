@@ -6,7 +6,7 @@
   import { eventPayload } from './types';
   import { payloadModel, payloadProvider } from './nativePayload';
   import BrandIcon from './BrandIcon.svelte';
-  import { Bot, Wrench, ShieldCheck, SquareTerminal, Sparkles, CircleAlert } from '@lucide/svelte';
+  import { Activity, Bot, Wrench, ShieldCheck, SquareTerminal, Sparkles, CircleAlert } from '@lucide/svelte';
 
   function familyIcon(event: TraceEvent) {
     const category = categoryOf(event);
@@ -15,6 +15,8 @@
     if (category === 'tool') return Wrench;
     if (category === 'approval') return ShieldCheck;
     if (category === 'process') return SquareTerminal;
+    // A kind the viewer has no family for gets a neutral mark, not the agent one.
+    if (category === 'other') return Activity;
     return Bot;
   }
 
@@ -26,8 +28,13 @@
     return { provider: payloadProvider(payload), model: payloadModel(payload) };
   }
 
-  let { events, selectedSequence, onselect, loading = null }: {
+  let { events, journal = null, selectedSequence, onselect, loading = null }: {
     events: TraceEvent[];
+    /**
+     * The whole run, when `events` is a filtered or time-cropped part of it. Elapsed offsets and
+     * causal depth are measured against it, so they do not change with the active scope.
+     */
+    journal?: TraceEvent[] | null;
     selectedSequence: number | null;
     onselect: (event: TraceEvent) => void;
     /** Set while the journal is still arriving in pages; null once it is complete. */
@@ -60,6 +67,9 @@
       while (cursor < input.length && group.length < 100) {
         const candidate = input[cursor];
         if (!isProcessNoise(candidate) || candidate.kind !== current.kind || actorId(candidate) !== actorId(current)) break;
+        // Rows that a filter or search left next to each other were not consecutive in the journal;
+        // only output that really was back to back folds into one row.
+        if (candidate.sequence !== group[group.length - 1].sequence + 1) break;
         group.push(candidate);
         cursor += 1;
       }
@@ -75,7 +85,7 @@
 
   let processed = $derived.by(() => aggregateProcess(events));
   let displayEvents = $derived(processed.events);
-  let layout = $derived(timelineLayout(displayEvents));
+  let layout = $derived(timelineLayout(displayEvents, journal ?? events));
   let virtualized = $derived(displayEvents.length > 300);
   // The list can shrink under a stale scroll offset (filters, a new run); never window past its end.
   let windowTop = $derived(Math.min(scrollTop, Math.max(0, displayEvents.length * rowHeight + headerHeight - viewportHeight)));
@@ -173,13 +183,15 @@
   {#if events.length === 0}
     <div class="timeline-scroll filtered-empty" role="status"><strong>No matching evidence</strong><span>Clear or broaden the active filters.</span></div>
   {:else}
-    <div class="timeline-scroll" bind:this={scrollElement} onscroll={updateViewport} role="listbox" aria-label="Events" aria-orientation="vertical">
+    <div class="timeline-scroll" bind:this={scrollElement} onscroll={updateViewport}>
+      <!-- Column labels sit beside the listbox, not in it: a listbox may only own options. -->
       <div class="lane-key">
         <span>Step</span>
         <span>Actor</span>
         <span>Event</span>
         <span>Status</span>
       </div>
+      <div class="timeline-rows" role="listbox" aria-label="Events" aria-orientation="vertical">
       {#if virtualized && windowStart > 0}<div class="virtual-spacer" style={`height:${windowStart * rowHeight}px`} aria-hidden="true"></div>{/if}
       {#each renderedEvents as event, localIndex (event.event_id)}
         {@const index = windowStart + localIndex}
@@ -190,7 +202,12 @@
           class:error={categoryOf(event) === 'error'}
           data-event-id={event.event_id}
           onclick={() => onselect(displayEvents[index])}
-          onkeydown={(keyEvent) => { navigate(keyEvent, index); activate(keyEvent, index); }}
+          onkeydown={(keyEvent) => {
+            // A key pressed on a control inside the row (Read full summary) belongs to that control.
+            if (keyEvent.target !== keyEvent.currentTarget) return;
+            navigate(keyEvent, index);
+            activate(keyEvent, index);
+          }}
           aria-selected={event.sequence === selectedSequence}
           aria-setsize={displayEvents.length}
           aria-posinset={index + 1}
@@ -210,7 +227,7 @@
               {#if (event.depth || 0) > 0}<span class="depth-badge" title={`Causal depth ${event.depth}`}>d{event.depth}</span>{/if}
             </span>
             <small class:expanded={expandedEvents.has(event.event_id)}>{eventSummary(event)}</small>
-            {#if processed.counts.has(event.event_id)}<span class="process-group">{processed.counts.get(event.event_id)} consecutive {event.kind === 'process.stderr' ? 'stderr lines' : event.kind === 'process.terminal' ? 'terminal chunks' : 'stdout lines'} collapsed</span>{/if}
+            {#if processed.counts.has(event.event_id)}<span class="process-group">{processed.counts.get(event.event_id)} consecutive {event.kind === 'process.stderr' ? 'stderr' : event.kind === 'process.terminal' ? 'terminal' : 'stdout'} output chunks collapsed</span>{/if}
             {#if !virtualized && eventSummary(event).length > 108}
               <button type="button" class="summary-toggle" aria-expanded={expandedEvents.has(event.event_id)} onclick={(clickEvent) => { clickEvent.stopPropagation(); toggleSummary(event.event_id); }}>
                 {expandedEvents.has(event.event_id) ? 'Show less' : 'Read full summary'}
@@ -219,10 +236,11 @@
           </span>
           <span class="event-status" data-status={event.status || categoryOf(event)}>{event.status || 'recorded'}</span>
           {#if event.duration_ms > 0}<span class="duration">{event.duration_ms >= 1000 ? `${(event.duration_ms / 1000).toFixed(2)} s` : `${event.duration_ms} ms`}</span>{/if}
-          {#if event.elapsedMs > 0}<time datetime={event.timestamp} title={new Date(event.timestamp).toLocaleTimeString([], { hour12: false, fractionalSecondDigits: 3 })}>+{event.elapsedMs >= 1000 ? `${(event.elapsedMs / 1000).toFixed(2)} s` : `${event.elapsedMs} ms`}</time>{/if}
+          {#if event.elapsedMs > 0}<time datetime={event.timestamp} title={`${new Date(event.timestamp).toLocaleTimeString([], { hour12: false, fractionalSecondDigits: 3 })} · since the run's first event`}>+{event.elapsedMs >= 1000 ? `${(event.elapsedMs / 1000).toFixed(2)} s` : `${event.elapsedMs} ms`}</time>{/if}
         </div>
       {/each}
       {#if virtualized && windowEnd < layout.events.length}<div class="virtual-spacer" style={`height:${(layout.events.length - windowEnd) * rowHeight}px`} aria-hidden="true"></div>{/if}
+      </div>
     </div>
   {/if}
 </section>

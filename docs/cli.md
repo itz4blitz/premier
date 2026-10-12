@@ -1522,7 +1522,66 @@ Error bodies are `{"error": "<message>"}`.
 | An abandoned state with the recover command | `integrity` is `abandoned`, in the list or from a `trace.abandoned` event while the trace is open. |
 | `Encrypted · key required` and a `Locked` badge in the trace list | `integrity` is `locked`. |
 | `Needs a newer Premier` and a `Newer format` badge in the trace list | `integrity` is `unsupported`. |
+| `Damaged` and a `Damaged` badge in the trace list | `integrity` is `invalid` and the entry has no journal: its manifest could not be read. |
+
+A locked, unsupported, or damaged entry has no events to fetch. Its row shows
+the `integrity_detail` sentence as text and is never marked `Live`. Opening
+it requests nothing: the workspace shows why it cannot be opened (the same
+sentence), the run's outcome reads `Locked`, `Unsupported`, or `Unverified`,
+and the connection indicator reads `LOCKED`, `UNSUPPORTED`, or `DAMAGED`.
+Ask AI is disabled for it.
+
+The connection indicator otherwise reads `STREAMING`, `RECORDED`,
+`ABANDONED`, `CONNECTING`, `RECONNECTING` (the stream dropped and the browser
+is retrying), or `DISCONNECTED` (nothing is being retried: the stream was
+refused with an HTTP error, the server sent `trace.error`, or the server
+could not be reached).
 
 When the listed state of the open trace changes (it was recovered, finalized,
 or is being recorded again), the viewer reloads its manifest and events and
-keeps the selected event.
+keeps the selected event. The run list is polled every 4 seconds and a row is
+redrawn when its state or its event, issue, or actor count changes.
+
+### The reload cache
+
+So that a reload does not flash an empty workspace, the viewer keeps a copy
+of what it last showed in the tab's `sessionStorage` under
+`premier.viewer.session.v1`: up to 80 list entries, the open trace's
+manifest, and the first 2,500 events of the open trace **with their
+payloads**. The API responses themselves are sent `no-store`; this copy is
+the viewer's own.
+
+- It lasts for the life of the tab and is ignored after 30 minutes. It is
+  removed when a trace fails to load, when a write to it fails (a full
+  quota), and when the server answers `401`.
+- The events of an **encrypted** trace are not stored: only the manifests
+  are, so a decrypted copy is never written to browser storage.
+- It is a stand-in. The viewer requests the trace again on every load and
+  replaces the copy. While only the copy is on screen, a link to an event
+  beyond the first 2,500 is not reported missing until the load has finished.
+- If the server cannot be reached on reload, the copy stays on screen under a
+  `Viewer server unreachable` notice that says it may be incomplete or out of
+  date. If the server answers `401`, the copy is discarded and the sign-in
+  error is shown instead.
+
+Use a private window, or close the tab, on a shared machine.
+
+### Topology
+
+The System view draws one node per `actor_id` and infers its structure once,
+from every event of the run. A filter or a time range dims what is outside
+it; it never removes an actor or a connection, and never adds one.
+
+| Drawn as | Means |
+| --- | --- |
+| Solid arrow | A parent-to-child connection with a recorded `parent_event_id`. |
+| Dashed arrow | A connection derived from `parent_span_id` only. |
+| Dotted line, no arrowhead | A reference: an event's `links`, or a `correlation_id` shared by two actors. Not a cause, and not counted as a causal connection. |
+| Red arrow | An event behind the connection is an issue. |
+| Amber arrow | An issue was recorded in the events that connection led to. |
+
+A run whose actors have no causal connection (typical for a plain process
+capture, or one provider session beside the recorder's `root` process) says
+so under the map, with the reason. Actors that nothing links to are marked
+`No recorded links`. A role the producer did not state as a known
+`actor_type` is marked `inferred`.

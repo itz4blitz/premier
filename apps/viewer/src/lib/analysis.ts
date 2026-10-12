@@ -1,5 +1,6 @@
 import { nativeExitCode, nativeFailure, nativeOf, nativeText, nativeType, payloadError, payloadModel, payloadTool, payloadTotalTokens, record } from './nativePayload';
-import { isAbandoned, type EventCategory, type EventFilters, type TraceEvent, type TraceManifest } from './types';
+import { parentResolver } from './causal';
+import { isAbandoned, type EventCategory, type EventFamily, type EventFilters, type TraceEvent, type TraceManifest } from './types';
 
 export type ActorRole = 'process' | 'agent' | 'subagent' | 'human' | 'system';
 
@@ -21,7 +22,7 @@ export interface ActorInventory {
 }
 
 export interface RunHealth {
-  label: 'Running' | 'Abandoned' | 'Awaiting approval' | 'Blocked' | 'Needs attention' | 'Interrupted' | 'Failed' | 'Passed' | 'Unverified';
+  label: 'Running' | 'Abandoned' | 'Locked' | 'Unsupported' | 'Awaiting approval' | 'Blocked' | 'Needs attention' | 'Interrupted' | 'Failed' | 'Passed' | 'Unverified';
   tone: 'running' | 'warning' | 'error' | 'success';
   detail: string;
 }
@@ -105,16 +106,32 @@ export function awaitingApprovals(events: TraceEvent[]): TraceEvent[] {
   return awaiting.reverse();
 }
 
-export function categoryOf(event: TraceEvent): EventCategory {
-  if (isIssue(event)) return 'error';
-  const prefix = event.kind.split('.')[0] as EventCategory;
-  return ['agent', 'model', 'tool', 'approval', 'process'].includes(prefix) ? prefix : 'agent';
+/**
+ * Which filter tab a kind belongs to, by the text before its first dot, compared without regard to
+ * case. Documented in docs/events.md ("Viewer categories"); keep the two in step.
+ */
+const KIND_FAMILIES: Record<string, EventFamily> = {
+  agent: 'agent',
+  model: 'model',
+  llm: 'model',
+  tool: 'tool',
+  mcp: 'tool',
+  approval: 'approval',
+  process: 'process',
+  // The recorder's own bookkeeping about the run and its adapter.
+  session: 'process',
+  adapter: 'process'
+};
+
+/** The recorded family stays stable even when an event is also an issue. Unknown kinds are `other`. */
+export function familyOf(event: TraceEvent): EventFamily {
+  const prefix = event.kind.trim().split('.')[0].toLowerCase();
+  // Own keys only: a kind such as `constructor.x` must not find something on the prototype.
+  return Object.prototype.hasOwnProperty.call(KIND_FAMILIES, prefix) ? KIND_FAMILIES[prefix] : 'other';
 }
 
-/** The recorded family stays stable even when an event is also an issue. */
-export function familyOf(event: TraceEvent): Exclude<EventCategory, 'all' | 'error'> | 'agent' {
-  const prefix = event.kind.split('.')[0] as Exclude<EventCategory, 'all' | 'error'>;
-  return ['agent', 'model', 'tool', 'approval', 'process'].includes(prefix) ? prefix : 'agent';
+export function categoryOf(event: TraceEvent): EventCategory {
+  return isIssue(event) ? 'error' : familyOf(event);
 }
 
 export function summarizeAgents(events: TraceEvent[]): AgentSummary[] {
@@ -170,6 +187,20 @@ export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth
       detail: trace.integrity_detail?.trim() || 'Journal failed integrity verification'
     };
   }
+  if (trace.integrity === 'locked') {
+    return {
+      label: 'Locked',
+      tone: 'warning',
+      detail: trace.integrity_detail?.trim() || 'This trace is encrypted. Restart premier with --key-file to read it.'
+    };
+  }
+  if (trace.integrity === 'unsupported') {
+    return {
+      label: 'Unsupported',
+      tone: 'warning',
+      detail: trace.integrity_detail?.trim() || 'This trace was written by a newer Premier. Upgrade premier to read it.'
+    };
+  }
   if (isAbandoned(trace)) {
     return {
       label: 'Abandoned',
@@ -198,12 +229,25 @@ export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth
   return { label: 'Passed', tone: 'success', detail: `Clean exit with no recorded errors${verified}` };
 }
 
+/**
+ * Terminal control sequences (colours, cursor movement, window titles) and the control characters
+ * left around them. Recorded output keeps them; a one-line summary and the search box must not.
+ */
+const CONTROL_SEQUENCES = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\|$)|\u001b[PX^_][^\u001b]*(?:\u001b\\|$)|\u001b[@-Z\\-_]|\u001b|[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+
+export function stripControlSequences(text: string): string {
+  // A carriage return rewrites the line in a terminal; in flat text it only separates.
+  return text.includes('\u001b') || /[\u0000-\u0008\u000b-\u001f\u007f]/.test(text)
+    ? text.replace(/\r/g, '\n').replace(CONTROL_SEQUENCES, '')
+    : text;
+}
+
 function compact(value: unknown): string {
   let output: string;
   if (Array.isArray(value)) output = value.map(String).join(', ');
   else if (typeof value === 'object' && value !== null) output = JSON.stringify(value);
   else output = String(value);
-  return output.replace(/\s+/g, ' ').trim();
+  return stripControlSequences(output).replace(/\s+/g, ' ').trim();
 }
 
 function first(payload: Record<string, unknown>, keys: string[]): string | null {
@@ -217,7 +261,7 @@ function first(payload: Record<string, unknown>, keys: string[]): string | null 
 /** Provider text is unbounded; rows only need the opening of it. */
 function excerpt(value: string | null, limit = 240): string | null {
   if (!value) return null;
-  const flat = value.replace(/\s+/g, ' ').trim();
+  const flat = stripControlSequences(value).replace(/\s+/g, ' ').trim();
   if (!flat) return null;
   return flat.length > limit ? `${flat.slice(0, limit - 1)}…` : flat;
 }
@@ -250,7 +294,7 @@ export function eventSummary(event: TraceEvent): string {
     const shellWrapper = command && ['sh', 'bash', 'zsh'].includes(command[0]) && command[1] === '-c';
     return goal ? `Goal: ${goal}` : shellWrapper ? 'Shell trace recording started' : executable ? `Started ${executable}` : 'Trace recording started';
   }
-  if (kind.includes('stdout') || kind.includes('stderr')) return first(payload, ['text'])?.replace(/\s+/g, ' ').trim() || 'Empty output';
+  if (kind.includes('stdout') || kind.includes('stderr') || kind === 'process.terminal') return first(payload, ['text'])?.replace(/\s+/g, ' ').trim() || 'Empty output';
   if (kind.startsWith('model.')) {
     const model = first(payload, ['model']) ?? payloadModel(payload);
     const content = first(payload, ['summary', 'text', 'content', 'response'])
@@ -306,32 +350,48 @@ export function eventSummary(event: TraceEvent): string {
   return first(payload, ['summary', 'text', 'message', 'operation', 'command']) || nativeFallback() || event.source;
 }
 
-export function timelineLayout(events: TraceEvent[]): { lanes: string[]; events: TimelineEvent[] } {
+/**
+ * Rows for `events` (what is shown), measured against `journal` (the whole run): elapsed time is
+ * counted from the run's first event and causal depth follows parents wherever they are, so neither
+ * changes with the active filter or time crop.
+ */
+export function timelineLayout(events: TraceEvent[], journal: TraceEvent[] = events): { lanes: string[]; events: TimelineEvent[] } {
   const lanes = [...new Set(events.map(actorId))];
-  const startedAt = events.length ? Date.parse(events[0].timestamp) : 0;
-  const byEvent = new Map(events.map((event) => [event.event_id, event]));
-  const firstBySpan = new Map<string, TraceEvent>();
-  for (const event of events) if (event.span_id && !firstBySpan.has(event.span_id)) firstBySpan.set(event.span_id, event);
+  const startedAt = traceTimeBounds(journal)?.start ?? Number.NaN;
+  const resolveParent = parentResolver(journal);
   const depthMemo = new Map<string, number>();
-  const depthOf = (event: TraceEvent, seen = new Set<string>()): number => {
-    if (depthMemo.has(event.event_id)) return depthMemo.get(event.event_id)!;
-    if (seen.has(event.event_id)) return 0;
-    seen.add(event.event_id);
-    const parent = byEvent.get(event.parent_event_id) ?? firstBySpan.get(event.parent_span_id);
-    const depth = parent && parent.event_id !== event.event_id ? Math.min(depthOf(parent, seen) + 1, 8) : 0;
-    depthMemo.set(event.event_id, depth);
-    return depth;
+  const depthOf = (event: TraceEvent): number => {
+    // Walk up iteratively: a deep chain must not overflow the stack, and a cycle must end.
+    const chain: TraceEvent[] = [];
+    const seen = new Set<string>();
+    let current: TraceEvent | null = event;
+    let base = 0;
+    while (current) {
+      const known = depthMemo.get(current.event_id);
+      if (known !== undefined) { base = known + 1; break; }
+      if (seen.has(current.event_id)) break;
+      seen.add(current.event_id);
+      chain.push(current);
+      current = resolveParent(current).found;
+    }
+    for (let index = chain.length - 1; index >= 0; index -= 1) {
+      depthMemo.set(chain[index].event_id, Math.min(base, 8));
+      base += 1;
+    }
+    return depthMemo.get(event.event_id) ?? 0;
   };
   return {
     lanes,
     events: events.map((event) => {
-      const parent = byEvent.get(event.parent_event_id) ?? firstBySpan.get(event.parent_span_id);
+      const parent = resolveParent(event).found;
+      const timestamp = Date.parse(event.timestamp);
+      const parentLane = parent ? lanes.indexOf(actorId(parent)) : -1;
       return {
         ...event,
         lane: lanes.indexOf(actorId(event)),
-        parentLane: parent ? lanes.indexOf(actorId(parent)) : null,
+        parentLane: parentLane >= 0 ? parentLane : null,
         depth: depthOf(event),
-        elapsedMs: Math.max(0, Date.parse(event.timestamp) - startedAt)
+        elapsedMs: Number.isFinite(timestamp) && Number.isFinite(startedAt) ? Math.max(0, timestamp - startedAt) : 0
       };
     })
   };
@@ -346,14 +406,43 @@ export function filterEvents(events: TraceEvent[], filters: EventFilters): Trace
     if (filters.category === 'error' && !isIssue(event)) return false;
     if (filters.category !== 'all' && filters.category !== 'error' && familyOf(event) !== filters.category) return false;
     if (!query) return true;
-    return [
-      event.kind, event.source, actorId(event), event.status,
-      event.event_id, event.span_id, event.parent_span_id, event.correlation_id, event.payload_json
-    ]
-      .join(' ')
-      .toLowerCase()
-      .includes(query);
+    return searchText(event).includes(query);
   });
+}
+
+/** Every string in a decoded payload, one per line. */
+function collectStrings(value: unknown, output: string[]): void {
+  if (typeof value === 'string') output.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, output);
+  else if (value !== null && typeof value === 'object') for (const item of Object.values(value)) collectStrings(item, output);
+}
+
+/**
+ * What the search box looks in, the same as `premier query --search`: the event's fields and ids,
+ * its payload as JSON text (so key names match), and every payload string as it was recorded, with
+ * and without terminal control sequences, so text with quotes, line breaks or colour codes matches
+ * as it is displayed.
+ */
+function searchText(event: TraceEvent): string {
+  const parts = [
+    event.kind, event.source, actorId(event), event.actor_type, event.status,
+    event.event_id, event.span_id, event.parent_span_id, event.parent_event_id, event.correlation_id,
+    event.timestamp, event.payload_json, ...event.links
+  ];
+  // Only an escaped character makes the decoded text differ from the JSON.
+  if (event.payload_json.includes('\\')) {
+    try {
+      const decoded: string[] = [];
+      collectStrings(JSON.parse(event.payload_json), decoded);
+      const text = decoded.join('\n');
+      parts.push(text);
+      const plain = stripControlSequences(text);
+      if (plain !== text) parts.push(plain);
+    } catch {
+      // A payload that is not JSON is searched as the text it is.
+    }
+  }
+  return parts.join(' ').toLowerCase();
 }
 
 export function countByCategory(events: TraceEvent[], category: EventCategory): number {
@@ -363,8 +452,11 @@ export function countByCategory(events: TraceEvent[], category: EventCategory): 
 }
 
 /**
- * First timestamp and overall span of a journal. Written as a loop on purpose: spreading a large
- * journal into Math.min/Math.max overflows the call stack above roughly 125k events.
+ * First timestamp and overall span of a journal, from the first to the last time an event was
+ * received. A reported duration is elapsed time that ended at the event, so it never extends the
+ * run past its last event, and an event whose timestamp cannot be parsed has no place on the clock.
+ * Written as a loop on purpose: spreading a large journal into Math.min/Math.max overflows the call
+ * stack above roughly 125k events.
  */
 export function traceTimeBounds(input: TraceEvent[]): { start: number; span: number } | null {
   let start = Number.POSITIVE_INFINITY;
@@ -373,8 +465,7 @@ export function traceTimeBounds(input: TraceEvent[]): { start: number; span: num
     const timestamp = Date.parse(event.timestamp);
     if (!Number.isFinite(timestamp)) continue;
     if (timestamp < start) start = timestamp;
-    const finished = timestamp + Math.max(0, event.duration_ms || 0);
-    if (finished > end) end = finished;
+    if (timestamp > end) end = timestamp;
   }
   if (!Number.isFinite(start)) return null;
   return { start, span: Math.max(1, end - start) };

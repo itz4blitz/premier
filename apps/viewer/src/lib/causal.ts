@@ -29,40 +29,63 @@ export function findEventById(events: TraceEvent[], id: string): TraceEvent | un
 }
 
 /**
- * The event that opened a span: the lowest-sequence event carrying that span_id. Producers that only
- * record span lineage (`premier emit --span`, native adapters) mean this event when they name a span.
+ * One parent resolver for the inspector, the timeline's nesting depth, and the topology, so the
+ * three never disagree. A recorded parent_event_id wins; otherwise (or when that id is not in the
+ * journal) the parent is the event that opened parent_span_id: the lowest-sequence event carrying
+ * that span id, which is what producers that only record span lineage (`premier emit --span`,
+ * native adapters) mean when they name a span. Self references resolve to no parent.
+ *
+ * Indexes `events` once; resolve against the whole journal, never a filtered subset.
  */
-function spanOpener(events: TraceEvent[], spanId: string, exclude?: TraceEvent): TraceEvent | null {
+export function parentResolver(events: TraceEvent[]): (event: TraceEvent) => ParentResolution {
+  const byId = new Map<string, TraceEvent>();
+  const openers = new Map<string, TraceEvent>();
+  for (const candidate of events) {
+    if (!byId.has(candidate.event_id)) byId.set(candidate.event_id, candidate);
+    if (!candidate.span_id) continue;
+    const opener = openers.get(candidate.span_id);
+    if (!opener || candidate.sequence < opener.sequence) openers.set(candidate.span_id, candidate);
+  }
+  return (event) => {
+    const parentId = event.parent_event_id && event.parent_event_id !== event.event_id ? event.parent_event_id : '';
+    if (parentId) {
+      let found = byId.get(parentId);
+      if (!found) {
+        // A producer that put a span id in parent_event_id means the span's opener.
+        const named = openers.get(parentId);
+        found = named && named.event_id !== event.event_id
+          ? named
+          : events.find((candidate) => candidate.span_id === parentId && candidate.event_id !== event.event_id);
+      }
+      if (found) return { found, missing: false, via: 'event', reference: parentId };
+    }
+    const parentSpan = event.parent_span_id;
+    if (parentSpan) {
+      const opener = openers.get(parentSpan);
+      // Within one span only an earlier event can be the parent, so the span's opener has none.
+      const sameSpan = parentSpan === event.span_id;
+      if (opener && opener.event_id !== event.event_id && (!sameSpan || opener.sequence < event.sequence)) {
+        return { found: opener, missing: false, via: 'span', reference: parentSpan };
+      }
+      if (!parentId) return sameSpan ? noParent : { found: null, missing: true, via: 'span', reference: parentSpan };
+    }
+    return parentId ? { found: null, missing: true, via: 'event', reference: parentId } : noParent;
+  };
+}
+
+/** The lowest-sequence event carrying `spanId`. */
+function spanOpener(events: TraceEvent[], spanId: string): TraceEvent | null {
   let opener: TraceEvent | null = null;
   for (const candidate of events) {
-    if (candidate.span_id !== spanId || candidate.event_id === exclude?.event_id) continue;
+    if (candidate.span_id !== spanId) continue;
     if (!opener || candidate.sequence < opener.sequence) opener = candidate;
   }
   return opener;
 }
 
-/**
- * Resolve an event's parent. A recorded parent_event_id wins; otherwise (or when that id is not in the
- * journal) the parent is the event that opened parent_span_id. Self references resolve to no parent.
- */
+/** Resolve one event's parent; see {@link parentResolver} for the rules. */
 export function parentOf(event: TraceEvent, events: TraceEvent[]): ParentResolution {
-  const parentId = event.parent_event_id && event.parent_event_id !== event.event_id ? event.parent_event_id : '';
-  if (parentId) {
-    const found = events.find((candidate) => candidate.event_id === parentId)
-      ?? events.find((candidate) => candidate.span_id === parentId && candidate.event_id !== event.event_id);
-    if (found) return { found, missing: false, via: 'event', reference: parentId };
-  }
-  const parentSpan = event.parent_span_id;
-  if (parentSpan) {
-    const opener = spanOpener(events, parentSpan, event);
-    // Within one span only an earlier event can be the parent, so the span's opener has none.
-    const sameSpan = parentSpan === event.span_id;
-    if (opener && (!sameSpan || opener.sequence < event.sequence)) {
-      return { found: opener, missing: false, via: 'span', reference: parentSpan };
-    }
-    if (!parentId) return sameSpan ? noParent : { found: null, missing: true, via: 'span', reference: parentSpan };
-  }
-  return parentId ? { found: null, missing: true, via: 'event', reference: parentId } : noParent;
+  return parentResolver(events)(event);
 }
 
 /**

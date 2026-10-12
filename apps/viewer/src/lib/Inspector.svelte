@@ -82,11 +82,33 @@
     ]);
     return relations.peers.filter((peer) => !shown.has(peer.event_id));
   });
-  const causalCount = $derived(event
-    ? [event.parent_event_id, event.span_id, event.parent_span_id, event.correlation_id, ...event.links].filter(Boolean).length
-      + (relations?.children.length ?? 0)
-      + (relations?.linkedFrom.length ?? 0)
+  /** Relations the user can open: each is a recorded event, not an identifier field. */
+  const causalCount = $derived(relations
+    ? (relations.parent.found ? 1 : 0)
+      + relations.children.length
+      + correlated.length
+      + relations.linkedFrom.length
+      + relations.links.filter((link) => link.found).length
     : 0);
+  /** Identifiers worth listing even when none of them resolves to another event. */
+  const hasIdentifiers = $derived(Boolean(event
+    && [event.parent_event_id, event.span_id, event.parent_span_id, event.correlation_id, ...event.links].some(Boolean)));
+  /** Above this the Raw tab shows the head of the text; the whole value stays one click or copy away. */
+  const rawLimit = 200_000;
+  let rawExpanded = $state(false);
+  // Only the Raw tab pays for serializing the payload and envelope.
+  const rawPayload = $derived(activeTab === 'raw' ? JSON.stringify(payload, null, 2) : '');
+  const rawEnvelope = $derived(activeTab === 'raw' && event ? JSON.stringify({ ...event, payload_json: undefined }, null, 2) : '');
+
+  function bounded(text: string): string {
+    return rawExpanded || text.length <= rawLimit ? text : `${text.slice(0, rawLimit)}\n…`;
+  }
+
+  /** A producer timestamp is stored as given; one that is not a date is shown as it was recorded. */
+  function observedAt(current: TraceEvent): string {
+    const parsed = Date.parse(current.timestamp);
+    return Number.isFinite(parsed) ? new Date(parsed).toLocaleTimeString() : (current.timestamp.trim() || 'at an unrecorded time');
+  }
 
   function tabCount(tab: Tab): number | null {
     if (tab === 'data') return entries.length;
@@ -94,10 +116,14 @@
     return null;
   }
 
+  /** The event a relation was followed to; arriving there keeps the tab the user is hopping in. */
+  let followedTo: string | null = null;
   $effect(() => {
     if (event?.event_id) {
-      activeTab = 'overview';
+      if (event.event_id !== followedTo) activeTab = 'overview';
+      followedTo = null;
       copied = null;
+      rawExpanded = false;
     }
   });
 
@@ -145,6 +171,7 @@
     const result = resolveRelatedTarget(events, id);
     if (result.found) {
       relatedMissing = null;
+      followedTo = result.found.event_id;
       onnavigate?.(result.found.event_id);
     } else {
       relatedMissing = id;
@@ -331,7 +358,7 @@
           <p>{eventDescription(event)}</p>
           <div class="summary-facts">
             <div><UserRound size={15} strokeWidth={1.8} aria-hidden="true" /><span>Actor</span><strong>{actorId(event)}</strong><small>{event.actor_type || 'process'}</small></div>
-            <div><Clock3 size={15} strokeWidth={1.8} aria-hidden="true" /><span>Duration</span><strong>{durationLabel(event)}</strong><small>Observed {new Date(event.timestamp).toLocaleTimeString()}</small></div>
+            <div><Clock3 size={15} strokeWidth={1.8} aria-hidden="true" /><span>Duration</span><strong>{durationLabel(event)}</strong><small>Observed {observedAt(event)}</small></div>
             <div><Radio size={15} strokeWidth={1.8} aria-hidden="true" /><span>Source</span><strong>{event.source || 'Unknown'}</strong><small>Capture producer</small></div>
             <div><Fingerprint size={15} strokeWidth={1.8} aria-hidden="true" /><span>Sequence</span><strong>Event {event.sequence}</strong><small>Recorded order</small></div>
           </div>
@@ -372,10 +399,10 @@
           </section>
         {/if}
 
-        {#if causalCount}
+        {#if causalCount || hasIdentifiers}
           <section class="evidence-section overview-relations">
             <div class="section-title">
-              <h3><GitBranch size={14} aria-hidden="true" />Trace context <b>{causalCount}</b></h3>
+              <h3><GitBranch size={14} aria-hidden="true" />Trace context {#if causalCount}<b title="Related events you can open">{causalCount}</b>{/if}</h3>
               <button class="text-action" onclick={() => (activeTab = 'relationships')}>Explore <ChevronRight size={14} aria-hidden="true" /></button>
             </div>
             <dl class="field-list causal-list">
@@ -404,7 +431,7 @@
           {#if relatedMissing}
             <div class="relation-missing" role="status"><strong>Not in journal</strong><span>No event matches <code>{relatedMissing}</code>. The reference may be outside this trace or never recorded.</span></div>
           {/if}
-          {#if causalCount || relations?.children.length}
+          {#if causalCount || hasIdentifiers}
           <dl class="field-list causal-list">
             <div><dt>Event ID</dt><dd><code>{event.event_id}</code></dd></div>
             {#if relations?.parent.reference}
@@ -471,12 +498,21 @@
       {:else}
         <section class="evidence-section raw-section">
           <div class="section-title"><h3><Braces size={14} aria-hidden="true" />Decoded payload</h3><button class="text-action" onclick={() => writeClipboard(JSON.stringify(payload, null, 2), 'payload')}>{#if copied === 'payload'}<Check size={14} aria-hidden="true" />Copied{:else}<Copy size={14} aria-hidden="true" />Copy payload{/if}</button></div>
-          <pre>{JSON.stringify(payload, null, 2)}</pre>
+          <pre>{bounded(rawPayload)}</pre>
         </section>
         <section class="evidence-section raw-section">
           <div class="section-title"><h3><Code2 size={14} aria-hidden="true" />Event envelope</h3><button class="text-action" onclick={() => writeClipboard(JSON.stringify({ ...event, payload_json: undefined }, null, 2), 'event')}>{#if copied === 'event'}<Check size={14} aria-hidden="true" />Copied{:else}<Copy size={14} aria-hidden="true" />Copy envelope{/if}</button></div>
-          <pre>{JSON.stringify({ ...event, payload_json: undefined }, null, 2)}</pre>
+          <pre>{bounded(rawEnvelope)}</pre>
         </section>
+        {#if !rawExpanded && (rawPayload.length > rawLimit || rawEnvelope.length > rawLimit)}
+          <section class="evidence-section raw-section">
+            <div class="section-empty raw-truncated" role="status">
+              <strong>Showing the first {rawLimit.toLocaleString('en-US')} characters</strong>
+              <span>The payload is {Math.max(rawPayload.length, rawEnvelope.length).toLocaleString('en-US')} characters. Copy still copies all of it.</span>
+              <button class="text-action" onclick={() => (rawExpanded = true)}>Show all</button>
+            </div>
+          </section>
+        {/if}
       {/if}
     </div>
   {:else}

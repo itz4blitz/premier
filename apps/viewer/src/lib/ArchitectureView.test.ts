@@ -114,3 +114,36 @@ it('mounts the time navigator for a journal larger than the argument-spread limi
   })).not.toThrow();
   expect(document.querySelector('.architecture-view.time-only')).toBeInTheDocument();
 }, 60_000);
+
+it('keeps the full-run topology under a time range and only highlights the range', () => {
+  // The delegation (0 s) is outside the range; its edge to the researcher must survive the crop.
+  render(ArchitectureView, { props: { events, showRuler: false, windowStartMs: 7000, windowEndMs: 10000, onwindow: vi.fn(), onactor: vi.fn(), onselect: vi.fn() } });
+  expect(document.querySelector('.topology .summary')).toHaveTextContent('2 actors · 2 causal connections');
+  expect(screen.getByLabelText('Map scope')).toHaveTextContent('4 supplied events · 2 highlighted');
+  expect(screen.getByText('Range highlighted on the full-run map; structure is unchanged')).toBeInTheDocument();
+  expect(screen.getByText('2 events · 1 of 2 connections')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /coordinator to researcher: 1 linked event/ })).toHaveClass('muted');
+  expect(screen.getByRole('button', { name: /researcher to coordinator: 1 linked event/ })).not.toHaveClass('muted');
+});
+
+it('jumps to the first recorded issue, not the last', async () => {
+  const onselect = vi.fn();
+  const twoIssues = [...events, event(5, 'researcher', 'tool.error', 12, 'research', 'tool-2', 'error')];
+  render(ArchitectureView, { props: { events: twoIssues, onwindow: vi.fn(), onactor: vi.fn(), onselect } });
+  await fireEvent.click(screen.getByRole('button', { name: 'Failure window' }));
+  expect(onselect).toHaveBeenCalledWith(twoIssues[2]);
+});
+
+it('leaves events without a readable timestamp off the ruler and does not project durations past the run', () => {
+  const odd = [
+    ...events.slice(0, 3),
+    { ...event(4, 'coordinator', 'agent.join', 10, 'research', 'join'), duration_ms: 600_000 },
+    { ...event(5, 'researcher', 'tool.execution', 0), timestamp: 'not-a-time' }
+  ];
+  render(ArchitectureView, { props: { events: odd, onwindow: vi.fn(), onactor: vi.fn(), onselect: vi.fn() } });
+  // 10 s of receipts: neither the 10-minute duration nor a 1970 fallback stretches it.
+  expect(screen.getByText('Observed activity over 10 s')).toBeInTheDocument();
+  expect(screen.getByText(/1 without a readable timestamp, not on the ruler/)).toBeInTheDocument();
+  expect(screen.getByText('1 event without a readable timestamp')).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /sequence 5/ })).not.toBeInTheDocument();
+});
