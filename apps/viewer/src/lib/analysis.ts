@@ -1,5 +1,5 @@
-import { nativeExitCode, nativeOf, nativeText, nativeType, payloadError, payloadModel, payloadTool, payloadTotalTokens } from './nativePayload';
-import type { EventCategory, EventFilters, TraceEvent, TraceManifest } from './types';
+import { nativeExitCode, nativeFailure, nativeOf, nativeText, nativeType, payloadError, payloadModel, payloadTool, payloadTotalTokens, record } from './nativePayload';
+import { isAbandoned, type EventCategory, type EventFilters, type TraceEvent, type TraceManifest } from './types';
 
 export type ActorRole = 'process' | 'agent' | 'subagent' | 'human' | 'system';
 
@@ -21,7 +21,7 @@ export interface ActorInventory {
 }
 
 export interface RunHealth {
-  label: 'Running' | 'Awaiting approval' | 'Blocked' | 'Needs attention' | 'Interrupted' | 'Failed' | 'Passed' | 'Unverified';
+  label: 'Running' | 'Abandoned' | 'Awaiting approval' | 'Blocked' | 'Needs attention' | 'Interrupted' | 'Failed' | 'Passed' | 'Unverified';
   tone: 'running' | 'warning' | 'error' | 'success';
   detail: string;
 }
@@ -54,7 +54,55 @@ export function isIssue(event: TraceEvent): boolean {
   const kind = event.kind.trim().toLowerCase();
   return ['error', 'failed', 'denied', 'blocked'].includes(status)
     || kind.includes('error')
-    || kind.includes('fail');
+    || kind.includes('fail')
+    || statesNativeFailure(event);
+}
+
+const nativeFailures = new WeakMap<TraceEvent, boolean>();
+
+/**
+ * Older adapter traces record a provider's explicit failure only under payload.native.
+ * The predicate runs for every row and count, so the decoded answer is kept per event.
+ */
+function statesNativeFailure(event: TraceEvent): boolean {
+  // Most events are not adapter envelopes; skip decoding their payload.
+  if (!event.payload_json.includes('"native"')) return false;
+  const known = nativeFailures.get(event);
+  if (known !== undefined) return known;
+  let failed = false;
+  try {
+    const payload = record(JSON.parse(event.payload_json));
+    failed = payload !== null && nativeFailure(payload, event.correlation_id);
+  } catch {
+    failed = false;
+  }
+  nativeFailures.set(event, failed);
+  return failed;
+}
+
+/**
+ * Pending events nobody has answered yet. A request is settled by a later `approval.decision`, or by
+ * any later approved/denied event, that shares its correlation id or span.
+ */
+export function awaitingApprovals(events: TraceEvent[]): TraceEvent[] {
+  const decidedCorrelations = new Set<string>();
+  const decidedSpans = new Set<string>();
+  const awaiting: TraceEvent[] = [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const status = event.status.trim().toLowerCase();
+    if (status === 'pending') {
+      const settled = (event.correlation_id !== '' && decidedCorrelations.has(event.correlation_id))
+        || (event.span_id !== '' && decidedSpans.has(event.span_id));
+      if (!settled) awaiting.push(event);
+      continue;
+    }
+    if (['approved', 'denied'].includes(status) || event.kind.trim().toLowerCase() === 'approval.decision') {
+      if (event.correlation_id) decidedCorrelations.add(event.correlation_id);
+      if (event.span_id) decidedSpans.add(event.span_id);
+    }
+  }
+  return awaiting.reverse();
 }
 
 export function categoryOf(event: TraceEvent): EventCategory {
@@ -71,6 +119,7 @@ export function familyOf(event: TraceEvent): Exclude<EventCategory, 'all' | 'err
 
 export function summarizeAgents(events: TraceEvent[]): AgentSummary[] {
   const actors = new Map<string, AgentSummary>();
+  const awaiting = new Set(awaitingApprovals(events));
   for (const event of events) {
     const id = actorId(event);
     const current = actors.get(id) ?? {
@@ -85,7 +134,7 @@ export function summarizeAgents(events: TraceEvent[]): AgentSummary[] {
     if (categoryOf(event) === 'error' || ['failed', 'denied', 'blocked'].includes(event.status)) {
       current.errors += 1;
       current.status = 'error';
-    } else if (['running', 'pending'].includes(event.status) && current.status !== 'error') {
+    } else if ((event.status === 'running' || awaiting.has(event)) && current.status !== 'error') {
       current.status = event.status;
     }
     actors.set(id, current);
@@ -113,9 +162,16 @@ export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth
       detail: trace.integrity_detail?.trim() || 'Journal failed integrity verification'
     };
   }
+  if (isAbandoned(trace)) {
+    return {
+      label: 'Abandoned',
+      tone: 'warning',
+      detail: trace.integrity_detail?.trim() || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.'
+    };
+  }
   const errorCount = events.filter((event) => categoryOf(event) === 'error').length;
   const deniedCount = events.filter((event) => ['denied', 'blocked'].includes(event.status)).length;
-  const pendingCount = events.filter((event) => event.status === 'pending').length;
+  const pendingCount = awaitingApprovals(events).length;
   if (trace.termination?.kind === 'interrupted') {
     return { label: 'Interrupted', tone: 'warning', detail: 'Recovered after recorder interruption' };
   }
@@ -276,7 +332,10 @@ export function filterEvents(events: TraceEvent[], filters: EventFilters): Trace
     if (filters.category === 'error' && !isIssue(event)) return false;
     if (filters.category !== 'all' && filters.category !== 'error' && familyOf(event) !== filters.category) return false;
     if (!query) return true;
-    return [event.kind, event.source, actorId(event), event.status, event.correlation_id, event.payload_json]
+    return [
+      event.kind, event.source, actorId(event), event.status,
+      event.event_id, event.span_id, event.parent_span_id, event.correlation_id, event.payload_json
+    ]
       .join(' ')
       .toLowerCase()
       .includes(query);

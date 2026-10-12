@@ -33,6 +33,8 @@ use tokio::process::Command;
 use tower_http::services::{ServeDir, ServeFile};
 
 pub mod evidence;
+pub mod issues;
+pub mod liveness;
 
 /// Viewer static assets compiled into the `premier` binary.
 #[derive(RustEmbed)]
@@ -233,7 +235,7 @@ fn trace_snapshot(state: &AppState, path: &Path) -> Result<TraceSnapshot> {
     if let Some((cached_stamp, snapshot)) = state.snapshots.lock().unwrap().get(path)
         && *cached_stamp == stamp
     {
-        return Ok(snapshot.clone());
+        return Ok(with_recorder_liveness(path, snapshot.clone()));
     }
     let snapshot = compute_trace_snapshot(path)?;
     state
@@ -241,7 +243,19 @@ fn trace_snapshot(state: &AppState, path: &Path) -> Result<TraceSnapshot> {
         .lock()
         .unwrap()
         .insert(path.to_path_buf(), (stamp, snapshot.clone()));
-    Ok(snapshot)
+    Ok(with_recorder_liveness(path, snapshot))
+}
+
+/// Whether an unfinalized trace is still being recorded depends on the clock
+/// and the recorder lease, not on the files the snapshot cache is keyed by, so
+/// it is decided on every read.
+fn with_recorder_liveness(path: &Path, mut snapshot: TraceSnapshot) -> TraceSnapshot {
+    if snapshot.integrity.status == IntegrityStatus::Live
+        && let Some(integrity) = liveness::unfinalized_integrity(path, &snapshot.manifest)
+    {
+        snapshot.integrity = integrity;
+    }
+    snapshot
 }
 
 fn compute_trace_snapshot(path: &Path) -> Result<TraceSnapshot> {
@@ -1178,45 +1192,12 @@ fn serialize_bounded<T: Serialize>(
     Ok(bounded)
 }
 
+/// Redact trace content bound for an assistant prompt with the same rules as
+/// `premier export`: the shared secret field names
+/// ([`premier_trace::DEFAULT_REDACTED_FIELDS`]) and the built-in secret value
+/// patterns, applied to every string because the prompt leaves this machine.
 fn redact_sensitive_fields(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, child) in object.iter_mut() {
-                let normalized = key.to_ascii_lowercase().replace(['-', ' '], "_");
-                let sensitive = normalized.contains("password")
-                    || normalized.contains("secret")
-                    || normalized.contains("token")
-                    || normalized.contains("authorization")
-                    || normalized.contains("cookie")
-                    || normalized.ends_with("api_key")
-                    || normalized.ends_with("private_key");
-                if sensitive {
-                    *child = serde_json::Value::String("[REDACTED BY PREMIER]".into());
-                } else {
-                    redact_sensitive_fields(child);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_sensitive_fields(item);
-            }
-        }
-        serde_json::Value::String(text) => {
-            if let Ok(mut nested) = serde_json::from_str::<serde_json::Value>(text)
-                && matches!(
-                    nested,
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                )
-            {
-                redact_sensitive_fields(&mut nested);
-                if let Ok(serialized) = serde_json::to_string(&nested) {
-                    *text = serialized;
-                }
-            }
-        }
-        _ => {}
-    }
+    evidence::redact_secrets(value);
 }
 
 fn assistant_args(provider: &str, prompt: &str) -> Option<Vec<String>> {
@@ -1538,7 +1519,10 @@ fn summarize_trace(manifest: &TraceManifest, events: &[TraceEvent]) -> TraceList
             .map(str::to_owned)
             .or_else(|| event_display_name(events)),
         actor_count: actors.len() as u64,
-        issue_count: events.iter().filter(|event| is_issue(event)).count() as u64,
+        issue_count: events
+            .iter()
+            .filter(|event| issues::is_issue(event))
+            .count() as u64,
         event_count: events.len() as u64,
     }
 }
@@ -1561,14 +1545,6 @@ fn event_display_name(events: &[TraceEvent]) -> Option<String> {
 fn human_readable_text(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
-}
-
-fn is_issue(event: &TraceEvent) -> bool {
-    let status = event.status.to_ascii_lowercase();
-    let kind = event.kind.to_ascii_lowercase();
-    matches!(status.as_str(), "error" | "failed" | "denied" | "blocked")
-        || kind.contains("error")
-        || kind.contains("fail")
 }
 
 async fn get_trace(
@@ -2354,6 +2330,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_and_detail_report_abandoned_traces_with_the_recover_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_dir = temp.path().join("traces");
+        let unfinished = |name: &str, lease: Option<String>| {
+            let trace = trace_dir.join(name);
+            let mut writer = TraceWriter::create(&trace, vec![name.to_owned()]).unwrap();
+            writer
+                .append("session.start", "test", serde_json::json!({}))
+                .unwrap();
+            drop(writer);
+            if let Some(lease) = lease {
+                fs::write(trace.join(premier_trace::RECORDER_LEASE), lease).unwrap();
+            }
+            trace
+        };
+        let abandoned = unfinished("abandoned.atrace", None);
+        // This test process stands in for a recorder that is still running.
+        unfinished("live.atrace", Some(std::process::id().to_string()));
+        let viewer = temp.path().join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        let app = app(trace_dir, Some(viewer), AuthPolicy::default());
+
+        // Asked twice: the answer must not be frozen by the snapshot cache.
+        for _ in 0..2 {
+            let list = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/traces")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(list.status(), StatusCode::OK);
+            let body = to_bytes(list.into_body(), 64 * 1024).await.unwrap();
+            let list_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let entry = |artifact: &str| {
+                list_json
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["artifact"] == artifact)
+                    .unwrap()
+                    .clone()
+            };
+            let live = entry("live.atrace");
+            assert_eq!(live["integrity"], "live");
+            assert!(live.get("integrity_detail").is_none());
+            let gone = entry("abandoned.atrace");
+            assert_eq!(gone["integrity"], "abandoned");
+            let detail = gone["integrity_detail"].as_str().unwrap();
+            assert!(
+                detail.contains(&format!("premier recover --force {}", abandoned.display())),
+                "{detail}"
+            );
+
+            let trace_id = gone["trace_id"].as_str().unwrap();
+            let detail = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/traces/{trace_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(detail.status(), StatusCode::OK);
+            let body = to_bytes(detail.into_body(), 64 * 1024).await.unwrap();
+            let detail_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(detail_json["integrity"], "abandoned");
+            assert!(
+                detail_json["integrity_detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("premier recover"),
+                "{detail_json}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn list_and_detail_expose_invalid_integrity_for_tampered_traces() {
         let temp = tempfile::tempdir().unwrap();
         let trace_dir = temp.path().join("traces");
@@ -2734,8 +2794,40 @@ mod tests {
         let serialized = serialize_bounded(&encoded, 8_000).unwrap();
         assert!(!serialized.contains("sk-secret-value"));
         assert!(!serialized.contains("private-token"));
-        assert!(serialized.contains("REDACTED BY PREMIER"));
+        assert!(serialized.contains(evidence::REDACTED));
         assert!(serialized.contains("diagnostic evidence"));
+    }
+
+    #[test]
+    fn assistant_context_uses_the_shared_secret_rules() {
+        let shaped = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let mut value = serde_json::json!({
+            "passwd": "pw-one",
+            "apiKey": "key-two",
+            "credentials": {"user": "u", "pass": "pw-three"},
+            "env": ["DB_PASSWORD=pw-four", "HOME=/home/agent"],
+            "note": format!("pushed with {shaped}"),
+            "usage": {"input_tokens": 1200, "output_tokens": 400, "max_tokens": 4096},
+            "token_count": 7,
+            "commit": "7ebad3a1c0ffee00deadbeef0123456789abcdef"
+        });
+        redact_sensitive_fields(&mut value);
+        let text = value.to_string();
+        for secret in ["pw-one", "key-two", "pw-three", "pw-four", shaped.as_str()] {
+            assert!(!text.contains(secret), "{secret} survived: {text}");
+        }
+        assert_eq!(value["passwd"], evidence::REDACTED);
+        assert_eq!(value["apiKey"], evidence::REDACTED);
+        assert_eq!(value["credentials"], evidence::REDACTED);
+        assert_eq!(value["note"], "pushed with [REDACTED]");
+        assert_eq!(value["env"][1], "HOME=/home/agent");
+        // Token counts are evidence, not secrets.
+        assert_eq!(
+            value["usage"],
+            serde_json::json!({"input_tokens": 1200, "output_tokens": 400, "max_tokens": 4096})
+        );
+        assert_eq!(value["token_count"], 7);
+        assert_eq!(value["commit"], "7ebad3a1c0ffee00deadbeef0123456789abcdef");
     }
 
     #[tokio::test]

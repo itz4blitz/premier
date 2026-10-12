@@ -1643,3 +1643,422 @@ fn encrypt_command_migrates_and_verifies_a_finalized_trace() {
     let stored = std::fs::read_to_string(trace.join("manifest.json")).unwrap();
     assert!(!stored.contains("private-command"));
 }
+
+#[test]
+fn diff_and_replay_refuse_an_unverifiable_trace_unless_explicitly_allowed() {
+    let temp = tempfile::tempdir().unwrap();
+    let intact = temp.path().join("intact.atrace");
+    let tampered = temp.path().join("tampered.atrace");
+    evidence_trace(&intact, "baseline");
+    evidence_trace(&tampered, "current");
+    break_journal_digest(&tampered);
+    let premier = env!("CARGO_BIN_EXE_premier");
+    let run =
+        |arguments: &[&std::ffi::OsStr]| Command::new(premier).args(arguments).output().unwrap();
+    let intact_arg = intact.as_os_str();
+    let tampered_arg = tampered.as_os_str();
+    let os = std::ffi::OsStr::new;
+
+    // Either side of a comparison failing verification fails the comparison.
+    for arguments in [
+        vec![os("diff"), intact_arg, tampered_arg, os("--json")],
+        vec![os("diff"), tampered_arg, intact_arg, os("--json")],
+        vec![os("replay"), tampered_arg, os("--no-sleep")],
+    ] {
+        let output = run(&arguments);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{arguments:?} must fail closed");
+        assert!(output.stdout.is_empty(), "{arguments:?} printed evidence");
+        assert!(stderr.contains("failed verification"), "{stderr}");
+        assert!(stderr.contains("--allow-unverified"), "{stderr}");
+    }
+
+    let diff = run(&[
+        os("diff"),
+        intact_arg,
+        tampered_arg,
+        os("--json"),
+        os("--allow-unverified"),
+    ]);
+    let stderr = String::from_utf8_lossy(&diff.stderr);
+    assert!(diff.status.success(), "{stderr}");
+    assert!(stderr.contains("warning"), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&diff.stdout).unwrap();
+    assert_eq!(result["counts"]["added"], 1);
+
+    let replay = run(&[
+        os("replay"),
+        tampered_arg,
+        os("--no-sleep"),
+        os("--allow-unverified"),
+    ]);
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(replay.status.success(), "{stderr}");
+    assert!(stderr.contains("failed verification"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&replay.stdout).lines().count(), 3);
+}
+
+#[test]
+fn diff_and_replay_read_a_live_trace_with_a_stderr_note() {
+    let temp = tempfile::tempdir().unwrap();
+    let live = temp.path().join("live.atrace");
+    let finished = temp.path().join("finished.atrace");
+    evidence_trace(&finished, "baseline");
+    let mut writer = premier_trace::TraceWriter::create(&live, vec!["agent".into()]).unwrap();
+    writer
+        .append("agent.turn", "test", serde_json::json!({"live": true}))
+        .unwrap();
+    let premier = env!("CARGO_BIN_EXE_premier");
+    let diff = Command::new(premier)
+        .arg("diff")
+        .arg(&finished)
+        .arg(&live)
+        .output()
+        .unwrap();
+    let replay = Command::new(premier)
+        .arg("replay")
+        .arg(&live)
+        .arg("--no-sleep")
+        .output()
+        .unwrap();
+    for output in [diff, replay] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("not finalized"), "{stderr}");
+    }
+    drop(writer);
+}
+
+/// A trace whose recorder never finalized it, as left behind by a crash.
+#[cfg(unix)]
+fn unfinalized_trace(trace: &std::path::Path, lease: String) {
+    let mut writer = premier_trace::TraceWriter::create(trace, vec!["agent".into()]).unwrap();
+    writer
+        .append("session.start", "test", serde_json::json!({"live": true}))
+        .unwrap();
+    drop(writer);
+    std::fs::write(trace.join(premier_trace::RECORDER_LEASE), lease).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn recover_refuses_a_trace_whose_recorder_is_alive_even_past_the_idle_threshold() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("live.atrace");
+    // This test process stands in for a recorder that is still running.
+    unfinalized_trace(&trace, std::process::id().to_string());
+    let premier = env!("CARGO_BIN_EXE_premier");
+
+    let guarded = Command::new(premier)
+        .arg("recover")
+        .arg(&trace)
+        .args(["--stale-after-seconds", "0"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&guarded.stderr);
+    assert!(!guarded.status.success(), "a live recording was finalized");
+    assert!(stderr.contains("still being recorded"), "{stderr}");
+    assert!(stderr.contains(&std::process::id().to_string()), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+    assert!(
+        premier_trace::read_manifest(&trace)
+            .unwrap()
+            .journal
+            .is_none()
+    );
+
+    let forced = Command::new(premier)
+        .arg("recover")
+        .arg(&trace)
+        .arg("--force")
+        .output()
+        .unwrap();
+    assert!(
+        forced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    premier_trace::verify(&trace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn recover_finalizes_a_fresh_trace_without_force_when_its_recorder_is_dead() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("dead.atrace");
+    // A reaped child's process id names a recorder that is certainly gone.
+    let mut finished = Command::new("true").spawn().unwrap();
+    let dead_pid = finished.id();
+    finished.wait().unwrap();
+    unfinalized_trace(&trace, dead_pid.to_string());
+    let premier = env!("CARGO_BIN_EXE_premier");
+
+    let listed = Command::new(premier)
+        .args(["list", "--trace-dir"])
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains("premier recover"), "{listed}");
+    assert!(!listed.contains("--force"), "{listed}");
+
+    let recovered = Command::new(premier)
+        .arg("recover")
+        .arg(&trace)
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    premier_trace::verify(&trace).unwrap();
+    let manifest = premier_trace::read_manifest(&trace).unwrap();
+    assert_eq!(
+        manifest.termination.unwrap().kind,
+        premier_trace::TerminationKind::Interrupted
+    );
+    assert!(!trace.join(premier_trace::RECORDER_LEASE).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn recorder_sighup_is_forwarded_and_finalized() {
+    assert_recorder_signal_is_forwarded("-HUP", libc::SIGHUP, 128 + libc::SIGHUP, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn recorder_sigquit_is_forwarded_and_finalized() {
+    assert_recorder_signal_is_forwarded("-QUIT", libc::SIGQUIT, 128 + libc::SIGQUIT, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_recorder_sighup_and_sigquit_are_forwarded_to_the_process_group_and_finalized() {
+    assert_recorder_signal_is_forwarded("-HUP", libc::SIGHUP, 128 + libc::SIGHUP, true);
+    assert_recorder_signal_is_forwarded("-QUIT", libc::SIGQUIT, 128 + libc::SIGQUIT, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn recorder_sighup_and_sigquit_keep_a_handling_childs_status_and_escalate_when_ignored() {
+    for (kill_argument, trap_name, signal) in [
+        ("-HUP", "HUP", libc::SIGHUP),
+        ("-QUIT", "QUIT", libc::SIGQUIT),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let handled = temp.path().join("handled.atrace");
+        let script = format!(
+            "trap 'echo cleaned; exit 7' {trap_name}; echo READY; while :; do sleep 0.1; done"
+        );
+        let (mut recorder, _stdout) = spawn_ready_recorder(&handled, false, "60000", &script);
+        signal_process(kill_argument, recorder.id());
+        let status = wait_bounded(&mut recorder, || {});
+        assert_eq!(status.code(), Some(7), "{trap_name}");
+        premier_trace::verify(&handled).unwrap();
+        let exit = process_exit_payload(&handled);
+        assert_eq!(exit["termination"], "exit", "{trap_name}");
+        assert_eq!(exit["recorder_signal"], signal, "{trap_name}");
+        assert_eq!(exit["recorder_signal_name"], format!("SIG{trap_name}"));
+
+        let ignored = temp.path().join("ignored.atrace");
+        let script = format!("trap '' {trap_name}; echo READY; exec sleep 300");
+        let (mut recorder, _stdout) = spawn_ready_recorder(&ignored, false, "300", &script);
+        signal_process(kill_argument, recorder.id());
+        let status = wait_bounded(&mut recorder, || {});
+        assert_eq!(status.code(), Some(128 + libc::SIGKILL), "{trap_name}");
+        premier_trace::verify(&ignored).unwrap();
+        let exit = process_exit_payload(&ignored);
+        assert_eq!(exit["recorder_signal"], signal, "{trap_name}");
+        assert_eq!(exit["killed_by_recorder"], true, "{trap_name}");
+    }
+}
+
+fn assert_failed_start_is_finalized(
+    recorded: &std::process::Output,
+    trace: &std::path::Path,
+    exit_code: i32,
+) {
+    let stderr = String::from_utf8_lossy(&recorded.stderr);
+    assert_eq!(recorded.status.code(), Some(exit_code), "{stderr}");
+    assert!(stderr.contains("failed to start"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    // The directory is a finalized, verifiable trace, not an abandoned one.
+    premier_trace::verify(trace).unwrap();
+    assert!(!trace.join(premier_trace::RECORDER_LEASE).exists());
+    let manifest = premier_trace::read_manifest(trace).unwrap();
+    assert_eq!(manifest.exit_code, Some(exit_code));
+    let events = read_events(trace).unwrap();
+    let failure = events
+        .iter()
+        .find(|event| event.kind == "process.spawn_failed")
+        .expect("process.spawn_failed event");
+    assert_eq!(failure.status, "error");
+    assert_eq!(failure.payload()["exit_code"], exit_code);
+    assert!(
+        failure.payload()["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
+    assert!(!events.iter().any(|event| event.kind == "process.exit"));
+    let listed = Command::new(env!("CARGO_BIN_EXE_premier"))
+        .args(["list", "--trace-dir"])
+        .arg(trace.parent().unwrap())
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(!listed.contains("recover"), "{listed}");
+    assert!(!listed.contains("recording"), "{listed}");
+}
+
+#[test]
+fn record_finalizes_the_trace_and_exits_127_when_the_command_is_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("missing.atrace");
+    let recorded = Command::new(env!("CARGO_BIN_EXE_premier"))
+        .args(["record", "--output"])
+        .arg(&trace)
+        .arg("premier-test-command-that-does-not-exist")
+        .output()
+        .unwrap();
+    assert_failed_start_is_finalized(&recorded, &trace, 127);
+    let stderr = String::from_utf8_lossy(&recorded.stderr);
+    assert!(stderr.contains("command not found"), "{stderr}");
+    assert!(
+        stderr.contains("premier-test-command-that-does-not-exist"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn record_exits_126_when_the_command_exists_but_cannot_be_executed() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let not_executable = temp.path().join("not-executable");
+    std::fs::write(&not_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    for pty in [false, true] {
+        let traces = temp.path().join(format!("pty-{pty}"));
+        let trace = traces.join("denied.atrace");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_premier"));
+        command.arg("record");
+        if pty {
+            command.arg("--pty");
+        }
+        let recorded = command
+            .arg("--output")
+            .arg(&trace)
+            .arg(&not_executable)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_failed_start_is_finalized(&recorded, &trace, 126);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_record_finalizes_the_trace_and_exits_127_when_the_command_is_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("missing-pty.atrace");
+    let recorded = Command::new(env!("CARGO_BIN_EXE_premier"))
+        .args(["record", "--pty", "--output"])
+        .arg(&trace)
+        .arg("premier-test-command-that-does-not-exist")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failed_start_is_finalized(&recorded, &trace, 127);
+}
+
+/// `GET path` against a local viewer: the whole HTTP response, or `None`
+/// while the server is not accepting connections yet.
+#[cfg(unix)]
+fn http_get(port: u16, path: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
+}
+
+#[cfg(unix)]
+#[test]
+fn record_open_serves_only_the_recorded_trace_not_its_siblings() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let traces = temp.path().join("traces");
+    std::fs::create_dir_all(&traces).unwrap();
+    let sibling = traces.join("sibling.atrace");
+    evidence_trace(&sibling, "baseline");
+    let sibling_id = premier_trace::read_manifest(&sibling).unwrap().trace_id;
+    let recorded = traces.join("recorded.atrace");
+
+    // Never launch a real browser: shadow the platform opener with a no-op.
+    let stubs = temp.path().join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    for opener in ["open", "xdg-open"] {
+        let stub = stubs.join(opener);
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut path = std::ffi::OsString::from(&stubs);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let viewer = temp.path().join("viewer");
+    std::fs::create_dir_all(&viewer).unwrap();
+    std::fs::write(viewer.join("index.html"), "<!doctype html>").unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    let mut recorder = Command::new(env!("CARGO_BIN_EXE_premier"))
+        .args(["record", "--open", "--bind", &format!("127.0.0.1:{port}")])
+        .arg("--viewer-dir")
+        .arg(&viewer)
+        .arg("--output")
+        .arg(&recorded)
+        .args(["sh", "-c", "echo recorded"])
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let listed = loop {
+        if let Some(response) = http_get(port, "/api/traces") {
+            break response;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            recorder.kill().unwrap();
+            panic!("viewer did not start within 30s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let sibling_lookup = http_get(port, &format!("/api/traces/{sibling_id}"));
+    recorder.kill().unwrap();
+    recorder.wait().unwrap();
+
+    let recorded_id = premier_trace::read_manifest(&recorded).unwrap().trace_id;
+    assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
+    assert!(listed.contains(&recorded_id), "{listed}");
+    assert!(!listed.contains(&sibling_id), "sibling published: {listed}");
+    let sibling_lookup = sibling_lookup.expect("sibling lookup response");
+    assert!(
+        sibling_lookup.starts_with("HTTP/1.1 404"),
+        "{sibling_lookup}"
+    );
+}

@@ -47,3 +47,21 @@ it('surfaces an integrity chip for invalid journals instead of Passed', () => {
   expect(screen.getByText('Integrity failed')).toBeInTheDocument();
   expect(screen.getByRole('status')).toHaveAttribute('title', 'journal digest mismatch');
 });
+
+it('tells the reader an abandoned recording needs premier recover', () => {
+  const abandoned: TraceManifest = {
+    ...trace, ended_at: null, exit_code: null, integrity: 'abandoned',
+    integrity_detail: 'The recorder is no longer running. Run `premier recover /traces/a.atrace` to finalize this trace.'
+  };
+  const events = [event(1, 'root', 'process', 'process.stdout')];
+  const compact = render(RunOverview, { props: { compact: true, trace: abandoned, events } });
+  expect(screen.getByText('Abandoned')).toBeInTheDocument();
+  expect(screen.queryByText('Running')).not.toBeInTheDocument();
+  expect(screen.getByRole('status')).toHaveTextContent('Abandoned — run premier recover');
+  expect(screen.getByRole('status')).toHaveAttribute('title', abandoned.integrity_detail);
+  compact.unmount();
+
+  render(RunOverview, { props: { trace: abandoned, events } });
+  expect(screen.getByRole('status')).toHaveTextContent('Abandoned — run premier recover');
+  expect(screen.getByRole('status')).toHaveTextContent('premier recover /traces/a.atrace');
+});

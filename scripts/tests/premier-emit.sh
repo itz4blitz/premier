@@ -118,6 +118,32 @@ run_emit "$OK_PORT" \
 [[ "$EMIT_STATUS" -eq 0 ]] || fail "emit with a proxy configured exited $EMIT_STATUS: $(cat "$WORK/err")"
 [[ -s "$WORK/ok.log" ]] || fail "collector did not receive the event when a proxy was configured"
 
+# Every loopback spelling of the collector bypasses the proxy.
+for host in localhost LOCALHOST 127.0.0.1; do
+  : >"$WORK/ok.log"
+  run_emit "$OK_PORT" \
+    "PREMIER_COLLECTOR_URL=http://$host:$OK_PORT/v1/events" \
+    "http_proxy=http://127.0.0.1:$STUB_PORT" "all_proxy=http://127.0.0.1:$STUB_PORT"
+  [[ ! -s "$WORK/proxy.log" ]] || fail "$host event was sent through the proxy: $(cat "$WORK/proxy.log")"
+  [[ "$EMIT_STATUS" -eq 0 ]] || fail "emit to $host with a proxy configured exited $EMIT_STATUS: $(cat "$WORK/err")"
+  [[ -s "$WORK/ok.log" ]] || fail "collector did not receive the $host event"
+done
+
+# A remote collector may only be reachable through a mandatory proxy, so the
+# proxy settings apply to it. `.invalid` never resolves: the event can only
+# arrive via the proxy. A name that merely starts like a loopback address is
+# remote too.
+for host in collector.premier.invalid 127.0.0.1.premier.invalid localhost.premier.invalid; do
+  : >"$WORK/proxy.log"
+  run_emit "$OK_PORT" \
+    "PREMIER_COLLECTOR_URL=http://$host/v1/events" \
+    "http_proxy=http://127.0.0.1:$STUB_PORT"
+  [[ "$EMIT_STATUS" -eq 0 ]] || fail "remote collector $host behind a proxy exited $EMIT_STATUS: $(cat "$WORK/err")"
+  grep -q "http://$host/v1/events Bearer secret-token" "$WORK/proxy.log" ||
+    fail "remote collector $host was not reached through the proxy: $(cat "$WORK/proxy.log")"
+done
+: >"$WORK/proxy.log"
+
 # A collector that never answers must not hang the caller.
 start_stub hang hang
 STARTED="$(date +%s)"

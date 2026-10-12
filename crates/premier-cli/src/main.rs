@@ -2,7 +2,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use premier_cli::evidence::{
-    DiffStatus, QueryOptions, diff_events, portable_evidence, query_events,
+    DiffStatus, QueryOptions, RedactionOptions, diff_events, portable_evidence_with, query_events,
+};
+use premier_cli::liveness::{
+    RecorderLiveness, UnfinalizedState, recorder_liveness, unfinalized_state,
 };
 use premier_cli::{
     AuthPolicy, ServerOptions, app_with_options, embedded_viewer_ready, instrumentation_app,
@@ -77,9 +80,25 @@ enum Commands {
         #[arg(long = "redact-literal")]
         redact_literals: Vec<String>,
         /// Regex to redact from persisted terminal output, event payloads, and the
-        /// recorded command line (terminal display stays raw). Matched per line.
+        /// recorded command line (terminal display stays raw). Regex rules are
+        /// line-scoped: in terminal output a match never spans a line break, so
+        /// write one rule per line of a multi-line secret. A line longer than
+        /// 256 KiB is stored in pieces, and only a match up to 16 KiB is
+        /// guaranteed across such a cut. A partial line (such as a prompt) is
+        /// stored after 1 second without output, so a match the output pauses
+        /// inside can be split; use --redact-literal for exact secrets.
         #[arg(long = "redact-regex")]
         redact_regexes: Vec<String>,
+        /// Do not apply the built-in secret value patterns (API keys, bearer
+        /// credentials, URL passwords, private key blocks, JWTs) to structured
+        /// event payloads and the recorded command line.
+        #[arg(long)]
+        no_default_secret_patterns: bool,
+        /// Also apply the built-in secret value patterns to persisted terminal
+        /// output, which is otherwise stored raw unless a --redact-literal or
+        /// --redact-regex rule matches.
+        #[arg(long)]
+        redact_known_secrets: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -164,11 +183,21 @@ enum Commands {
         allow_unverified: bool,
     },
     /// Export portable JSON evidence with common secret fields recursively redacted.
+    /// The `redaction` block reports the active rules and what was removed.
     Export {
         trace: PathBuf,
         /// Destination JSON file. Omit to write JSON to stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Do not apply the built-in secret value patterns (API keys, bearer
+        /// credentials, URL passwords, private key blocks, JWTs) to structured
+        /// event payloads and the recorded command line.
+        #[arg(long)]
+        no_default_secret_patterns: bool,
+        /// Also apply the built-in secret value patterns to captured terminal
+        /// output, which is otherwise exported as recorded.
+        #[arg(long)]
+        redact_known_secrets: bool,
         /// Export a finalized trace even though it fails `premier verify`.
         #[arg(long)]
         allow_unverified: bool,
@@ -180,6 +209,9 @@ enum Commands {
         /// Emit the complete structural comparison as JSON.
         #[arg(long)]
         json: bool,
+        /// Compare finalized traces even though one fails `premier verify`.
+        #[arg(long)]
+        allow_unverified: bool,
     },
     /// Replay recorded evidence timing only; this never re-executes the traced command.
     Replay {
@@ -190,6 +222,9 @@ enum Commands {
         /// Emit evidence immediately while preserving recorded order.
         #[arg(long)]
         no_sleep: bool,
+        /// Replay a finalized trace even though it fails `premier verify`.
+        #[arg(long)]
+        allow_unverified: bool,
     },
     /// List traces in a directory.
     List {
@@ -256,9 +291,13 @@ async fn main() -> Result<()> {
             redact_fields,
             redact_literals,
             redact_regexes,
+            no_default_secret_patterns,
+            redact_known_secrets,
             command,
         } => {
-            let redaction = RedactionConfig::new(redact_fields, redact_literals, redact_regexes)?;
+            let redaction = RedactionConfig::new(redact_fields, redact_literals, redact_regexes)?
+                .default_secret_patterns(!no_default_secret_patterns)
+                .known_secrets_in_terminal(redact_known_secrets);
             record(RecordOptions {
                 output,
                 name,
@@ -333,11 +372,24 @@ async fn main() -> Result<()> {
             stale_after_seconds,
             force,
         } => {
+            // The idle guard only approximates "is the recorder gone?"; the
+            // lease answers it directly when it names a process.
+            let mut skip_idle_guard = force;
+            if !force {
+                match recorder_liveness(&trace) {
+                    // Without a liveness probe the idle guard stays in charge.
+                    RecorderLiveness::Alive(pid) if cfg!(unix) => bail!(
+                        "trace is still being recorded by process {pid}; stop that recorder and let it finalize the trace, or pass --force to finalize it anyway"
+                    ),
+                    RecorderLiveness::Dead => skip_idle_guard = true,
+                    RecorderLiveness::Alive(_) | RecorderLiveness::Unknown => {}
+                }
+            }
             let manifest = recover_interrupted_trace(
                 &trace,
                 RecoveryOptions {
                     minimum_idle: StdDuration::from_secs(stale_after_seconds),
-                    force,
+                    force: skip_idle_guard,
                 },
             )?;
             println!(
@@ -394,21 +446,39 @@ async fn main() -> Result<()> {
         Commands::Export {
             trace,
             output,
+            no_default_secret_patterns,
+            redact_known_secrets,
             allow_unverified,
         } => {
             ensure_verified(&trace, allow_unverified)?;
-            export_trace(trace, output)
+            export_trace(
+                trace,
+                output,
+                RedactionOptions {
+                    default_secret_patterns: !no_default_secret_patterns,
+                    known_secrets_in_terminal: redact_known_secrets,
+                },
+            )
         }
         Commands::Diff {
             baseline,
             current,
             json,
-        } => diff_traces(baseline, current, json),
+            allow_unverified,
+        } => {
+            ensure_verified(&baseline, allow_unverified)?;
+            ensure_verified(&current, allow_unverified)?;
+            diff_traces(baseline, current, json)
+        }
         Commands::Replay {
             trace,
             speed,
             no_sleep,
-        } => replay_trace(trace, speed, no_sleep),
+            allow_unverified,
+        } => {
+            ensure_verified(&trace, allow_unverified)?;
+            replay_trace(trace, speed, no_sleep)
+        }
         Commands::List { trace_dir } => list(trace_dir),
         Commands::Open {
             trace,
@@ -420,16 +490,9 @@ async fn main() -> Result<()> {
             let mut options = server_options(no_assistant);
             let (trace_dir, focus) = if let Some(trace) = trace {
                 let manifest = read_manifest(&trace)?;
-                // Canonical so `.` and `dir/..` still name one directory entry:
-                // opening a trace must not publish its siblings.
-                let trace = fs::canonicalize(&trace)?;
-                options.only_artifact = Some(
-                    trace
-                        .file_name()
-                        .context("trace path has no directory name")?
-                        .to_owned(),
-                );
-                (trace_parent_dir(&trace), Some(manifest.trace_id))
+                let (trace_dir, only_artifact) = single_trace_scope(&trace)?;
+                options.only_artifact = Some(only_artifact);
+                (trace_dir, Some(manifest.trace_id))
             } else {
                 (trace_dir, None)
             };
@@ -472,6 +535,18 @@ fn server_options(no_assistant: bool) -> ServerOptions {
         disable_assistant: no_assistant || disabled_by_env,
         ..ServerOptions::default()
     }
+}
+
+/// The directory to serve and the one entry in it to publish when the viewer
+/// is opened for a single trace. Canonical so `.` and `dir/..` still name one
+/// directory entry: opening a trace must not publish its siblings.
+fn single_trace_scope(trace: &std::path::Path) -> Result<(PathBuf, std::ffi::OsString)> {
+    let trace = fs::canonicalize(trace)?;
+    let only_artifact = trace
+        .file_name()
+        .context("trace path has no directory name")?
+        .to_owned();
+    Ok((trace_parent_dir(&trace), only_artifact))
 }
 
 /// Gate evidence-reading commands on the same checks as `premier verify`.
@@ -564,10 +639,14 @@ fn query_trace(trace: PathBuf, options: QueryOptions, json_output: bool) -> Resu
     Ok(())
 }
 
-fn export_trace(trace: PathBuf, output: Option<PathBuf>) -> Result<()> {
+fn export_trace(
+    trace: PathBuf,
+    output: Option<PathBuf>,
+    redaction: RedactionOptions,
+) -> Result<()> {
     let manifest =
         read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
-    let export = portable_evidence(&manifest, &read_events(&trace)?);
+    let export = portable_evidence_with(&manifest, &read_events(&trace)?, redaction);
     if let Some(output) = output {
         let mut bytes = serde_json::to_vec_pretty(&export)?;
         bytes.push(b'\n');
@@ -586,7 +665,13 @@ fn export_trace(trace: PathBuf, output: Option<PathBuf>) -> Result<()> {
             return Err(error)
                 .with_context(|| format!("cannot publish export {}", output.display()));
         }
-        println!("exported redacted evidence to {}", output.display());
+        let counts = &export.redaction.redacted;
+        println!(
+            "exported redacted evidence to {} ({} value(s) redacted by this export, {} already redacted when recorded)",
+            output.display(),
+            counts.total,
+            counts.already_redacted
+        );
         Ok(())
     } else {
         print_json(&export)
@@ -801,11 +886,15 @@ async fn emit_event(args: EmitArgs) -> Result<()> {
         .filter(|seconds| *seconds > 0.0)
         .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
         .unwrap_or(std::time::Duration::from_secs(10));
-    // The collector is a loopback endpoint authenticated by a bearer token:
-    // never route the token or payload through HTTP(S)_PROXY / ALL_PROXY.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
+    // A loopback collector is authenticated only by its bearer token: never
+    // route that token or the payload through HTTP(S)_PROXY / ALL_PROXY. A
+    // remote collector keeps the environment's proxy settings, because a
+    // mandatory egress proxy may be the only route to it.
+    let mut client = reqwest::Client::builder().timeout(timeout);
+    if collector_is_loopback(&url) {
+        client = client.no_proxy();
+    }
+    let client = client
         .build()
         .context("failed to build the collector HTTP client")?;
     let response = client
@@ -829,6 +918,24 @@ async fn emit_event(args: EmitArgs) -> Result<()> {
         println!("ok");
     }
     Ok(())
+}
+
+/// Whether a collector URL names this machine: `localhost` (or a
+/// `.localhost` name), 127.0.0.0/8, or ::1. An unparsable URL is not loopback.
+fn collector_is_loopback(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    // `host_str` keeps the brackets of an IPv6 literal.
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return address.is_loopback();
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
 }
 
 fn open_browser(url: &str) -> Result<()> {
@@ -1258,14 +1365,66 @@ async fn record(options: RecordOptions) -> Result<()> {
                 terminal.expect("PTY terminal size"),
                 capture_environment,
                 &writer,
-            )?
+            )
         }
         #[cfg(not(unix))]
         unreachable!("non-Unix PTY request rejected before trace creation")
     } else {
-        capture_pipes(executable, &command[1..], capture_environment, &writer)?
+        capture_pipes(executable, &command[1..], capture_environment, &writer)
     };
     recorder_lease.stop()?;
+    let capture = match capture {
+        Ok(capture) => capture,
+        Err(error) => {
+            let failure = error.downcast::<SpawnFailure>()?;
+            // Nothing ran, but the trace directory already exists: finalize
+            // it as evidence of the failed start instead of leaving an
+            // unfinalized trace that looks like an interrupted recording.
+            let appended = writer
+                .lock()
+                .unwrap()
+                .append_input(EventInput {
+                    kind: "process.spawn_failed".into(),
+                    source: "premier".into(),
+                    actor_id: "root".into(),
+                    actor_type: "process".into(),
+                    span_id: "command".into(),
+                    parent_span_id: "session".into(),
+                    status: "error".into(),
+                    payload: json!({
+                        "executable": failure.executable,
+                        "error": failure.reason,
+                        "exit_code": failure.exit_code,
+                        "success": false,
+                    }),
+                    ..EventInput::default()
+                })
+                .map(drop);
+            let finalized = match appended {
+                Ok(()) => {
+                    finalize_recording(
+                        writer,
+                        shutdown_sender,
+                        collector_task,
+                        ProcessTermination::exited(failure.exit_code),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            eprintln!("premier: {failure}");
+            match finalized {
+                Ok(manifest) => {
+                    eprintln!("trace {} → {}", manifest.trace_id, output.display());
+                }
+                Err(error) => eprintln!(
+                    "premier: the trace of the failed start could not be finalized: {error:#}\npremier: finalize it with `premier recover --force {}`",
+                    output.display()
+                ),
+            }
+            std::process::exit(failure.exit_code)
+        }
+    };
     let termination = capture.termination;
     let recorder_signals = capture.recorder_signals;
     let mut faults = capture.faults;
@@ -1324,16 +1483,8 @@ async fn record(options: RecordOptions) -> Result<()> {
     );
     // From here on a recorder failure must not replace the command's own
     // exit status, so finalization errors are reported instead of returned.
-    let finalized: Result<premier_trace::TraceManifest> = async {
-        let _ = shutdown_sender.send(());
-        collector_task.await??;
-        let writer = Arc::try_unwrap(writer)
-            .map_err(|_| anyhow::anyhow!("collector still owns the trace writer"))?
-            .into_inner()
-            .map_err(|_| anyhow::anyhow!("trace writer lock was poisoned"))?;
-        writer.finish_termination(termination.clone())
-    }
-    .await;
+    let finalized =
+        finalize_recording(writer, shutdown_sender, collector_task, termination.clone()).await;
     match &finalized {
         Ok(manifest) => eprintln!("\ntrace {} → {}", manifest.trace_id, output.display()),
         Err(error) => eprintln!(
@@ -1365,12 +1516,17 @@ async fn record(options: RecordOptions) -> Result<()> {
     if let Ok(manifest) = finalized {
         eprintln!("next: premier open {}", output.display());
         if open_viewer && recorder_signals.received.is_none() {
+            // Like `premier open <trace>`: publish this recording only, not
+            // every other trace that happens to share its directory.
+            let (trace_dir, only_artifact) = single_trace_scope(&output)?;
+            let mut options = server_options(false);
+            options.only_artifact = Some(only_artifact);
             return serve_viewer(
-                trace_parent_dir(&output),
+                trace_dir,
                 viewer_dir,
                 bind,
                 AuthPolicy::default(),
-                server_options(false),
+                options,
                 Some(manifest.trace_id),
                 true,
                 None,
@@ -1384,6 +1540,56 @@ async fn record(options: RecordOptions) -> Result<()> {
         std::process::exit(code.clamp(1, 255))
     }
 }
+
+/// Stop the collector, reclaim the trace writer from it, and finalize.
+async fn finalize_recording(
+    writer: Arc<Mutex<TraceWriter>>,
+    shutdown_sender: tokio::sync::oneshot::Sender<()>,
+    collector_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    termination: ProcessTermination,
+) -> Result<premier_trace::TraceManifest> {
+    let _ = shutdown_sender.send(());
+    collector_task.await??;
+    let writer = Arc::try_unwrap(writer)
+        .map_err(|_| anyhow::anyhow!("collector still owns the trace writer"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("trace writer lock was poisoned"))?;
+    writer.finish_termination(termination)
+}
+
+/// The recorded command could not be started, so there is no child status.
+/// `exit_code` follows the shell convention: 127 when the command was not
+/// found, 126 when it was found but could not be executed.
+#[derive(Debug)]
+struct SpawnFailure {
+    executable: String,
+    reason: String,
+    exit_code: i32,
+}
+
+const EXIT_COMMAND_NOT_FOUND: i32 = 127;
+const EXIT_COMMAND_NOT_EXECUTABLE: i32 = 126;
+
+impl std::fmt::Display for SpawnFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            executable,
+            reason,
+            exit_code,
+        } = self;
+        let summary = if *exit_code == EXIT_COMMAND_NOT_FOUND {
+            "command not found"
+        } else {
+            "command could not be executed"
+        };
+        write!(
+            formatter,
+            "failed to start {executable}: {summary} ({reason}); nothing was run (exit status {exit_code})"
+        )
+    }
+}
+
+impl std::error::Error for SpawnFailure {}
 
 #[derive(Clone, Copy)]
 struct CaptureEnvironment<'a> {
@@ -1440,6 +1646,17 @@ const CHILD_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 const OUTPUT_QUIET_AFTER_EXIT: StdDuration = StdDuration::from_millis(250);
 /// Upper bound on draining after exit when a descendant keeps writing.
 const OUTPUT_DRAIN_LIMIT: StdDuration = StdDuration::from_secs(5);
+/// A partial line held back for a redaction rule (for example an interactive
+/// prompt) is journaled once its stream has been quiet this long, so it is
+/// not lost if the recorder is killed before the line ends.
+const HELD_OUTPUT_IDLE_FLUSH: StdDuration = StdDuration::from_secs(1);
+
+/// What the capture loop hands its callback.
+enum Captured<'a> {
+    Output(&'static str, &'a [u8]),
+    /// Periodic wake-up with no new output, used to flush idle held text.
+    Tick,
+}
 
 /// Hand captured output to `on_output` until the child has exited and its
 /// streams are drained. Finalization must not wait for end-of-file: a
@@ -1449,14 +1666,19 @@ const OUTPUT_DRAIN_LIMIT: StdDuration = StdDuration::from_secs(5);
 fn drain_child_output(
     receiver: mpsc::Receiver<(&'static str, Vec<u8>)>,
     mut try_wait: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
-    mut on_output: impl FnMut(&'static str, &[u8]),
+    mut on_output: impl FnMut(Captured<'_>),
 ) -> std::io::Result<(Option<std::process::ExitStatus>, bool)> {
     let mut status = None;
     let mut exited_at = None;
     let mut last_output = Instant::now();
     let mut next_poll = Instant::now();
+    let mut next_tick = Instant::now() + CHILD_POLL_INTERVAL;
     loop {
         let now = Instant::now();
+        if now >= next_tick {
+            on_output(Captured::Tick);
+            next_tick = now + CHILD_POLL_INTERVAL;
+        }
         if status.is_none() && now >= next_poll {
             status = try_wait()?;
             next_poll = now + CHILD_POLL_INTERVAL;
@@ -1473,7 +1695,7 @@ fn drain_child_output(
         }
         match receiver.recv_timeout(CHILD_POLL_INTERVAL) {
             Ok((stream, bytes)) => {
-                on_output(stream, &bytes);
+                on_output(Captured::Output(stream, &bytes));
                 last_output = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1497,7 +1719,15 @@ fn capture_pipes(
         .env("PREMIER_COLLECTOR_URL", environment.collector_url)
         .env("PREMIER_COLLECTOR_TOKEN", environment.collector_token)
         .spawn()
-        .with_context(|| format!("failed to start {executable}"))?;
+        .map_err(|error| SpawnFailure {
+            executable: executable.to_owned(),
+            exit_code: if error.kind() == std::io::ErrorKind::NotFound {
+                EXIT_COMMAND_NOT_FOUND
+            } else {
+                EXIT_COMMAND_NOT_EXECUTABLE
+            },
+            reason: error.to_string(),
+        })?;
 
     #[cfg(unix)]
     let signal_forwarder = UnixSignalForwarder::start(child.id())?;
@@ -1513,7 +1743,7 @@ fn capture_pipes(
     let mut mirror_stderr = true;
     let mut native_adapter = environment.native_provider.map(NativeAdapter::new);
     let mut faults = RecordingFaults::default();
-    let (status, output_open_at_exit) = drain_child_output(
+    let drained = drain_child_output(
         receiver,
         || {
             let status = child.try_wait()?;
@@ -1523,7 +1753,16 @@ fn capture_pipes(
             }
             Ok(status)
         },
-        |stream, bytes| {
+        |captured| {
+            let Captured::Output(stream, bytes) = captured else {
+                for (kind, pending) in [
+                    ("process.stdout", &mut stdout_pending),
+                    ("process.stderr", &mut stderr_pending),
+                ] {
+                    faults.note(append_idle_output(writer, kind, pending));
+                }
+                return;
+            };
             // A closed recorder stdout/stderr (for example `premier record -- cmd | head`)
             // stops mirroring but must never abort evidence capture.
             if stream == "stdout" {
@@ -1558,7 +1797,8 @@ fn capture_pipes(
                 faults.note(append_adapter_events(writer, adapter.push(bytes)));
             }
         },
-    )?;
+    );
+    // Held text is journaled before a capture error can end the run.
     for (stream, pending) in [
         ("stdout", &mut stdout_pending),
         ("stderr", &mut stderr_pending),
@@ -1572,6 +1812,7 @@ fn capture_pipes(
     if let Some(adapter) = native_adapter.as_mut() {
         faults.note(append_adapter_events(writer, adapter.finish()));
     }
+    let (status, output_open_at_exit) = drained?;
     let status = match status {
         Some(status) => status,
         None => child.wait()?,
@@ -1623,7 +1864,16 @@ fn capture_pty(
     let child = pair
         .slave
         .spawn_command(command)
-        .with_context(|| format!("failed to start {executable} in pseudo-terminal"))?;
+        .map_err(|error| SpawnFailure {
+            executable: executable.to_owned(),
+            exit_code: if command_exists(executable) {
+                EXIT_COMMAND_NOT_EXECUTABLE
+            } else {
+                EXIT_COMMAND_NOT_FOUND
+            },
+            // portable-pty lists every PATH entry it tried, one per line.
+            reason: format!("{error:#}").replace('\n', " "),
+        })?;
     drop(pair.slave);
     let child_pid = child
         .process_id()
@@ -1652,7 +1902,7 @@ fn capture_pty(
     let mut pending = PendingOutput::new(writer, "process.terminal");
     let mut mirror = true;
     let mut faults = RecordingFaults::default();
-    let (status, output_open_at_exit) = drain_child_output(
+    let drained = drain_child_output(
         receiver,
         || {
             let status = wait_for_pid(child_pid, false)?;
@@ -1661,7 +1911,11 @@ fn capture_pty(
             }
             Ok(status)
         },
-        |_, bytes| {
+        |captured| {
+            let Captured::Output(_, bytes) = captured else {
+                faults.note(append_idle_output(writer, "process.terminal", &mut pending));
+                return;
+            };
             if mirror {
                 mirror = std::io::stdout()
                     .write_all(bytes)
@@ -1675,12 +1929,14 @@ fn capture_pty(
                 bytes,
             ));
         },
-    )?;
+    );
+    // Held text is journaled before a capture error can end the run.
     faults.note(append_pending_utf8(
         writer,
         "process.terminal",
         &mut pending,
     ));
+    let (status, output_open_at_exit) = drained?;
     let status = match status {
         Some(status) => status,
         None => loop {
@@ -1699,6 +1955,20 @@ fn capture_pty(
         output_open_at_exit,
         faults,
     })
+}
+
+/// Whether `executable` names an existing file, looked up the way a spawn
+/// does: as a path when it contains a separator, otherwise through `PATH`.
+/// portable-pty reports a failed start only as text, so this tells "not
+/// found" apart from "found but not executable".
+#[cfg(unix)]
+fn command_exists(executable: &str) -> bool {
+    let path = std::path::Path::new(executable);
+    if executable.contains('/') {
+        return path.exists();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(path).exists()))
 }
 
 /// Reap the PTY child with `waitpid` directly. portable-pty's own exit status
@@ -1732,6 +2002,8 @@ fn wait_for_pid(pid: i32, block: bool) -> std::io::Result<Option<std::process::E
 struct PendingOutput {
     utf8: Vec<u8>,
     redaction: premier_trace::TerminalRedactionBuffer,
+    /// When this stream last produced output.
+    last_output: Instant,
 }
 
 impl PendingOutput {
@@ -1739,7 +2011,24 @@ impl PendingOutput {
         Self {
             utf8: Vec::new(),
             redaction: writer.lock().unwrap().terminal_redaction_buffer(kind),
+            last_output: Instant::now(),
         }
+    }
+}
+
+/// Journal the partial line a redaction rule is holding back once its stream
+/// has been quiet for [`HELD_OUTPUT_IDLE_FLUSH`]. The rules still apply to it.
+fn append_idle_output(
+    writer: &Arc<Mutex<TraceWriter>>,
+    kind: &str,
+    pending: &mut PendingOutput,
+) -> Result<()> {
+    if pending.last_output.elapsed() < HELD_OUTPUT_IDLE_FLUSH {
+        return Ok(());
+    }
+    match pending.redaction.flush_idle() {
+        Some((text, byte_length)) => append_process_event(writer, kind, text, byte_length),
+        None => Ok(()),
     }
 }
 
@@ -1749,6 +2038,7 @@ fn append_process_bytes(
     pending: &mut PendingOutput,
     bytes: &[u8],
 ) -> Result<()> {
+    pending.last_output = Instant::now();
     let text = decode_utf8_chunk(&mut pending.utf8, bytes);
     match pending.redaction.push(&text, bytes.len()) {
         Some((text, byte_length)) => append_process_event(writer, kind, text, byte_length),
@@ -1909,8 +2199,9 @@ impl RecorderLease {
     }
 }
 
-/// Overrides how long a child may outlive a SIGTERM sent to the recorder, in
-/// milliseconds, for supervisors that enforce their own shutdown deadline.
+/// Overrides how long a child may outlive a SIGTERM, SIGHUP, or SIGQUIT sent
+/// to the recorder, in milliseconds, for supervisors that enforce their own
+/// shutdown deadline.
 #[cfg(unix)]
 const STOP_GRACE_ENV: &str = "PREMIER_STOP_GRACE_MS";
 #[cfg(unix)]
@@ -1921,11 +2212,12 @@ const RAPID_INTERRUPT_WINDOW: StdDuration = StdDuration::from_secs(2);
 #[cfg(unix)]
 const RAPID_INTERRUPTS_TO_KILL: u32 = 3;
 
-/// Relays SIGINT/SIGTERM received by the recorder to the child and escalates
-/// to SIGKILL when the child will not stop, so the recorder can always be
-/// stopped and the trace finalized:
-/// - SIGTERM is forwarded, and the child is killed if it is still running
-///   after the stop grace period.
+/// Relays SIGINT/SIGTERM/SIGHUP/SIGQUIT received by the recorder to the child
+/// and escalates to SIGKILL when the child will not stop, so the recorder can
+/// always be stopped and the trace finalized:
+/// - SIGTERM, SIGHUP (terminal or session closed), and SIGQUIT are forwarded
+///   as the same signal, and the child is killed if it is still running after
+///   the stop grace period.
 /// - SIGINT is forwarded without a deadline, because interactive agents
 ///   handle an interrupt and keep running; the third interrupt in quick
 ///   succession kills the child instead.
@@ -1980,13 +2272,13 @@ impl UnixSignalForwarder {
     }
 
     fn start_target(child_pid: u32, process_group: bool) -> Result<Self> {
-        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
         use signal_hook::iterator::SignalsInfo;
         use signal_hook::iterator::exfiltrator::WithOrigin;
 
         let child_pid = i32::try_from(child_pid).context("child process id exceeds i32")?;
         let signal_target = if process_group { -child_pid } else { child_pid };
-        let mut signals = SignalsInfo::<WithOrigin>::new([SIGINT, SIGTERM])?;
+        let mut signals = SignalsInfo::<WithOrigin>::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
         let handle = signals.handle();
         let state = Arc::new(ForwarderState::default());
         let (sender, receiver) = mpsc::channel::<(i32, bool)>();
@@ -2052,8 +2344,18 @@ impl UnixSignalForwarder {
                     if !process_group && interrupt_is_from_terminal(sent_by_process) {
                         continue;
                     }
-                } else if kill_deadline.is_none() {
-                    kill_deadline = Some(Instant::now() + stop_grace);
+                } else {
+                    if kill_deadline.is_none() {
+                        kill_deadline = Some(Instant::now() + stop_grace);
+                    }
+                    // Ctrl-\ reaches a pipe-mode child directly, exactly as
+                    // Ctrl-C does; the deadline above still applies.
+                    if signal == SIGQUIT
+                        && !process_group
+                        && interrupt_is_from_terminal(sent_by_process)
+                    {
+                        continue;
+                    }
                 }
                 state.signal_child(signal_target, signal);
             }
@@ -2088,8 +2390,8 @@ impl UnixSignalForwarder {
     }
 }
 
-/// Whether a SIGINT received by the recorder was generated by its terminal
-/// (Ctrl-C) rather than sent to the recorder alone.
+/// Whether a SIGINT or SIGQUIT received by the recorder was generated by its
+/// terminal (Ctrl-C, Ctrl-\) rather than sent to the recorder alone.
 #[cfg(unix)]
 fn interrupt_is_from_terminal(sent_by_process: bool) -> bool {
     // Linux marks terminal-generated signals as sent by the kernel, with no
@@ -2205,80 +2507,6 @@ fn list(trace_dir: PathBuf) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Why a trace without a finalized journal is in that state.
-enum UnfinalizedState {
-    /// The recorder named in the lease is alive and heartbeating.
-    Recording,
-    /// The recorder is gone; `recover` needs `--force` only while the
-    /// journal is still inside its idle guard.
-    Abandoned { needs_force: bool },
-}
-
-impl UnfinalizedState {
-    fn describe(&self, trace: &std::path::Path) -> String {
-        match self {
-            Self::Recording => "still recording".into(),
-            Self::Abandoned { needs_force } => format!(
-                "abandoned: the recorder is no longer running — run `premier recover {}{}`",
-                if *needs_force { "--force " } else { "" },
-                trace.display()
-            ),
-        }
-    }
-}
-
-/// Classify an unfinalized trace from its recorder lease: the lease holds the
-/// recorder's process id and is rewritten every two seconds while it runs.
-fn unfinalized_state(
-    trace: &std::path::Path,
-    manifest: &premier_trace::TraceManifest,
-) -> Option<UnfinalizedState> {
-    if manifest.journal.is_some() {
-        return None;
-    }
-    let stale_after = RecoveryOptions::default().minimum_idle;
-    let lease = trace.join(RECORDER_LEASE);
-    let idle = |path: &std::path::Path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-    };
-    let recorder_pid = fs::read_to_string(&lease)
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok());
-    let lease_idle = idle(&lease);
-    let heartbeating = lease_idle.is_some_and(|idle| idle < stale_after);
-    if recorder_pid.is_some_and(process_is_alive) && heartbeating {
-        return Some(UnfinalizedState::Recording);
-    }
-    // `premier recover` guards on the newer of the journal and the lease.
-    let journal_idle = idle(&trace.join("events").join(premier_trace::ACTIVE_JOURNAL));
-    let needs_force = [lease_idle, journal_idle]
-        .into_iter()
-        .flatten()
-        .any(|idle| idle < stale_after);
-    Some(UnfinalizedState::Abandoned { needs_force })
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 performs only the existence and permission check.
-    // EPERM still means a process with this id exists.
-    pid > 0
-        && (unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
-}
-
-/// Without a portable liveness probe, rely on the lease heartbeat alone.
-#[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
 }
 
 /// Directory that contains `trace`, treating the empty parent of a bare

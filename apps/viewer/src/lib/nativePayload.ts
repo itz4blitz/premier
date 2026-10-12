@@ -246,6 +246,51 @@ export function payloadError(payload: Fields): string | null {
   return null;
 }
 
+/**
+ * Objects in which a provider states the outcome of the event itself: the line, its `item` or `part`,
+ * and their `state`. Arguments, output and prose are never consulted.
+ */
+function outcomeScopes(native: Fields): Fields[] {
+  const scopes = [native, record(native.item), record(native.part)].filter((scope): scope is Fields => scope !== null);
+  return [...scopes, ...scopes.map((scope) => record(scope.state)).filter((scope): scope is Fields => scope !== null)];
+}
+
+function flagsError(scope: Fields): boolean {
+  return scope.is_error === true || scope.isError === true;
+}
+
+function statesFailure(scope: Fields): boolean {
+  if (flagsError(scope)) return true;
+  const status = [scope.status, scope.state].find((value) => typeof value === 'string') as string | undefined;
+  if (status && ['error', 'errored', 'failed', 'failure', 'denied', 'rejected'].includes(status.trim().toLowerCase())) return true;
+  const exit = [scope.exit_code, scope.exitCode].find((value) => value !== undefined && value !== null);
+  if (typeof exit === 'number' && exit !== 0) return true;
+  const error = scope.error;
+  if (error === undefined || error === null || error === false || error === 0 || error === '') return false;
+  if (Array.isArray(error)) return error.length > 0;
+  return typeof error === 'object' ? Object.keys(error).length > 0 : true;
+}
+
+/**
+ * True when the provider object states outright that the event failed: `is_error`, an error
+ * status or state, a non-zero exit code, or an error value. Current adapters also record that as the
+ * event status; older traces carry it only here. Keep aligned with `issues.rs` in premier-cli.
+ *
+ * A chat-style line can carry several tool results. An event that names one of them by
+ * `correlationId` answers only for that block; otherwise the event stands for the whole line.
+ */
+export function nativeFailure(payload: Fields, correlationId = ''): boolean {
+  const native = nativeOf(payload);
+  if (!native) return false;
+  if (outcomeScopes(native).some(statesFailure)) return true;
+  if (typeof native.type === 'string' && native.type.trim().toLowerCase() === 'error') return true;
+  const blocks = contentBlocks(native);
+  const own = correlationId
+    ? blocks.filter((block) => ['tool_use_id', 'tool_call_id', 'call_id', 'id'].some((key) => block[key] === correlationId))
+    : [];
+  return (own.length ? own : blocks).some(flagsError);
+}
+
 /** Human-readable content of the provider event: the assistant text, tool output, or final result. */
 export function nativeText(payload: Fields): string | null {
   const native = nativeOf(payload);

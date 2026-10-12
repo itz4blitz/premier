@@ -35,10 +35,34 @@ fi
 TIMEOUT="${PREMIER_EMIT_TIMEOUT:-10}"
 [[ "$TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] || TIMEOUT=10
 
+# Host of the collector URL: scheme, path, credentials, and port removed.
+HOST="${PREMIER_COLLECTOR_URL#*://}"
+HOST="${HOST%%[/?#]*}"
+HOST="${HOST##*@}"
+if [[ "$HOST" == \[* ]]; then
+  HOST="${HOST#\[}"
+  HOST="${HOST%%\]*}"
+else
+  HOST="${HOST%%:*}"
+fi
+HOST="${HOST%.}"
+
+# A loopback collector (localhost, 127.0.0.0/8, ::1) is authenticated only by
+# its bearer token, so --noproxy keeps the token and payload away from
+# HTTP(S)_PROXY/ALL_PROXY. A remote collector keeps the proxy settings: a
+# mandatory egress proxy may be the only route to it.
+NOPROXY=()
+shopt -s nocasematch
+if [[ "$HOST" == localhost || "$HOST" == *.localhost ||
+  "$HOST" =~ ^127([.][0-9]+){1,3}$ || "$HOST" =~ ^(0*:){2,7}0*1$ ]]; then
+  NOPROXY=(--noproxy '*')
+fi
+shopt -u nocasematch
+
 # The status code is appended on its own line so a rejected event (401/400/500)
 # fails this script instead of printing the error body and exiting 0.
-# --noproxy keeps the bearer token and payload away from HTTP(S)_PROXY/ALL_PROXY.
-if ! OUTPUT="$(curl -sS --noproxy '*' --max-time "$TIMEOUT" \
+# (The `+` expansion keeps an empty array valid under `set -u` on bash 3.2.)
+if ! OUTPUT="$(curl -sS ${NOPROXY[@]+"${NOPROXY[@]}"} --max-time "$TIMEOUT" \
   -w '\n%{http_code}' \
   -X POST "$PREMIER_COLLECTOR_URL" \
   -H "Authorization: Bearer $PREMIER_COLLECTOR_TOKEN" \

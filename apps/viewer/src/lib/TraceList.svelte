@@ -1,6 +1,6 @@
 <script lang="ts">
   import { deriveRunIdentity } from './runIdentity';
-  import { listKey, type TraceManifest } from './types';
+  import { isAbandoned, isRecording, listKey, type TraceManifest } from './types';
   import { PanelLeftOpen } from '@lucide/svelte';
 
   type RunFilter = 'all' | 'issues' | 'live';
@@ -16,7 +16,7 @@
   let filter = $state<RunFilter>('all');
   let matchingTraces = $derived(traces.filter((trace) => {
     if (filter === 'issues') return ['error', 'warning'].includes(health(trace).tone);
-    if (filter === 'live') return trace.ended_at === null;
+    if (filter === 'live') return isRecording(trace);
     return true;
   }));
   let visibleTraces = $derived.by(() => {
@@ -27,6 +27,7 @@
   });
 
   function duration(trace: TraceManifest): string {
+    if (isAbandoned(trace)) return 'Abandoned — run premier recover';
     if (!trace.ended_at) return 'Live';
     const milliseconds = Math.max(0, Date.parse(trace.ended_at) - Date.parse(trace.started_at));
     if (milliseconds < 1000) return `${milliseconds} ms`;
@@ -55,6 +56,7 @@
 
   function health(trace: TraceManifest): { label: string; tone: 'success' | 'warning' | 'error' | 'live' } {
     if (trace.integrity === 'invalid') return { label: 'Unverified', tone: 'error' };
+    if (isAbandoned(trace)) return { label: 'Abandoned', tone: 'warning' };
     if (trace.exit_code !== null && trace.exit_code !== 0) return { label: 'Failed', tone: 'error' };
     if ((trace.summary?.issue_count ?? 0) > 0) return { label: 'Needs attention', tone: 'warning' };
     if (!trace.ended_at || trace.integrity === 'live') return { label: 'Running', tone: 'live' };
@@ -127,13 +129,14 @@
         <span class="run-copy">
           <span class="run-title-line">
             <strong>{title(trace)}</strong>
-            {#if !trace.ended_at}<span class="live-badge">Live</span>{/if}
+            {#if isAbandoned(trace)}<span class="abandoned-badge" title={trace.integrity_detail || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.'}>Abandoned</span>
+            {:else if !trace.ended_at}<span class="live-badge">Live</span>{/if}
             {#if trace.trace_id === selectedId && !matchingTraces.some((item) => item.trace_id === trace.trace_id)}<span class="outside-badge">Pinned</span>{/if}
           </span>
           <span class="run-outcome" data-tone={health(trace).tone}>{outcome(trace)}</span>
           <span class="run-foot" title={new Date(trace.started_at).toLocaleString()}>
             <time datetime={trace.started_at}>{when(trace)}</time>
-            <span aria-hidden="true">·</span><span>{trace.ended_at ? `captured ${duration(trace)}` : duration(trace)}</span>
+            <span aria-hidden="true">·</span><span>{trace.ended_at && !isAbandoned(trace) ? `captured ${duration(trace)}` : duration(trace)}</span>
             {#if eventCount(trace) !== null}<span aria-hidden="true">·</span><span>{eventCount(trace)} events</span>{/if}
           </span>
         </span>
@@ -262,6 +265,7 @@
   .run-title-line { min-width: 0; display: flex; align-items: flex-start; gap: 7px; }
   .run-title-line strong { min-width: 0; flex: 1 1 auto; color: #f1f4f8; font-family: 'IBM Plex Sans Variable', 'IBM Plex Sans', sans-serif; font-size: 13px; font-weight: 700; line-height: 1.3; overflow-wrap: break-word; }
   .live-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid rgba(158,170,255,.38); border-radius: 3px; color: #b8c0ff; background: rgba(111,123,247,.13); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+  .abandoned-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid rgba(245,188,104,.38); border-radius: 3px; color: #f1c984; background: rgba(245,188,104,.08); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
   .outside-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid rgba(245,188,104,.38); border-radius: 3px; color: #f1c984; background: rgba(245,188,104,.08); font-size: 8px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
   .run-outcome { color: #aeb9c8; font-size: 11px; font-weight: 650; line-height: 1.35; }
   .run-outcome[data-tone='error'] { color: #ff9b98; }

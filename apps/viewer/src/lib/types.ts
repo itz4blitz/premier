@@ -4,7 +4,8 @@ export interface JournalFile {
   event_count: number;
 }
 
-export type IntegrityStatus = 'live' | 'verified' | 'invalid';
+/** `abandoned`: no finalized journal and the recorder is gone; `premier recover` finalizes it. */
+export type IntegrityStatus = 'live' | 'abandoned' | 'verified' | 'invalid';
 
 export interface ProcessTermination {
   kind: 'exit' | 'signal' | 'interrupted';
@@ -88,6 +89,16 @@ export function eventPayload(event: TraceEvent): Record<string, unknown> {
 /** Stable list key that survives copied .atrace directories with colliding trace_ids. */
 export function listKey(trace: Pick<TraceManifest, 'trace_id' | 'artifact'>): string {
   return trace.artifact || trace.trace_id;
+}
+
+/** The recorder stopped without finalizing this trace. */
+export function isAbandoned(trace: Pick<TraceManifest, 'integrity'>): boolean {
+  return trace.integrity === 'abandoned';
+}
+
+/** Still being written by a running recorder, so there is something to tail. */
+export function isRecording(trace: Pick<TraceManifest, 'ended_at' | 'integrity'>): boolean {
+  return !trace.ended_at && !isAbandoned(trace);
 }
 
 export type EventCategory = 'all' | 'agent' | 'model' | 'tool' | 'approval' | 'process' | 'error';

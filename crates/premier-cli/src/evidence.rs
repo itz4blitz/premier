@@ -94,66 +94,163 @@ fn secret_key(key: &str) -> bool {
     premier_trace::is_secret_field_name(key)
 }
 
+/// What one redaction pass removed, by rule type.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RedactionCounts {
+    /// Values this pass replaced: `field_names` plus every `value_patterns` count.
+    pub total: usize,
+    /// Values replaced because their field, flag or header name is secret.
+    pub field_names: usize,
+    /// Values replaced per built-in secret value pattern.
+    pub value_patterns: BTreeMap<&'static str, usize>,
+    /// Redaction markers that were already present, written at record time.
+    pub already_redacted: usize,
+}
+
+/// Which optional rules a redaction pass applies on top of secret field names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RedactionOptions {
+    /// Built-in secret value patterns on structured strings and the command line.
+    pub default_secret_patterns: bool,
+    /// Built-in secret value patterns on captured terminal text as well.
+    pub known_secrets_in_terminal: bool,
+}
+
+impl Default for RedactionOptions {
+    fn default() -> Self {
+        Self {
+            default_secret_patterns: true,
+            known_secrets_in_terminal: false,
+        }
+    }
+}
+
+struct Redactor {
+    value_patterns: bool,
+    counts: RedactionCounts,
+}
+
+impl Redactor {
+    fn replace_named(&mut self, value: &mut Value) {
+        match value {
+            Value::String(text) if text == REDACTED => self.counts.already_redacted += 1,
+            Value::Null => {}
+            Value::String(text) if text.is_empty() => {}
+            _ => {
+                self.counts.field_names += 1;
+                self.counts.total += 1;
+            }
+        }
+        *value = Value::String(REDACTED.into());
+    }
+
+    fn redact(&mut self, value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                let named_secret = ["name", "key", "header"]
+                    .iter()
+                    .filter_map(|field| object.get(*field)?.as_str())
+                    .any(secret_key);
+                for (key, value) in object {
+                    if secret_key(key)
+                        || (named_secret && matches!(key.as_str(), "value" | "values"))
+                    {
+                        self.replace_named(value);
+                    } else {
+                        self.redact(value);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                let strings = items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>();
+                if let Some(mut strings) = strings {
+                    // A bare header name followed by its value: `["Cookie", VALUE]`.
+                    let bare_name = |name: &str| {
+                        !name.contains(|character: char| {
+                            character.is_whitespace() || matches!(character, ':' | '=')
+                        })
+                    };
+                    if strings.len() == 2 && bare_name(&strings[0]) && secret_key(&strings[0]) {
+                        strings[1] = REDACTED.into();
+                    }
+                    for (item, mut redacted) in items
+                        .iter_mut()
+                        .zip(premier_trace::redact_command_secrets(&strings))
+                    {
+                        if item.as_str() == Some(redacted.as_str()) {
+                            self.redact(item);
+                        } else {
+                            self.counts.field_names += 1;
+                            self.counts.total += 1;
+                            // The marker just written is not a recorded one.
+                            self.redact_text(&mut redacted, false);
+                            *item = Value::String(redacted);
+                        }
+                    }
+                } else {
+                    for item in items {
+                        self.redact(item);
+                    }
+                }
+            }
+            Value::String(text) => {
+                if text.trim_start().starts_with(['{', '['])
+                    && let Ok(original) = serde_json::from_str::<Value>(text)
+                {
+                    let mut nested = original.clone();
+                    self.redact(&mut nested);
+                    // Untouched documents keep their exact original text.
+                    if nested != original {
+                        *text = nested.to_string();
+                    }
+                } else {
+                    self.redact_text(text, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply the built-in secret value patterns to one plain string.
+    fn redact_text(&mut self, text: &mut String, count_markers: bool) {
+        if count_markers {
+            self.counts.already_redacted += text.matches(REDACTED).count();
+        }
+        if !self.value_patterns {
+            return;
+        }
+        let counts = &mut self.counts;
+        let mut on_match = |name: &'static str| {
+            *counts.value_patterns.entry(name).or_default() += 1;
+            counts.total += 1;
+        };
+        if let Some(redacted) = premier_trace::redact_builtin_secrets(text, &mut on_match) {
+            *text = redacted;
+        }
+    }
+}
+
 /// Recursively replace the values of secret-named fields. Besides plain
 /// object keys this covers header-style pairs (`{"name": "Authorization",
 /// "value": ...}` and `["Authorization", ...]`), argument and header lists
 /// (`--token VALUE`, `API_KEY=VALUE`, `Cookie: VALUE`), and JSON documents
-/// stored inside string values.
-pub fn redact_secrets(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            let named_secret = ["name", "key", "header"]
-                .iter()
-                .filter_map(|field| object.get(*field)?.as_str())
-                .any(secret_key);
-            for (key, value) in object {
-                if secret_key(key) || (named_secret && matches!(key.as_str(), "value" | "values")) {
-                    *value = Value::String(REDACTED.into());
-                } else {
-                    redact_secrets(value);
-                }
-            }
-        }
-        Value::Array(items) => {
-            let strings = items
-                .iter()
-                .map(|item| item.as_str().map(str::to_owned))
-                .collect::<Option<Vec<_>>>();
-            if let Some(mut strings) = strings {
-                // A bare header name followed by its value: `["Cookie", VALUE]`.
-                let bare_name = |name: &str| {
-                    !name.contains(|character: char| {
-                        character.is_whitespace() || matches!(character, ':' | '=')
-                    })
-                };
-                if strings.len() == 2 && bare_name(&strings[0]) && secret_key(&strings[0]) {
-                    strings[1] = REDACTED.into();
-                }
-                for (item, redacted) in items
-                    .iter_mut()
-                    .zip(premier_trace::redact_command_secrets(&strings))
-                {
-                    *item = Value::String(redacted);
-                }
-            }
-            for item in items {
-                redact_secrets(item);
-            }
-        }
-        Value::String(text) => {
-            if text.trim_start().starts_with(['{', '['])
-                && let Ok(original) = serde_json::from_str::<Value>(text)
-            {
-                let mut nested = original.clone();
-                redact_secrets(&mut nested);
-                // Untouched documents keep their exact original text.
-                if nested != original {
-                    *text = nested.to_string();
-                }
-            }
-        }
-        _ => {}
-    }
+/// stored inside string values. String values are also checked against the
+/// built-in secret value patterns. Returns what was removed.
+pub fn redact_secrets(value: &mut Value) -> RedactionCounts {
+    redact_secrets_with(value, true)
+}
+
+/// [`redact_secrets`], with the built-in secret value patterns optional.
+pub fn redact_secrets_with(value: &mut Value, value_patterns: bool) -> RedactionCounts {
+    let mut redactor = Redactor {
+        value_patterns,
+        counts: RedactionCounts::default(),
+    };
+    redactor.redact(value);
+    redactor.counts
 }
 
 #[derive(Debug, Serialize)]
@@ -166,14 +263,47 @@ pub struct PortableEvidence {
 
 #[derive(Debug, Serialize)]
 pub struct PortableRedaction {
+    /// Whether this export removed at least one value. `false` means the
+    /// rules below ran and found nothing left to redact.
     pub applied: bool,
     pub replacement: &'static str,
     pub policy: &'static str,
+    /// The rules that were active for this export.
+    pub rules: PortableRedactionRules,
+    /// What this export removed, by rule type.
+    pub redacted: RedactionCounts,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortableRedactionRules {
+    /// Field, flag and header names (normalized) whose values are removed.
+    pub secret_field_names: &'static [&'static str],
+    /// Built-in secret value patterns that were active; empty when off.
+    pub builtin_patterns: Vec<&'static str>,
+    pub builtin_patterns_structured: bool,
+    pub builtin_patterns_terminal: bool,
 }
 
 pub fn portable_evidence(manifest: &TraceManifest, events: &[TraceEvent]) -> PortableEvidence {
+    portable_evidence_with(manifest, events, RedactionOptions::default())
+}
+
+pub fn portable_evidence_with(
+    manifest: &TraceManifest,
+    events: &[TraceEvent],
+    options: RedactionOptions,
+) -> PortableEvidence {
+    let mut structured = Redactor {
+        value_patterns: options.default_secret_patterns,
+        counts: RedactionCounts::default(),
+    };
+    // Captured terminal text is only pattern-matched when asked for.
+    let mut terminal = Redactor {
+        value_patterns: options.known_secrets_in_terminal,
+        counts: RedactionCounts::default(),
+    };
     let mut manifest = serde_json::to_value(manifest).unwrap_or(Value::Null);
-    redact_secrets(&mut manifest);
+    structured.redact(&mut manifest);
     let events = events
         .iter()
         .map(|event| {
@@ -183,19 +313,47 @@ pub fn portable_evidence(manifest: &TraceManifest, events: &[TraceEvent]) -> Por
             };
             object.remove("payload_json");
             let mut payload = event.payload();
-            redact_secrets(&mut payload);
+            let terminal_text = matches!(
+                event.kind.as_str(),
+                "process.stdout" | "process.stderr" | "process.terminal"
+            )
+            .then(|| payload.as_object_mut()?.remove("text"))
+            .flatten();
             object.insert("payload".into(), payload);
             let mut event = Value::Object(object);
-            redact_secrets(&mut event);
+            structured.redact(&mut event);
+            if let Some(mut text) = terminal_text {
+                terminal.redact(&mut text);
+                event["payload"]["text"] = text;
+            }
             event
         })
         .collect();
+    let mut redacted = structured.counts;
+    redacted.total += terminal.counts.total;
+    redacted.field_names += terminal.counts.field_names;
+    redacted.already_redacted += terminal.counts.already_redacted;
+    for (name, count) in terminal.counts.value_patterns {
+        *redacted.value_patterns.entry(name).or_default() += count;
+    }
+    let builtin = options.default_secret_patterns || options.known_secrets_in_terminal;
     PortableEvidence {
         format: "premier.portable-evidence.v1",
         redaction: PortableRedaction {
-            applied: true,
+            applied: redacted.total > 0,
             replacement: REDACTED,
-            policy: "recursive common secret field names, including JSON strings and header or argument lists",
+            policy: "recursive common secret field names, including JSON strings and header or argument lists, plus built-in secret value patterns",
+            rules: PortableRedactionRules {
+                secret_field_names: premier_trace::DEFAULT_REDACTED_FIELDS,
+                builtin_patterns: if builtin {
+                    premier_trace::builtin_secret_pattern_names()
+                } else {
+                    Vec::new()
+                },
+                builtin_patterns_structured: options.default_secret_patterns,
+                builtin_patterns_terminal: options.known_secrets_in_terminal,
+            },
+            redacted,
         },
         manifest,
         events,
@@ -597,6 +755,90 @@ mod tests {
             value["usage"],
             json!({"input_tokens": 1200, "output_tokens": 400})
         );
+    }
+
+    #[test]
+    fn redaction_counts_separate_rule_types_and_recorded_markers() {
+        let token = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let mut value = json!({
+            "password": "pw",
+            "api_key": REDACTED,
+            "empty_token": null,
+            "note": format!("used {token} and https://u:pw9@host.test/x"),
+            "stored": "earlier [REDACTED] value",
+            "command": ["deploy", "--token", "argv-secret", "--password=[REDACTED]"],
+            "arguments": format!("{{\"secret\":\"s\",\"text\":\"{token}\"}}"),
+            "usage": {"input_tokens": 1200, "output_tokens": 400},
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "commit": "7ebad3a1c0ffee00deadbeef0123456789abcdef"
+        });
+        let counts = redact_secrets(&mut value);
+        assert!(!value.to_string().contains(&token));
+        assert_eq!(
+            counts.field_names, 3,
+            "password, --token value, nested secret"
+        );
+        assert_eq!(counts.value_patterns["github-token"], 2);
+        assert_eq!(counts.value_patterns["url-credentials"], 1);
+        assert_eq!(counts.total, 6);
+        assert_eq!(counts.already_redacted, 3, "api_key, stored, --password");
+        assert_eq!(value["usage"]["input_tokens"], 1200);
+        assert_eq!(value["id"], "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(value["commit"], "7ebad3a1c0ffee00deadbeef0123456789abcdef");
+
+        // A second pass finds nothing left to do.
+        let again = redact_secrets(&mut value);
+        assert_eq!(again.total, 0);
+        assert!(again.value_patterns.is_empty());
+
+        let mut untouched = json!({"note": format!("used {token}"), "password": "pw"});
+        let counts = redact_secrets_with(&mut untouched, false);
+        assert_eq!(untouched["note"], format!("used {token}"));
+        assert_eq!((counts.total, counts.field_names), (1, 1));
+    }
+
+    #[test]
+    fn portable_evidence_only_pattern_matches_terminal_text_on_request() {
+        let token = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("export.atrace");
+        let writer = premier_trace::TraceWriter::create(&root, vec!["agent".into()]).unwrap();
+        writer.finish(0).unwrap();
+        let manifest = premier_trace::read_manifest(&root).unwrap();
+        let events = [
+            event("tool.result", json!({"note": format!("used {token}")})),
+            event("process.stdout", json!({"text": format!("echo {token}\n")})),
+        ];
+
+        let export = portable_evidence(&manifest, &events);
+        assert_eq!(export.events[0]["payload"]["note"], "used [REDACTED]");
+        assert_eq!(
+            export.events[1]["payload"]["text"],
+            format!("echo {token}\n")
+        );
+        assert!(export.redaction.applied);
+        assert_eq!(export.redaction.redacted.total, 1);
+        assert!(!export.redaction.rules.builtin_patterns_terminal);
+
+        let options = RedactionOptions {
+            known_secrets_in_terminal: true,
+            ..RedactionOptions::default()
+        };
+        let export = portable_evidence_with(&manifest, &events, options);
+        assert_eq!(export.events[1]["payload"]["text"], "echo [REDACTED]\n");
+        assert_eq!(export.redaction.redacted.value_patterns["github-token"], 2);
+
+        let export = portable_evidence_with(
+            &manifest,
+            &events,
+            RedactionOptions {
+                default_secret_patterns: false,
+                known_secrets_in_terminal: false,
+            },
+        );
+        assert!(!export.redaction.applied);
+        assert!(export.redaction.rules.builtin_patterns.is_empty());
+        assert_eq!(export.events[0]["payload"]["note"], format!("used {token}"));
     }
 
     #[test]

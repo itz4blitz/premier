@@ -10,6 +10,8 @@ use std::path::Path;
 pub enum IntegrityStatus {
     /// Recording is still open (no finalized journal).
     Live,
+    /// No finalized journal and the recorder is gone; `premier recover` finalizes it.
+    Abandoned,
     /// Finalized journal matches the manifest digest and structural checks.
     Verified,
     /// Finalized or readable trace failed verification.
@@ -68,6 +70,15 @@ mod tests {
         let report = assess_integrity(&root);
         assert_eq!(report.status, IntegrityStatus::Live);
         assert!(report.detail.is_none());
+    }
+
+    #[test]
+    fn abandoned_is_a_distinct_wire_state() {
+        assert_eq!(
+            serde_json::to_string(&IntegrityStatus::Abandoned).unwrap(),
+            "\"abandoned\""
+        );
+        assert_ne!(IntegrityStatus::Abandoned, IntegrityStatus::Live);
     }
 
     #[test]

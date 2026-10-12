@@ -55,6 +55,28 @@ describe('TraceList', () => {
     expect(screen.getByText('Live repair')).toBeInTheDocument();
   });
 
+  it('shows an abandoned recording as abandoned, never as live', async () => {
+    const live = { ...trace, trace_id: 'live', name: 'Live repair', ended_at: null, exit_code: null, integrity: 'live' as const };
+    const abandoned = {
+      ...trace, trace_id: 'gone', name: 'Crashed repair', ended_at: null, exit_code: null, integrity: 'abandoned' as const,
+      integrity_detail: 'The recorder is no longer running. Run `premier recover /traces/gone.atrace` to finalize this trace.'
+    };
+    render(TraceList, { props: { traces: [live, abandoned], selectedId: null, onselect: vi.fn() } });
+    const row = screen.getByRole('button', { name: /Crashed repair/ });
+    expect(row).toHaveTextContent('Abandoned — run premier recover');
+    expect(row).not.toHaveTextContent(/Live|Running/);
+    expect(row).toHaveAccessibleName(/Abandoned/);
+    expect(row.querySelector('.abandoned-badge')).toHaveAttribute('title', abandoned.integrity_detail);
+    expect(screen.getByRole('button', { name: /Live repair/ })).toHaveTextContent('Live');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Live' }));
+    expect(screen.getByText('Live repair')).toBeInTheDocument();
+    expect(screen.queryByText('Crashed repair')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Issues' }));
+    expect(screen.getByText('Crashed repair')).toBeInTheDocument();
+    expect(screen.queryByText('Live repair')).not.toBeInTheDocument();
+  });
+
   it('supports arrow-key run navigation', async () => {
     const onselect = vi.fn();
     const second = { ...trace, trace_id: 'trace-2', name: 'Second run' };

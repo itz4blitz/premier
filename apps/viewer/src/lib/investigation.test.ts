@@ -196,6 +196,14 @@ describe('buildInvestigationSummary', () => {
     expect(result.recommendedEvent).toBeNull();
   });
 
+  it('reports an abandoned recording as abandoned, not as an active run', () => {
+    const abandoned = trace({ ended_at: null, exit_code: null, integrity: 'abandoned', integrity_detail: 'Run `premier recover /traces/a.atrace` to finalize this trace.' });
+    expect(buildInvestigationSummary(abandoned, []).cause).toMatchObject({ title: 'Recording was abandoned', detail: expect.stringContaining('premier recover'), event: null });
+    const withEvents = buildInvestigationSummary(abandoned, [event(1, 'agent.turn')]);
+    expect(withEvents.cause).toMatchObject({ title: 'Recording was abandoned', role: 'outcome' });
+    expect(withEvents.outcome.label).toBe('Abandoned');
+  });
+
   it('flags broken causal references and incomplete terminal evidence', () => {
     const events = [event(1, 'agent.result', { parent_event_id: 'missing-event', parent_span_id: 'missing-span' })];
     const result = buildInvestigationSummary(trace({ exit_code: 0 }), events);

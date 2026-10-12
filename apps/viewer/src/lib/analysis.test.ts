@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actorInventory, eventSummary, filterEvents, isIssue, runHealth, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
+import { actorInventory, awaitingApprovals, categoryOf, countByCategory, eventSummary, filterEvents, isIssue, runHealth, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
 import type { TraceEvent, TraceManifest } from './types';
 
 function event(sequence: number, actor: string, kind: string, status = 'ok'): TraceEvent {
@@ -93,6 +93,111 @@ describe('agent trace analysis', () => {
     expect(runHealth({ ...base, ended_at: null, integrity: 'live' }, [])).toMatchObject({ label: 'Running' });
     expect(runHealth(base, [event(1, 'policy', 'approval.decision', 'denied')])).toMatchObject({ label: 'Blocked' });
     expect(runHealth(base, [event(1, 'policy', 'approval.request', 'pending')])).toMatchObject({ label: 'Awaiting approval' });
+  });
+
+  it('reports an abandoned recording instead of a running one', () => {
+    const abandoned: TraceManifest = {
+      format_version: 1, trace_id: 'trace-1', command: ['test'], started_at: '', ended_at: null,
+      exit_code: null, journal: null, integrity: 'abandoned',
+      integrity_detail: 'The recorder is no longer running. Run `premier recover /traces/a.atrace` to finalize this trace.'
+    };
+    expect(runHealth(abandoned, [])).toEqual({
+      label: 'Abandoned',
+      tone: 'warning',
+      detail: 'The recorder is no longer running. Run `premier recover /traces/a.atrace` to finalize this trace.'
+    });
+    // Nobody is left to answer a pending request or to keep the run going.
+    expect(runHealth(abandoned, [event(1, 'policy', 'approval.request', 'pending')])).toMatchObject({ label: 'Abandoned' });
+    expect(runHealth({ ...abandoned, integrity_detail: null }, []).detail).toContain('premier recover');
+  });
+
+  it('resolves pending approvals against a later decision', () => {
+    const base: TraceManifest = {
+      format_version: 1, trace_id: 'trace-1', command: ['test'], started_at: '', ended_at: '2026-01-01',
+      exit_code: 0, journal: null, integrity: 'verified'
+    };
+    const request = { ...event(1, 'claude', 'approval.request', 'pending'), correlation_id: 'toolu_1' };
+    const decision = { ...event(2, 'claude', 'approval.decision', 'approved'), correlation_id: 'toolu_1' };
+    expect(awaitingApprovals([request])).toEqual([request]);
+    expect(awaitingApprovals([request, decision])).toEqual([]);
+    expect(runHealth(base, [request, decision])).toMatchObject({ label: 'Passed' });
+    expect(summarizeAgents([request, decision])[0].status).toBe('ok');
+    expect(summarizeAgents([request])[0].status).toBe('pending');
+
+    // An approved/denied event of any kind on the same span settles the request too.
+    const spanRequest = { ...event(3, 'claude', 'approval.request', 'pending'), span_id: 'span-approval' };
+    const spanDenied = { ...event(4, 'claude', 'tool.result', 'denied'), span_id: 'span-approval' };
+    expect(awaitingApprovals([spanRequest, spanDenied])).toEqual([]);
+
+    // Unrelated, earlier, or still-undecided events do not.
+    const other = { ...event(5, 'claude', 'approval.decision', 'approved'), correlation_id: 'toolu_2' };
+    const earlier = { ...event(0, 'claude', 'approval.decision', 'approved'), correlation_id: 'toolu_1' };
+    const stillPending = { ...event(6, 'claude', 'approval.decision', 'pending'), correlation_id: 'toolu_1' };
+    const running = { ...event(7, 'claude', 'tool.invocation', 'running'), correlation_id: 'toolu_1' };
+    expect(awaitingApprovals([earlier, request, other, stillPending, running])).toEqual([request, stillPending]);
+    expect(runHealth(base, [earlier, request, other])).toMatchObject({ label: 'Awaiting approval', detail: '1 pending decision' });
+    // Requests that carry no identity cannot be matched and stay pending.
+    expect(awaitingApprovals([{ ...event(8, 'a', 'approval.request', 'pending'), span_id: '' }, { ...event(9, 'a', 'approval.decision', 'approved'), span_id: '' }])).toHaveLength(1);
+  });
+
+  it('treats an explicit native failure as an issue even when the status says ok', () => {
+    const native = (value: unknown, correlation = '') => ({
+      ...event(1, 'claude', 'tool.result'), correlation_id: correlation, payload_json: JSON.stringify({ native: value })
+    });
+    const failures = [
+      { type: 'result', is_error: true, result: 'boom' },
+      { type: 'tool_result', isError: true },
+      { type: 'tool_result', tool_id: 't1', status: 'error' },
+      { type: 'item.completed', item: { type: 'command_execution', exit_code: 2 } },
+      { type: 'item.completed', item: { status: 'failed' } },
+      { type: 'tool', part: { state: { status: 'error', error: 'exit 1' } } },
+      { type: 'turn', error: { message: 'quota' } },
+      { type: 'error', message: 'overloaded' },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true }] } }
+    ];
+    for (const failure of failures) expect(isIssue(native(failure)), JSON.stringify(failure)).toBe(true);
+    const healthy = [
+      { type: 'result', is_error: false, result: 'done' },
+      { type: 'item.completed', item: { exit_code: 0, status: 'completed' } },
+      { type: 'item.started', item: { exit_code: null, status: 'in_progress' } },
+      { type: 'tool_result', error: null },
+      { type: 'tool_result', error: '' },
+      { type: 'tool_use', input: { status: 'failed', is_error: true, exit_code: 1 } },
+      { type: 'assistant', text: 'the build failed with an error' }
+    ];
+    for (const fine of healthy) expect(isIssue(native(fine)), JSON.stringify(fine)).toBe(false);
+    // Without an adapter envelope the same fields are ordinary payload data.
+    expect(isIssue({ ...event(1, 'sdk', 'tool.result'), payload_json: '{"is_error":true}' })).toBe(false);
+
+    const failed = native(failures[0]);
+    expect(categoryOf(failed)).toBe('error');
+    expect(countByCategory([failed], 'error')).toBe(1);
+    expect(filterEvents([failed, event(2, 'root', 'agent.turn')], { search: '', category: 'all', actorId: null, errorsOnly: true, correlationId: null })).toEqual([failed]);
+    expect(summarizeAgents([failed])[0]).toMatchObject({ errors: 1, status: 'error' });
+  });
+
+  it('flags only the event that answers for a failed block of a shared native line', () => {
+    const line = { type: 'user', message: { content: [
+      { type: 'tool_result', tool_use_id: 't1', content: 'ok' },
+      { type: 'tool_result', tool_use_id: 't2', is_error: true }
+    ] } };
+    const of = (correlation: string) => ({ ...event(1, 'claude', 'tool.result'), correlation_id: correlation, payload_json: JSON.stringify({ native: line }) });
+    expect(isIssue(of('t1'))).toBe(false);
+    expect(isIssue(of('t2'))).toBe(true);
+    expect(isIssue(of(''))).toBe(true);
+  });
+
+  it('searches the timeline by event, span, parent span, and correlation ids', () => {
+    const target = {
+      ...event(1, 'coder', 'tool.execution'), event_id: '0198-EVENT-aa', span_id: 'span-Bravo',
+      parent_span_id: 'parent-charlie', correlation_id: 'corr-delta'
+    };
+    const other = { ...event(2, 'coder', 'tool.execution'), event_id: 'zzz', span_id: 'yyy', parent_span_id: 'xxx', correlation_id: 'www' };
+    const search = (query: string) => filterEvents([target, other], { search: query, category: 'all', actorId: null, errorsOnly: false, correlationId: null });
+    for (const query of ['0198-event-AA', 'span-bravo', 'parent-charlie', 'corr-delta', '  CORR-DELTA ']) {
+      expect(search(query), query).toEqual([target]);
+    }
+    expect(search('nothing-matches')).toEqual([]);
   });
 
   it('survives null and array payloads in event summaries', () => {

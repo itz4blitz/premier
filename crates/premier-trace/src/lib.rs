@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration as StdDuration, SystemTime};
 use uuid::Uuid;
 
@@ -282,6 +283,17 @@ pub struct RedactionProvenance {
     pub terminal_literal_count: usize,
     #[serde(default)]
     pub terminal_regex_count: usize,
+    /// Names of the built-in secret value patterns that were active (see
+    /// [`builtin_secret_pattern_names`]). Empty when they were switched off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builtin_patterns: Vec<String>,
+    /// The built-in patterns were applied to structured payload strings and
+    /// the recorded command line.
+    #[serde(default)]
+    pub builtin_patterns_structured: bool,
+    /// The built-in patterns were also applied to captured terminal text.
+    #[serde(default)]
+    pub builtin_patterns_terminal: bool,
 }
 
 /// Replacement written wherever redaction removes a value.
@@ -289,6 +301,183 @@ const REDACTED: &str = "[REDACTED]";
 /// Longest unterminated line a [`TerminalRedactionBuffer`] holds back before
 /// it stops waiting for the line to end. Matches the native adapter line cap.
 const MAX_HELD_LINE_BYTES: usize = 256 * 1024;
+/// Tail a [`TerminalRedactionBuffer`] keeps when it is forced to cut a line
+/// longer than [`MAX_HELD_LINE_BYTES`]. A literal or regex match no longer
+/// than this cannot straddle the forced cut.
+const HELD_OVERLAP_BYTES: usize = 16 * 1024;
+
+/// One built-in secret value pattern: `group` is the capture group holding
+/// the secret, and `accept` vets a candidate to keep false positives low.
+struct SecretPattern {
+    name: &'static str,
+    regex: regex::Regex,
+    group: usize,
+    accept: fn(&str) -> bool,
+}
+
+fn any_candidate(_: &str) -> bool {
+    true
+}
+
+fn has_digit(candidate: &str) -> bool {
+    candidate.bytes().any(|byte| byte.is_ascii_digit())
+}
+
+const PEM_BEGIN: &str = r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----";
+const PEM_END: &str = r"-----END [A-Z0-9 ]*PRIVATE KEY-----";
+
+/// `(name, regex, secret capture group, candidate check)`.
+type SecretPatternSource = (&'static str, String, usize, fn(&str) -> bool);
+
+/// The built-in secret value patterns. Deliberately conservative: each one
+/// needs a distinctive prefix or shape, so token counts, UUIDs and git SHAs
+/// survive.
+fn builtin_pattern_table() -> Vec<SecretPatternSource> {
+    vec![
+        (
+            "pem-private-key",
+            // An unterminated block is redacted to the end of the text.
+            format!(r"{PEM_BEGIN}(?s:.*?)(?:{PEM_END}|\z)"),
+            0,
+            any_candidate,
+        ),
+        (
+            "authorization-header",
+            r#"(?i)\b(?:proxy-)?authorization\\?["']?\s*[:=]\s*\\?["']?(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})"#.into(),
+            1,
+            any_candidate,
+        ),
+        (
+            "bearer-token",
+            r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{20,})".into(),
+            1,
+            has_digit,
+        ),
+        (
+            "url-credentials",
+            r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@?#"'<>]*:([^\s/@?#"'<>]+)@"#.into(),
+            1,
+            any_candidate,
+        ),
+        (
+            "sk-api-key",
+            r"\bsk-[A-Za-z0-9_-]{20,}".into(),
+            0,
+            has_digit,
+        ),
+        (
+            "github-token",
+            r"\bgh[pousr]_[A-Za-z0-9]{36,}".into(),
+            0,
+            any_candidate,
+        ),
+        (
+            "github-fine-grained-pat",
+            r"\bgithub_pat_[A-Za-z0-9_]{22,}".into(),
+            0,
+            any_candidate,
+        ),
+        (
+            "aws-access-key-id",
+            r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b".into(),
+            0,
+            any_candidate,
+        ),
+        (
+            "slack-token",
+            r"\bxox[baprs]-[A-Za-z0-9-]{10,}".into(),
+            0,
+            has_digit,
+        ),
+        (
+            "jwt",
+            r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}".into(),
+            0,
+            any_candidate,
+        ),
+    ]
+}
+
+static BUILTIN_SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
+    builtin_pattern_table()
+        .into_iter()
+        .map(|(name, source, group, accept)| SecretPattern {
+            name,
+            regex: regex::Regex::new(&source).expect("built-in secret pattern compiles"),
+            group,
+            accept,
+        })
+        .collect()
+});
+
+/// Cheap pre-check: whether any built-in pattern could match at all.
+static BUILTIN_SECRET_SET: LazyLock<regex::RegexSet> = LazyLock::new(|| {
+    regex::RegexSet::new(builtin_pattern_table().into_iter().map(|entry| entry.1))
+        .expect("built-in secret patterns compile")
+});
+
+static PEM_BEGIN_PATTERN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(PEM_BEGIN).expect("PEM pattern compiles"));
+static PEM_END_PATTERN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(PEM_END).expect("PEM pattern compiles"));
+
+/// Names of the built-in secret value patterns, in the order they apply.
+pub fn builtin_secret_pattern_names() -> Vec<&'static str> {
+    BUILTIN_SECRET_PATTERNS
+        .iter()
+        .map(|pattern| pattern.name)
+        .collect()
+}
+
+/// Byte ranges of `text` one built-in pattern would redact. Values that are
+/// already the redaction marker are skipped, so the pass is idempotent.
+fn secret_pattern_spans(pattern: &SecretPattern, text: &str) -> Vec<(usize, usize)> {
+    pattern
+        .regex
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(pattern.group))
+        .filter(|secret| secret.as_str() != REDACTED && (pattern.accept)(secret.as_str()))
+        .map(|secret| (secret.start(), secret.end()))
+        .collect()
+}
+
+/// Replace every value in `text` that has the shape of a well-known secret
+/// (see [`builtin_secret_pattern_names`]), calling `on_match` with the
+/// pattern name for each replacement. `None` means nothing matched.
+pub fn redact_builtin_secrets(
+    text: &str,
+    on_match: &mut dyn FnMut(&'static str),
+) -> Option<String> {
+    if !BUILTIN_SECRET_SET.is_match(text) {
+        return None;
+    }
+    let mut current: Option<String> = None;
+    for pattern in BUILTIN_SECRET_PATTERNS.iter() {
+        let source = current.as_deref().unwrap_or(text);
+        let spans = secret_pattern_spans(pattern, source);
+        if spans.is_empty() {
+            continue;
+        }
+        let mut redacted = String::with_capacity(source.len());
+        let mut copied = 0;
+        for (start, end) in spans {
+            redacted.push_str(&source[copied..start]);
+            redacted.push_str(REDACTED);
+            copied = end;
+            on_match(pattern.name);
+        }
+        redacted.push_str(&source[copied..]);
+        current = Some(redacted);
+    }
+    current
+}
+
+fn is_terminal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "process.stdout" | "process.stderr" | "process.terminal"
+    )
+}
 
 /// Field names (normalized: lowercase letters and digits only) whose values
 /// are secret. A key matches when it equals or ends with one of these names.
@@ -320,6 +509,10 @@ pub struct RedactionConfig {
     custom_fields: Vec<String>,
     terminal_literals: Vec<String>,
     terminal_regexes: Vec<regex::Regex>,
+    /// Built-in value patterns on structured payloads and the command line.
+    structured_patterns: bool,
+    /// Built-in value patterns on captured terminal text (opt-in).
+    terminal_patterns: bool,
 }
 
 impl Default for RedactionConfig {
@@ -376,20 +569,54 @@ impl RedactionConfig {
             custom_fields,
             terminal_literals,
             terminal_regexes,
+            structured_patterns: true,
+            terminal_patterns: false,
         })
     }
 
+    /// Whether the built-in secret value patterns (see
+    /// [`builtin_secret_pattern_names`]) apply to structured payload strings
+    /// and the recorded command line. On by default.
+    pub fn default_secret_patterns(mut self, enabled: bool) -> Self {
+        self.structured_patterns = enabled;
+        self
+    }
+
+    /// Whether the built-in secret value patterns also apply to captured
+    /// terminal text. Off by default: terminal output is stored raw unless
+    /// the user configures a rule for it.
+    pub fn known_secrets_in_terminal(mut self, enabled: bool) -> Self {
+        self.terminal_patterns = enabled;
+        self
+    }
+
     fn provenance(&self) -> RedactionProvenance {
+        let builtin = self.structured_patterns || self.terminal_patterns;
         RedactionProvenance {
             structured_defaults: true,
             custom_fields: self.custom_fields.clone(),
             terminal_literal_count: self.terminal_literals.len(),
             terminal_regex_count: self.terminal_regexes.len(),
+            builtin_patterns: if builtin {
+                builtin_secret_pattern_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            builtin_patterns_structured: self.structured_patterns,
+            builtin_patterns_terminal: self.terminal_patterns,
         }
     }
 
     fn has_text_rules(&self) -> bool {
         !self.terminal_literals.is_empty() || !self.terminal_regexes.is_empty()
+    }
+
+    /// Whether any rule can rewrite captured terminal text.
+    fn redacts_terminal(&self) -> bool {
+        self.has_text_rules() || self.terminal_patterns
     }
 
     fn redact_text(&self, text: &str) -> String {
@@ -407,30 +634,52 @@ impl RedactionConfig {
         redacted
     }
 
-    /// Apply the literal and regex rules to every string value in `value`.
-    fn redact_strings(&self, value: &mut serde_json::Value) {
+    /// Apply the literal and regex rules (`rules`) and the built-in secret
+    /// value patterns (`patterns`) to every string value in `value`.
+    fn redact_strings(&self, value: &mut serde_json::Value, rules: bool, patterns: bool) {
         match value {
-            serde_json::Value::String(text) => *text = self.redact_text(text),
+            serde_json::Value::String(text) => {
+                if rules {
+                    *text = self.redact_text(text);
+                }
+                if patterns && let Some(redacted) = redact_builtin_secrets(text, &mut |_| {}) {
+                    *text = redacted;
+                }
+            }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    self.redact_strings(item);
+                    self.redact_strings(item, rules, patterns);
                 }
             }
             serde_json::Value::Object(object) => {
                 for (_, child) in object {
-                    self.redact_strings(child);
+                    self.redact_strings(child, rules, patterns);
                 }
             }
             _ => {}
         }
     }
 
+    /// Redact a structured (non-terminal) string such as the run name or one
+    /// command argument: the literal and regex rules, then the built-in
+    /// secret value patterns unless they are switched off.
+    fn redact_structured_text(&self, text: &str) -> String {
+        let redacted = self.redact_text(text);
+        if self.structured_patterns
+            && let Some(redacted) = redact_builtin_secrets(&redacted, &mut |_| {})
+        {
+            return redacted;
+        }
+        redacted
+    }
+
     /// Redact a recorded command line: values of secret-named flags,
-    /// assignments and headers, then the literal and regex rules.
+    /// assignments and headers, then the literal and regex rules and the
+    /// built-in secret value patterns.
     fn redact_command(&self, command: &[String]) -> Vec<String> {
         redact_command_fields(command, &|name| field_is_secret(name, &self.fields))
             .iter()
-            .map(|argument| self.redact_text(argument))
+            .map(|argument| self.redact_structured_text(argument))
             .collect()
     }
 
@@ -446,13 +695,52 @@ impl RedactionConfig {
         if native_stdout
             && kind == "process.stdout"
             && let Some(text) = payload.get("text").and_then(serde_json::Value::as_str)
-            && let Some(redacted) = redact_structured_lines(text, &self.fields)
+            && let Some(redacted) = self.redact_structured_lines(text)
         {
             payload["text"] = serde_json::Value::String(redacted);
         }
-        if self.has_text_rules() {
-            self.redact_strings(payload);
+        // Captured terminal text is raw unless the user opted in.
+        let patterns = if is_terminal_kind(kind) {
+            self.terminal_patterns
+        } else {
+            self.structured_patterns
+        };
+        let rules = self.has_text_rules();
+        if rules || patterns {
+            self.redact_strings(payload, rules, patterns);
         }
+    }
+
+    /// Redact the JSON-object lines of raw terminal text the way the same
+    /// objects are redacted as structured payloads: secret fields, plus the
+    /// built-in secret value patterns. Lines that are not JSON objects, or
+    /// need no redaction, keep their exact bytes; `None` means nothing changed.
+    fn redact_structured_lines(&self, text: &str) -> Option<String> {
+        let mut changed = false;
+        let mut output = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let redacted = body
+                .trim_start()
+                .starts_with('{')
+                .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
+                .flatten()
+                .and_then(|original| {
+                    let mut value = original.clone();
+                    redact_structured_fields(&mut value, &self.fields);
+                    self.redact_strings(&mut value, false, self.structured_patterns);
+                    (value != original).then(|| value.to_string())
+                });
+            match redacted {
+                Some(redacted) => {
+                    changed = true;
+                    output.push_str(&redacted);
+                    output.push_str(&line[body.len()..]);
+                }
+                None => output.push_str(line),
+            }
+        }
+        changed.then_some(output)
     }
 }
 
@@ -521,46 +809,30 @@ fn string_items(value: &serde_json::Value) -> Option<Vec<String>> {
         .collect()
 }
 
-/// Redact secret fields inside JSON-object lines of raw terminal text. Lines
-/// that are not JSON objects, or contain no secret field, keep their exact
-/// bytes; `None` means nothing changed.
-fn redact_structured_lines(text: &str, fields: &HashSet<String>) -> Option<String> {
-    let mut changed = false;
-    let mut output = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\r', '\n']);
-        let redacted = body
-            .trim_start()
-            .starts_with('{')
-            .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
-            .flatten()
-            .and_then(|original| {
-                let mut value = original.clone();
-                redact_structured_fields(&mut value, fields);
-                (value != original).then(|| value.to_string())
-            });
-        match redacted {
-            Some(redacted) => {
-                changed = true;
-                output.push_str(&redacted);
-                output.push_str(&line[body.len()..]);
-            }
-            None => output.push_str(line),
-        }
-    }
-    changed.then_some(output)
-}
-
 /// Carry-over buffer that keeps redaction correct when captured terminal
 /// output arrives in arbitrary chunks. It never rewrites text: it only delays
 /// it, releasing each piece at a point no literal rule can straddle (and, when
 /// regex or structured-line rules are active, only at line ends), so the
 /// per-event redaction in [`TraceWriter::append_input`] sees secrets whole.
 /// With no rules configured it is a pass-through.
+///
+/// Limits, stated explicitly:
+/// - Regex rules are line-scoped: a match is only guaranteed within one line
+///   of terminal output, never across a line break. The one multi-line
+///   built-in, a PEM private key block, is held until its end marker.
+/// - A line longer than [`MAX_HELD_LINE_BYTES`] without a line break is cut
+///   early, keeping the last [`HELD_OVERLAP_BYTES`] held and never cutting
+///   inside a match, so a match up to that size cannot straddle the cut.
+/// - [`Self::flush_idle`] releases a held partial line (such as a prompt)
+///   early; a regex match the stream pauses inside may then be split.
 #[derive(Clone, Debug)]
 pub struct TerminalRedactionBuffer {
     literals: Vec<String>,
-    hold_lines: bool,
+    regexes: Vec<regex::Regex>,
+    /// The built-in secret value patterns apply to this stream.
+    known_secrets: bool,
+    /// The stream is JSONL whose object lines are redacted as structured data.
+    structured_lines: bool,
     held: String,
     held_bytes: usize,
 }
@@ -578,6 +850,23 @@ impl TerminalRedactionBuffer {
     /// Release everything still held once the stream has ended.
     pub fn finish(&mut self) -> Option<(String, usize)> {
         self.release(self.held.len())
+    }
+
+    /// Release a held partial line once the stream has gone quiet, so an
+    /// unterminated line such as an interactive prompt is journaled without
+    /// waiting for its line break. What a literal rule or an open private key
+    /// block could still complete stays held, and so does a partial JSONL
+    /// line, which can only be redacted as structured data once it is whole.
+    pub fn flush_idle(&mut self) -> Option<(String, usize)> {
+        if self.structured_lines {
+            return None;
+        }
+        let cut = self.literal_safe_cut(self.open_block_cut(self.held.len()));
+        self.release(cut)
+    }
+
+    fn hold_lines(&self) -> bool {
+        !self.regexes.is_empty() || self.known_secrets || self.structured_lines
     }
 
     fn release(&mut self, cut: usize) -> Option<(String, usize)> {
@@ -598,16 +887,72 @@ impl TerminalRedactionBuffer {
     fn safe_cut(&self) -> usize {
         let text = self.held.as_str();
         let within_bound = |cut: usize| text.len() - cut <= MAX_HELD_LINE_BYTES;
-        if self.hold_lines {
+        if self.hold_lines() {
             let line_end = text.rfind('\n').map_or(0, |index| index + 1);
-            let cut = self.literal_safe_cut(line_end);
-            if within_bound(cut) {
-                return cut;
-            }
+            let cut = self.literal_safe_cut(self.open_block_cut(line_end));
+            return if within_bound(cut) {
+                cut
+            } else {
+                self.forced_cut()
+            };
         }
-        // An over-long line is released rather than held without bound.
+        // An over-long literal prefix is released rather than held without bound.
         let cut = self.literal_safe_cut(text.len());
         if within_bound(cut) { cut } else { text.len() }
+    }
+
+    /// Cut for a line that outgrew [`MAX_HELD_LINE_BYTES`]: everything but an
+    /// overlap window, moved back to the start of any rule match that would
+    /// otherwise straddle the cut. A single match too long to hold is split.
+    fn forced_cut(&self) -> usize {
+        let text = self.held.as_str();
+        let mut target = text.len().saturating_sub(HELD_OVERLAP_BYTES);
+        while !text.is_char_boundary(target) {
+            target -= 1;
+        }
+        let mut spans = Vec::new();
+        for regex in &self.regexes {
+            spans.extend(
+                regex
+                    .find_iter(text)
+                    .map(|found| (found.start(), found.end())),
+            );
+        }
+        if self.known_secrets {
+            for pattern in BUILTIN_SECRET_PATTERNS.iter() {
+                spans.extend(secret_pattern_spans(pattern, text));
+            }
+        }
+        let cut = spans
+            .into_iter()
+            .filter(|(start, end)| *start < target && target < *end)
+            .map(|(start, _)| start)
+            .min()
+            .unwrap_or(target);
+        let cut = self.literal_safe_cut(cut);
+        if text.len() - cut <= MAX_HELD_LINE_BYTES {
+            cut
+        } else {
+            target
+        }
+    }
+
+    /// Latest point at or before `limit` that does not release the opening
+    /// of a private key block whose end marker has not arrived yet.
+    fn open_block_cut(&self, limit: usize) -> usize {
+        if !self.known_secrets {
+            return limit;
+        }
+        let text = &self.held[..limit];
+        let Some(begin) = PEM_BEGIN_PATTERN.find_iter(text).last() else {
+            return limit;
+        };
+        if PEM_END_PATTERN.is_match(&text[begin.end()..]) {
+            return limit;
+        }
+        text[..begin.start()]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
     }
 
     /// Latest point at or before `limit` that no literal occurrence, complete
@@ -770,7 +1115,7 @@ impl TraceWriter {
             "causal-links".into(),
             "structured-redaction".into(),
         ];
-        if redaction.has_text_rules() {
+        if redaction.redacts_terminal() {
             capabilities.push("terminal-redaction".into());
         }
         let trace_id = Uuid::now_v7().to_string();
@@ -787,7 +1132,7 @@ impl TraceWriter {
             tenant_id: tenant_id.to_owned(),
             name: name
                 .filter(|value| !value.trim().is_empty())
-                .map(|value| redaction.redact_text(&value)),
+                .map(|value| redaction.redact_structured_text(&value)),
             command: redaction.redact_command(&command),
             started_at: Utc::now(),
             ended_at: None,
@@ -851,8 +1196,9 @@ impl TraceWriter {
     pub fn terminal_redaction_buffer(&self, kind: &str) -> TerminalRedactionBuffer {
         TerminalRedactionBuffer {
             literals: self.redaction.terminal_literals.clone(),
-            hold_lines: !self.redaction.terminal_regexes.is_empty()
-                || (kind == "process.stdout" && self.manifest.adapter.is_some()),
+            regexes: self.redaction.terminal_regexes.clone(),
+            known_secrets: self.redaction.terminal_patterns,
+            structured_lines: kind == "process.stdout" && self.manifest.adapter.is_some(),
             held: String::new(),
             held_bytes: 0,
         }
@@ -2866,10 +3212,361 @@ mod tests {
         .unwrap();
         let mut buffer = regex.terminal_redaction_buffer("process.stdout");
         assert_eq!(buffer.push("one\ntwo", 7), Some(("one\n".into(), 4)));
-        // A line that never ends is eventually released instead of growing.
+        // A line that never ends is eventually released instead of growing,
+        // except for an overlap window a later match could still begin in.
         let long = "y".repeat(MAX_HELD_LINE_BYTES);
         let (text, _) = buffer.push(&long, long.len()).unwrap();
-        assert_eq!(text.len(), MAX_HELD_LINE_BYTES + 3);
+        assert_eq!(text.len(), MAX_HELD_LINE_BYTES + 3 - HELD_OVERLAP_BYTES);
+    }
+
+    #[test]
+    fn a_forced_cut_of_an_over_long_line_never_splits_a_rule_match() {
+        // The secret arrives exactly where the unterminated line outgrows the
+        // hold limit, split across two reads.
+        let filler = "x".repeat(MAX_HELD_LINE_BYTES - 2);
+        for (rules, head, tail) in [
+            (text_rules(&[], &["sk-[a-z0-9]+"]), "sk-ab", "cdef123"),
+            (
+                text_rules(&["SUPERSECRETVALUE"], &["never-matches"]),
+                "SUPERSEC",
+                "RETVALUE",
+            ),
+        ] {
+            let first = format!("{filler} {head}");
+            let second = format!("{tail} done\n");
+            let stored = journal_chunks(rules, "process.stdout", &[&first, &second]);
+            assert_eq!(stored, format!("{filler} [REDACTED] done\n"));
+        }
+        // A match longer than the hold limit cannot be held; it is still
+        // redacted piecewise and the buffer stays bounded.
+        let mut buffer = TraceWriter::create_named_with_redaction(
+            tempfile::tempdir().unwrap().path().join("long.atrace"),
+            vec![],
+            None,
+            text_rules(&[], &["y+"]),
+        )
+        .unwrap()
+        .terminal_redaction_buffer("process.stdout");
+        let long = "y".repeat(MAX_HELD_LINE_BYTES + 1);
+        let (text, _) = buffer.push(&long, long.len()).unwrap();
+        assert_eq!(text.len(), long.len() - HELD_OVERLAP_BYTES);
+    }
+
+    #[test]
+    fn idle_flush_releases_a_held_prompt_but_not_a_possible_literal_or_jsonl_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = TraceWriter::create_named_with_redaction(
+            temp.path().join("idle.atrace"),
+            vec![],
+            None,
+            text_rules(&["hunter2"], &["sk-[a-z0-9]+"]),
+        )
+        .unwrap();
+        let mut buffer = writer.terminal_redaction_buffer("process.terminal");
+        assert_eq!(
+            buffer.push("done\nPassword: ", 15),
+            Some(("done\n".into(), 5))
+        );
+        assert_eq!(buffer.flush_idle(), Some(("Password: ".into(), 10)));
+        assert_eq!(buffer.flush_idle(), None);
+        // The start of a literal secret stays held however long the pause.
+        assert_eq!(buffer.push("token hun", 9), None);
+        assert_eq!(buffer.flush_idle(), Some(("token ".into(), 6)));
+        assert_eq!(buffer.push("ter2\n", 5), Some(("hunter2\n".into(), 8)));
+
+        let mut adapter = TraceWriter::create(temp.path().join("jsonl.atrace"), vec![]).unwrap();
+        adapter
+            .set_adapter(AdapterProvenance {
+                provider: "claude".into(),
+                schema_version: 1,
+                transport: "stdout-jsonl".into(),
+                completeness: "provider-native-best-effort".into(),
+            })
+            .unwrap();
+        let mut buffer = adapter.terminal_redaction_buffer("process.stdout");
+        assert_eq!(buffer.push(r#"{"api_key":"abc"#, 16), None);
+        assert_eq!(buffer.flush_idle(), None);
+        assert!(buffer.finish().is_some());
+    }
+
+    /// Secret-shaped sample values, assembled at run time so the source file
+    /// itself never contains a credential-shaped string.
+    fn sample_secrets() -> Vec<(&'static str, String)> {
+        let body = "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+        vec![
+            (
+                "pem-private-key",
+                format!(
+                    "-----BEGIN RSA {0}-----\nMIIEow{body}\n{body}\n-----END RSA {0}-----",
+                    "PRIVATE KEY"
+                ),
+            ),
+            ("sk-api-key", format!("sk-{body}")),
+            ("sk-api-key", format!("sk-ant-api03-{body}")),
+            ("github-token", format!("ghp_{body}")),
+            ("github-token", format!("ghs_{body}")),
+            (
+                "github-fine-grained-pat",
+                format!("github_pat_{body}_{body}"),
+            ),
+            ("aws-access-key-id", format!("AKIA{}", "IOSFODNN7EXAMPLE")),
+            ("slack-token", format!("xoxb-1234567890-{body}")),
+            (
+                "jwt",
+                format!("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.{body}"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn builtin_patterns_redact_well_known_secret_shapes_and_name_the_rule() {
+        for (name, secret) in sample_secrets() {
+            let text = format!("before {secret} after");
+            let mut matched = Vec::new();
+            let redacted = redact_builtin_secrets(&text, &mut |rule| matched.push(rule)).unwrap();
+            assert_eq!(redacted, "before [REDACTED] after", "{name}");
+            assert_eq!(matched, [name]);
+            // A second pass over redacted text changes nothing.
+            assert_eq!(redact_builtin_secrets(&redacted, &mut |_| {}), None);
+        }
+        let body = "a1B2c3D4e5F6g7H8i9J0k1L2";
+        for (name, text, expected) in [
+            (
+                "authorization-header",
+                format!("curl -H 'Authorization: Bearer {body}' https://example.test"),
+                "curl -H 'Authorization: Bearer [REDACTED]' https://example.test".to_owned(),
+            ),
+            (
+                "authorization-header",
+                r#"{\"authorization\": \"Basic dXNlcjpwYXNz\", "n": 1}"#.to_owned(),
+                r#"{\"authorization\": \"Basic [REDACTED]\", "n": 1}"#.to_owned(),
+            ),
+            (
+                "bearer-token",
+                format!("sent bearer {body} upstream"),
+                "sent bearer [REDACTED] upstream".to_owned(),
+            ),
+            (
+                "url-credentials",
+                "git clone https://deploy:hunter2@git.example.test/repo.git".to_owned(),
+                "git clone https://deploy:[REDACTED]@git.example.test/repo.git".to_owned(),
+            ),
+            (
+                "url-credentials",
+                "postgres://:p%40ss@db:5432/app".to_owned(),
+                "postgres://:[REDACTED]@db:5432/app".to_owned(),
+            ),
+            (
+                "pem-private-key",
+                "-----BEGIN PRIVATE KEY-----\nMIIEvQ truncated".to_owned(),
+                "[REDACTED]".to_owned(),
+            ),
+        ] {
+            let mut matched = Vec::new();
+            let redacted = redact_builtin_secrets(&text, &mut |rule| matched.push(rule));
+            assert_eq!(redacted.as_deref(), Some(expected.as_str()), "{name}");
+            assert_eq!(matched, [name]);
+        }
+        assert_eq!(
+            builtin_secret_pattern_names(),
+            [
+                "pem-private-key",
+                "authorization-header",
+                "bearer-token",
+                "url-credentials",
+                "sk-api-key",
+                "github-token",
+                "github-fine-grained-pat",
+                "aws-access-key-id",
+                "slack-token",
+                "jwt",
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_patterns_leave_ordinary_values_alone() {
+        for text in [
+            "input_tokens=1200 output_tokens=400 total 1600",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "0195f3a2-7b1c-7def-8abc-0123456789ab",
+            "commit 7ebad3a1c0ffee00deadbeef0123456789abcdef",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "https://example.test:8443/path?user=a@b.test",
+            "http://localhost:3000/callback",
+            "ssh://git@github.com:22/org/repo.git",
+            "git@github.com:org/repo.git",
+            "mailto:dev@example.test",
+            "Authorization: Bearer <token>",
+            "Authorization: Bearer $API_TOKEN",
+            "authorization: required",
+            "use bearer authentication for every request",
+            "the task-runner and disk-usage-report-for-all-volumes",
+            "sk-learn-style-hyphenated-slug-without-digits",
+            "sk-short1",
+            "ghp_tooshort123",
+            "AKIAIOSFODNN7EXAMPLEEXTRA",
+            "xoxo-gossip-girl",
+            "eyJhbGciOiJIUzI1NiJ9 alone is not a token",
+            "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----",
+            "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----",
+            "[REDACTED]",
+            "https://user:[REDACTED]@host/path",
+        ] {
+            assert_eq!(redact_builtin_secrets(text, &mut |_| {}), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn builtin_patterns_cover_structured_payloads_and_the_command_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = format!("sk-{}", "a1B2c3D4e5F6g7H8i9J0k1L2");
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("curl -H 'Authorization: Bearer {key}' https://u:pw123@example.test"),
+        ];
+        let payload = serde_json::json!({
+            "note": format!("called with {key}"),
+            "items": ["clone https://deploy:hunter2@git.example.test/r.git"],
+            "usage": {"input_tokens": 1200, "output_tokens": 400},
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "commit": "7ebad3a1c0ffee00deadbeef0123456789abcdef",
+        });
+        let record = |name: &str, redaction: RedactionConfig| {
+            let root = temp.path().join(name);
+            let mut writer = TraceWriter::create_named_with_redaction(
+                &root,
+                command.clone(),
+                Some(format!("run {key}")),
+                redaction,
+            )
+            .unwrap();
+            writer
+                .append("tool.result", "sdk", payload.clone())
+                .unwrap();
+            writer
+                .append(
+                    "process.stdout",
+                    "command",
+                    serde_json::json!({"text": format!("printed {key}\n")}),
+                )
+                .unwrap();
+            let manifest = writer.finish(0).unwrap();
+            let stored = format!(
+                "{}{}",
+                fs::read_to_string(root.join("manifest.json")).unwrap(),
+                read_events(&root)
+                    .unwrap()
+                    .iter()
+                    .map(|event| event.payload_json.clone())
+                    .collect::<String>()
+            );
+            (manifest, read_events(&root).unwrap(), stored)
+        };
+
+        let (manifest, events, stored) = record("default.atrace", RedactionConfig::default());
+        assert_eq!(
+            manifest.command[2],
+            "curl -H 'Authorization: Bearer [REDACTED]' https://u:[REDACTED]@example.test"
+        );
+        assert_eq!(manifest.name.as_deref(), Some("run [REDACTED]"));
+        let stored_payload = events[0].payload();
+        assert_eq!(stored_payload["note"], "called with [REDACTED]");
+        assert_eq!(
+            stored_payload["items"][0],
+            "clone https://deploy:[REDACTED]@git.example.test/r.git"
+        );
+        for kept in ["usage", "id", "commit"] {
+            assert_eq!(stored_payload[kept], payload[kept]);
+        }
+        // Terminal text stays raw unless the user opts in.
+        assert_eq!(events[1].payload()["text"], format!("printed {key}\n"));
+        assert_eq!(stored.matches(&key).count(), 1);
+        let provenance = manifest.redaction.unwrap();
+        assert_eq!(provenance.builtin_patterns, builtin_secret_pattern_names());
+        assert!(provenance.builtin_patterns_structured);
+        assert!(!provenance.builtin_patterns_terminal);
+        assert!(!manifest.capabilities.contains(&"terminal-redaction".into()));
+
+        let (manifest, _, stored) = record(
+            "terminal.atrace",
+            RedactionConfig::default().known_secrets_in_terminal(true),
+        );
+        assert!(!stored.contains(&key), "{stored}");
+        assert!(manifest.redaction.unwrap().builtin_patterns_terminal);
+        assert!(manifest.capabilities.contains(&"terminal-redaction".into()));
+
+        let (manifest, events, stored) = record(
+            "off.atrace",
+            RedactionConfig::default().default_secret_patterns(false),
+        );
+        assert_eq!(events[0].payload(), payload);
+        assert_eq!(stored.matches(&key).count(), 4);
+        let provenance = manifest.redaction.unwrap();
+        assert!(provenance.builtin_patterns.is_empty());
+        assert!(!provenance.builtin_patterns_structured);
+    }
+
+    #[test]
+    fn opted_in_terminal_patterns_hold_split_tokens_and_whole_key_blocks() {
+        let key = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let (head, tail) = key.split_at(12);
+        let rules = || RedactionConfig::default().known_secrets_in_terminal(true);
+        assert_eq!(
+            journal_chunks(
+                rules(),
+                "process.terminal",
+                &["export GH=", head, tail, "\nok\n"]
+            ),
+            "export GH=[REDACTED]\nok\n"
+        );
+        let block = [
+            "key:\n-----BEGIN OPENSSH ",
+            "PRIVATE KEY-----\n",
+            "b3BlbnNzaC1rZXktdjEAAAAA\n",
+            "QyNTUxOQAAACD\n",
+            "-----END OPENSSH PRIVATE KEY-----\n",
+            "after\n",
+        ];
+        assert_eq!(
+            journal_chunks(rules(), "process.stdout", &block),
+            "key:\n[REDACTED]\nafter\n"
+        );
+        // Without the opt-in the same output is stored exactly as captured.
+        assert_eq!(
+            journal_chunks(RedactionConfig::default(), "process.stdout", &block),
+            block.concat()
+        );
+    }
+
+    #[test]
+    fn adapter_stdout_lines_get_the_same_value_patterns_as_their_native_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("adapter-values.atrace");
+        let key = format!("sk-{}", "a1B2c3D4e5F6g7H8i9J0k1L2");
+        let mut writer = TraceWriter::create(&root, vec!["agent".into()]).unwrap();
+        writer
+            .set_adapter(AdapterProvenance {
+                provider: "claude".into(),
+                schema_version: 1,
+                transport: "stdout-jsonl".into(),
+                completeness: "provider-native-best-effort".into(),
+            })
+            .unwrap();
+        let line = format!(r#"{{"type":"result","result":"used {key}"}}"#);
+        writer
+            .append(
+                "process.stdout",
+                "command",
+                serde_json::json!({"text": format!("{line}\nplain {key}\n")}),
+            )
+            .unwrap();
+        writer.finish(0).unwrap();
+        assert_eq!(
+            read_events(&root).unwrap()[0].payload()["text"],
+            format!("{{\"result\":\"used [REDACTED]\",\"type\":\"result\"}}\nplain {key}\n")
+        );
     }
 
     proptest::proptest! {

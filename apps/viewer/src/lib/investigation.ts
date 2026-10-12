@@ -1,5 +1,6 @@
 import { actorId, eventSummary, isIssue, runHealth } from './analysis';
 import { modelCallUsage } from './modelUsage';
+import { isAbandoned } from './types';
 import type { TraceEvent, TraceManifest } from './types';
 
 export type EvidenceConfidence = 'high' | 'medium' | 'low';
@@ -93,7 +94,14 @@ function runFailed(trace: TraceManifest, events: TraceEvent[]): boolean {
     || terminalIssue(events) !== null;
 }
 
+function abandonedDetail(trace: TraceManifest): string {
+  return trace.integrity_detail?.trim() || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.';
+}
+
 function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCause {
+  if (isAbandoned(trace) && !events.length) {
+    return { title: 'Recording was abandoned', detail: abandonedDetail(trace), confidence: 'high', event: null, role: 'cause' };
+  }
   if (!events.length) {
     return {
       title: trace.ended_at === null ? 'Waiting for evidence' : 'No evidence captured',
@@ -162,6 +170,9 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
       event: failedTerminal,
       role: 'outcome'
     };
+  }
+  if (isAbandoned(trace)) {
+    return { title: 'Recording was abandoned', detail: abandonedDetail(trace), confidence: 'high', event: events.at(-1) ?? null, role: 'outcome' };
   }
   if (trace.ended_at === null || trace.integrity === 'live') {
     const latest = events.at(-1) ?? null;

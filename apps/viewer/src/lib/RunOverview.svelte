@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { TraceEvent, TraceManifest } from './types';
+  import { isAbandoned, type TraceEvent, type TraceManifest } from './types';
   import { actorInventory, countByCategory, runHealth } from './analysis';
 
   let { trace, events, compact = false }: {
@@ -20,8 +20,10 @@
   );
   let evidenceLabel = $derived(errors ? `${errors} issue${errors === 1 ? '' : 's'}` : `${events.length} event${events.length === 1 ? '' : 's'}`);
   let evidenceDetail = $derived(
-    `${events.length} captured · ${models} model${models === 1 ? '' : 's'} · ${tools} tool${tools === 1 ? '' : 's'}${trace.integrity === 'verified' ? ' · verified' : trace.integrity === 'invalid' ? ' · integrity failed' : trace.integrity === 'live' ? ' · live' : ''}`
+    `${events.length} captured · ${models} model${models === 1 ? '' : 's'} · ${tools} tool${tools === 1 ? '' : 's'}${trace.integrity === 'verified' ? ' · verified' : trace.integrity === 'invalid' ? ' · integrity failed' : trace.integrity === 'abandoned' ? ' · abandoned' : trace.integrity === 'live' ? ' · live' : ''}`
   );
+  let abandoned = $derived(isAbandoned(trace));
+  let abandonedDetail = $derived(trace.integrity_detail?.trim() || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.');
 </script>
 
 {#if compact}
@@ -43,6 +45,10 @@
     <div class="integrity-banner compact" role="status" title={trace.integrity_detail || 'Journal failed integrity verification'}>
       <strong>Integrity failed</strong>
     </div>
+  {:else if abandoned}
+    <div class="integrity-banner compact abandoned" role="status" title={abandonedDetail}>
+      <strong>Abandoned — run premier recover</strong>
+    </div>
   {/if}
 {:else}
   <section class="run-overview" aria-label="Run overview">
@@ -55,6 +61,11 @@
       <div class="integrity-banner" role="status">
         <strong>Integrity check failed</strong>
         <span>{trace.integrity_detail || 'This journal does not match its manifest digest. Treat outcome labels as untrusted; raw events remain available for forensics.'}</span>
+      </div>
+    {:else if abandoned}
+      <div class="integrity-banner abandoned" role="status">
+        <strong>Abandoned — run premier recover</strong>
+        <span>{abandonedDetail}</span>
       </div>
     {/if}
   </section>
@@ -122,6 +133,8 @@
   .run-overview { grid-template-columns: minmax(0, 1fr); }
   .integrity-banner { display: grid; gap: 4px; margin: 0 0 8px; padding: 10px 14px; border: 1px solid rgba(255,113,109,.35); border-radius: 6px; background: rgba(255,113,109,.08); color: #ffc2bf; }
   .integrity-banner strong { color: #ffaaa6; font-size: 12px; }
+  .integrity-banner.abandoned { border-color: rgba(240,185,104,.35); background: rgba(240,185,104,.08); }
+  .integrity-banner.abandoned strong { color: #f0b968; }
   .integrity-banner span { color: #d7c0be; font-size: 11px; line-height: 1.45; }
   .run-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; border-right: 0; }
   .run-metrics div { gap: 4px; padding-inline: 14px; }

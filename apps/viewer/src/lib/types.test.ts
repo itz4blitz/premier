@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { eventPayload, listKey, type TraceEvent, type TraceManifest } from './types';
+import { eventPayload, isAbandoned, isRecording, listKey, type TraceEvent, type TraceManifest } from './types';
 
 const baseEvent = (payload_json: string): TraceEvent => ({
   event_id: 'e1',
@@ -61,5 +61,26 @@ describe('listKey', () => {
 
   it('falls back to trace_id', () => {
     expect(listKey(manifest())).toBe('shared-id');
+  });
+});
+
+describe('recording state', () => {
+  const open: TraceManifest = {
+    format_version: 1, trace_id: 't1', command: ['agent'], started_at: '2026-01-01T00:00:00Z',
+    ended_at: null, exit_code: null, journal: null
+  };
+
+  it('tails only traces whose recorder is still running', () => {
+    expect(isRecording({ ...open, integrity: 'live' })).toBe(true);
+    // Older servers do not report integrity for an open trace.
+    expect(isRecording(open)).toBe(true);
+    expect(isRecording({ ...open, integrity: 'abandoned' })).toBe(false);
+    expect(isRecording({ ...open, ended_at: '2026-01-01T00:00:01Z', integrity: 'verified' })).toBe(false);
+  });
+
+  it('recognizes abandoned traces', () => {
+    expect(isAbandoned({ ...open, integrity: 'abandoned' })).toBe(true);
+    expect(isAbandoned({ ...open, integrity: 'live' })).toBe(false);
+    expect(isAbandoned(open)).toBe(false);
   });
 });

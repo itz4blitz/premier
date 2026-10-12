@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { api } from './lib/api';
   import type { EventFilters, TraceEvent, TraceManifest } from './lib/types';
-  import { listKey } from './lib/types';
+  import { isAbandoned, isRecording, listKey } from './lib/types';
   import { filterEvents, isIssue, materialEvent, runHealth, traceTimeBounds } from './lib/analysis';
   import { applyTraceComplete, mergeLiveEvents, resolveSelectedEvent, shouldCommitLoad, type EventRequest } from './lib/traceLoad';
   import { readViewSession, writeViewSession, clearViewSession } from './lib/viewSession';
@@ -70,7 +70,7 @@
   let error = $state<string | null>(null);
   let fatalError = $state<string | null>(null);
   let live = $state(false);
-  let streamState = $state<'recorded' | 'connecting' | 'live' | 'reconnecting' | 'disconnected'>('recorded');
+  let streamState = $state<'recorded' | 'abandoned' | 'connecting' | 'live' | 'reconnecting' | 'disconnected'>('recorded');
   let actionFeedback = $state('');
   let replaying = $state(false);
   let replayTimer: number | null = null;
@@ -347,7 +347,7 @@
     traceLoading = true;
     contentStale = !warmPaint;
     live = false;
-    streamState = trace.ended_at ? 'recorded' : 'connecting';
+    streamState = isRecording(trace) ? 'connecting' : isAbandoned(trace) ? 'abandoned' : 'recorded';
     error = null;
     fatalError = null;
     missingEventReference = null;
@@ -387,7 +387,8 @@
       pendingTraceId = null;
       if (!missingEventReference) writeUrl(committed.trace_id, selectedEvent, pushHistory ? 'push' : 'replace');
       persistSessionSoon();
-      if (!committed.ended_at) {
+      // An abandoned trace has no recorder left to tail.
+      if (isRecording(committed)) {
         closeStream = api.stream(
           committed.trace_id,
           (event) => enqueueLiveEvent(epoch, event),
@@ -410,7 +411,7 @@
         );
       } else {
         live = false;
-        streamState = 'recorded';
+        streamState = isAbandoned(committed) ? 'abandoned' : 'recorded';
       }
     } catch (cause) {
       if (!shouldCommitLoad(epoch, loadEpoch)) return;
@@ -682,8 +683,18 @@
     }
     pollTimer = window.setInterval(() => {
       void api.traces().then((next) => {
-        if (next.length !== traces.length || next.some((item, index) => item.trace_id !== traces[index]?.trace_id || item.ended_at !== traces[index]?.ended_at)) {
+        if (next.length !== traces.length || next.some((item, index) => item.trace_id !== traces[index]?.trace_id || item.ended_at !== traces[index]?.ended_at || item.integrity !== traces[index]?.integrity)) {
           traces = next;
+        }
+        // A recorder that died while its trace was open: stop tailing and say so.
+        const listed = selectedTrace && !selectedTrace.ended_at ? next.find((item) => listKey(item) === listKey(selectedTrace!)) : undefined;
+        if (listed && isAbandoned(listed) && !isAbandoned(selectedTrace!)) {
+          closeStream?.();
+          closeStream = null;
+          flushLiveBatch(loadEpoch);
+          selectedTrace = { ...selectedTrace!, integrity: listed.integrity, integrity_detail: listed.integrity_detail };
+          live = false;
+          streamState = 'abandoned';
         }
         // The empty state has nothing selected; adopt the first recording as soon as it appears.
         if (next.length && !selectedTrace && !pendingTraceId && !fatalError) void applyLocationState();
@@ -755,7 +766,7 @@
         </div>{/if}
       </div>
     </div>
-    <div class="connection" class:live class:recorded={streamState === 'recorded'} class:disconnected={streamState === 'reconnecting' || streamState === 'disconnected'} title={streamState === 'reconnecting' ? 'The live stream dropped. The browser is retrying automatically.' : undefined} role="status" aria-live="polite"><span></span>{streamState === 'live' ? 'STREAMING' : streamState === 'recorded' ? 'RECORDED' : streamState === 'reconnecting' ? 'RECONNECTING' : streamState === 'disconnected' ? 'DISCONNECTED' : 'CONNECTING'}</div>
+    <div class="connection" class:live class:recorded={streamState === 'recorded'} class:disconnected={streamState === 'reconnecting' || streamState === 'disconnected' || streamState === 'abandoned'} title={streamState === 'reconnecting' ? 'The live stream dropped. The browser is retrying automatically.' : streamState === 'abandoned' ? (selectedTrace?.integrity_detail || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.') : undefined} role="status" aria-live="polite"><span></span>{streamState === 'live' ? 'STREAMING' : streamState === 'recorded' ? 'RECORDED' : streamState === 'abandoned' ? 'ABANDONED' : streamState === 'reconnecting' ? 'RECONNECTING' : streamState === 'disconnected' ? 'DISCONNECTED' : 'CONNECTING'}</div>
   </header>
 
   {#if loading}
