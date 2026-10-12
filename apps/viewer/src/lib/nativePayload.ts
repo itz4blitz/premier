@@ -91,12 +91,25 @@ export function payloadProvider(payload: Fields): string | null {
   return firstText(payload, ['provider', 'vendor']);
 }
 
-/** opencode reports `{ input, output, reasoning, cache: { read, write } }`; rename to the common keys. */
-function commonUsageKeys(usage: Fields): Fields {
+/**
+ * Rename a provider's usage block to the common keys. opencode reports
+ * `{ input, output, reasoning, cache: { read, write } }`; Gemini reports `usageMetadata` with
+ * `promptTokenCount`, `candidatesTokenCount`, `cachedContentTokenCount`, `thoughtsTokenCount` and
+ * `totalTokenCount`. The provider's own keys are kept beside the renamed ones.
+ */
+export function commonUsageKeys(usage: Fields): Fields {
   if (usage.input_tokens !== undefined || usage.prompt_tokens !== undefined || usage.output_tokens !== undefined
     || usage.completion_tokens !== undefined || usage.total_tokens !== undefined) return usage;
-  const cache = record(usage.cache);
   const renamed: Fields = { ...usage };
+  if (usage.promptTokenCount !== undefined || usage.candidatesTokenCount !== undefined || usage.totalTokenCount !== undefined) {
+    if (finite(usage.promptTokenCount) !== null) renamed.input_tokens = usage.promptTokenCount;
+    if (finite(usage.candidatesTokenCount) !== null) renamed.output_tokens = usage.candidatesTokenCount;
+    if (finite(usage.totalTokenCount) !== null) renamed.total_tokens = usage.totalTokenCount;
+    if (finite(usage.cachedContentTokenCount) !== null) renamed.cached_tokens = usage.cachedContentTokenCount;
+    if (finite(usage.thoughtsTokenCount) !== null) renamed.reasoning_tokens = usage.thoughtsTokenCount;
+    return renamed;
+  }
+  const cache = record(usage.cache);
   if (finite(usage.input) !== null) renamed.input_tokens = usage.input;
   if (finite(usage.output) !== null) renamed.output_tokens = usage.output;
   if (finite(usage.reasoning) !== null) renamed.reasoning_tokens = usage.reasoning;
@@ -105,7 +118,27 @@ function commonUsageKeys(usage: Fields): Fields {
   if (finite(cache?.write) !== null) renamed.cache_write_tokens = cache?.write;
   return renamed;
 }
-
+/**
+ * Tokens a usage block reports beside its input and output counts rather than inside them, which a
+ * total worked out from the parts must add. Providers differ:
+ *
+ * - Anthropic: `input_tokens` leaves out `cache_read_input_tokens` and `cache_creation_input_tokens`.
+ * - OpenAI: `cached_tokens` (in `prompt_tokens_details` / `input_tokens_details`) is part of the
+ *   prompt count, and reasoning tokens are part of the completion count. Nothing is added.
+ * - Gemini: `cachedContentTokenCount` is part of `promptTokenCount`, but `thoughtsTokenCount` is
+ *   reported beside `candidatesTokenCount`.
+ */
+export function tokensOutsideInputAndOutput(usage: Fields | null): number {
+  if (!usage) return 0;
+  return (finite(usage.cache_read_input_tokens) ?? 0)
+    + (finite(usage.cache_creation_input_tokens) ?? 0)
+    + (usage.candidatesTokenCount !== undefined || usage.promptTokenCount !== undefined ? finite(usage.thoughtsTokenCount) ?? 0 : 0);
+}
+/** The top-level usage block of a payload under any of the names producers use, with common keys. */
+export function directUsage(payload: Fields): Fields | null {
+  const usage = record(payload.usage) ?? record(payload.usageMetadata) ?? record(payload.usage_metadata);
+  return usage ? commonUsageKeys(usage) : null;
+}
 /**
  * A provider's end-of-run summary (Claude Code / Gemini `result`): its usage is the cumulative total of
  * calls that were usually also recorded one by one, so it must not be added to them.
@@ -132,8 +165,8 @@ export function nativeUsage(payload: Fields, perCallOnly = false): Fields | null
   const info = record(native.info);
   const part = record(native.part);
   for (const candidate of [
-    native.usage, response?.usage, item?.usage, info?.last_token_usage, info?.total_token_usage,
-    part?.tokens, native.tokens, native.stats
+    native.usage, response?.usage, item?.usage, native.usageMetadata, response?.usageMetadata,
+    info?.last_token_usage, info?.total_token_usage, part?.tokens, native.tokens, native.stats
   ]) {
     const usage = record(candidate);
     if (usage) return commonUsageKeys(usage);
@@ -147,13 +180,13 @@ export function nativeUsage(payload: Fields, perCallOnly = false): Fields | null
  * evidence, not a second call.
  */
 export function usageReportedElsewhere(payload: Fields): boolean {
-  return text(payload.usage_reported_on) !== null && record(payload.usage) === null;
+  return text(payload.usage_reported_on) !== null && directUsage(payload) === null;
 }
 
 /** Usage block for this event: `payload.usage`, then the provider object. */
 export function payloadUsage(payload: Fields, perCallOnly = false): Fields | null {
   if (usageReportedElsewhere(payload)) return null;
-  return record(payload.usage) ?? nativeUsage(payload, perCallOnly);
+  return directUsage(payload) ?? nativeUsage(payload, perCallOnly);
 }
 
 /** Recorded cost in USD from the provider object, or null when the provider did not report one. */
@@ -280,6 +313,14 @@ function statesFailure(scope: Fields): boolean {
   if (error === undefined || error === null || error === false || error === 0 || error === '') return false;
   if (Array.isArray(error)) return error.length > 0;
   return typeof error === 'object' ? Object.keys(error).length > 0 : true;
+}
+
+/**
+ * True when the top level of a payload states a failure the same way a provider object does. Only
+ * consulted for an event recorded without a status; see `isIssue`.
+ */
+export function payloadFailure(payload: Fields): boolean {
+  return statesFailure(payload);
 }
 
 /**

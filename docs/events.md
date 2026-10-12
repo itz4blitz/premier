@@ -118,13 +118,15 @@ Any string is stored. The ones with behaviour attached:
 
 | Status | Effect |
 | --- | --- |
-| `error`, `failed`, `denied`, `blocked` | The event is an [issue](#what-counts-as-an-issue). |
-| `pending` | The viewer treats the event as awaiting a decision until a later `approval.decision`, or any later event with status `approved` or `denied`, shares its `correlation_id` or `span_id`. |
-| `approved`, `denied` | Settle a pending event as above. |
+| `error`, `failed`, `denied`, `blocked`, `rejected` | The event is an [issue](#what-counts-as-an-issue). |
+| `denied`, `blocked`, `rejected` | A refusal as well: a run with one reads `Blocked`, not `Passed`. |
+| `pending` | The viewer treats the event as awaiting a decision until a later `approval.decision`, or any later event with status `approved`, `denied` or `rejected`, shares its `correlation_id` or `span_id`, or names it as its `parent_event_id`. |
+| `approved`, `denied`, `rejected` | Settle a pending event as above. |
 | `running` | The actor is shown as active. |
 
-`rejected` is valid but is not an issue status. Use `denied` for a refused
-approval if it should be counted and surfaced as a failure.
+`rejected` and `denied` mean the same thing to the viewer. `cancelled` is
+stored and shown but is not an issue: record `failed` or `error` for a
+cancellation that should be surfaced as a failure.
 
 ## Actor types
 
@@ -302,10 +304,13 @@ native adapter about one provider line, not a manifest diagnostic.
 The viewer's issue filter and counts, and the issue count in the trace list,
 use one predicate. An event is an issue when any of these holds:
 
-1. Its `status` is `error`, `failed`, `denied`, or `blocked`
+1. Its `status` is `error`, `failed`, `denied`, `blocked`, or `rejected`
    (case-insensitive).
-2. Its `kind` contains `error` or `fail`, for example `tool.error` or
-   `process.spawn_failed`.
+2. A whole word of its `kind` is `error`, `errors`, `errored`, `fail`,
+   `failed`, or `failure`. The kind is split at every character that is not a
+   letter or a digit, so `tool.error`, `process.spawn_failed` and
+   `agent.failure` are issues, and `tool.failover` and `process.stderr` are
+   not.
 3. It is an adapter event whose provider object (`payload.native`) states a
    failure outright: `is_error` / `isError` is `true`; `status` or `state` is
    `error`, `errored`, `failed`, `failure`, `denied`, or `rejected`;
@@ -315,6 +320,18 @@ use one predicate. An event is an issue when any of these holds:
    event that stands for one content block of a message, the block's own
    `is_error` flag is used. Tool arguments, tool output, and prose are never
    consulted.
+4. It has **no status** and the top level of its payload states a failure the
+   same way: `is_error` / `isError` is `true`; `exit_code` / `exitCode` is
+   non-zero; `error` is present and non-empty; or the payload's own `status`
+   or `state` is one of the failing values in rule 3. This is for events
+   emitted without `--status` (or with `status` left out of an SDK call). A
+   status that was recorded is the producer's statement of the outcome and
+   is not second-guessed: `status: "ok"` with `"is_error": true` in the
+   payload is not an issue. Nested fields are data and are never consulted.
+
+The server's count (`premier list`, `GET /api/traces`, `premier query
+--issues`) and the viewer apply these rules to the same shared test cases
+(`crates/premier-cli/tests/fixtures/issues/issue-cases.json`).
 
 Consequences worth knowing:
 

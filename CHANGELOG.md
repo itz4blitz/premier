@@ -8,6 +8,36 @@ integrations may depend on.
 
 ### Added
 
+- Viewer: the assistant panel shows what a question will send before it is
+  asked: the event range, how many earlier events are left out, the number of
+  earlier messages and the prompt size, and on request the exact text. Each
+  answer is followed by the event range it was based on. New route `POST
+  /api/traces/{trace}/assistant/preview` returns that prompt and its
+  `context` without running a provider, and the assistant route's response
+  carries the same `context`. See
+  [docs/security.md](docs/security.md#the-local-assistant).
+- Viewer: the investigation summary keeps one finding per recorder
+  diagnostic, each opening the event it is about, shows the number of
+  evidence gaps before Details is opened, and follows the effects of a
+  failure through events that name it only by parent span.
+- Viewer: the comparison opens baseline-side events in the baseline run,
+  expands a row to every field change with whole values, keeps the chosen
+  baseline when it is reopened, renders long lists a page at a time, and
+  tells baselines with the same title apart by start time and artifact.
+- Viewer: model usage says when only some calls reported tokens or a cost
+  (`3 of 5 calls reported tokens`) instead of presenting a partial sum as the
+  total.
+- Viewer accessibility: the custom select announces its selected value,
+  keeps its menu inside an enclosing dialog for assistive technology, returns
+  focus to its trigger on Tab, and has a solid keyboard focus ring distinct
+  from hover; primary buttons and the skip link meet 4.5:1 contrast; the page
+  declares its dark colour scheme and keeps focus and selection visible in
+  forced-colors mode.
+- `THIRD_PARTY_NOTICES.md` and `scripts/third-party-notices.mjs`, which
+  generates it from `Cargo.lock` and `package-lock.json`: the Rust crates in
+  the binary and the JavaScript packages in the viewer, with their declared
+  licences. See [docs/releasing.md](docs/releasing.md#third-party-notices)
+  for how to regenerate it and what it does not yet cover.
 - `premier diff` aligns events in order. An event present in only one trace
   is reported as `added` or `removed` where it occurs and the events after it
   stay paired with their counterparts; an event at a different place is
@@ -334,6 +364,48 @@ integrations may depend on.
   and the launcher refuses a system with an older glibc, naming both versions.
 
 ### Changed
+
+- **Breaking: what counts as an issue.** One rule, applied by the server
+  (`premier list`, `premier query --issues`, the trace list's issue count)
+  and by the viewer, and tested against one shared set of cases:
+  - status `rejected` is an issue and a refusal, like `denied`: a run with a
+    rejected approval reads `Blocked` instead of `Passed`;
+  - a kind is matched by whole words (`error`, `errors`, `errored`, `fail`,
+    `failed`, `failure`), so `tool.failover` and other kinds that merely
+    contain those letters are no longer issues;
+  - an event recorded **without a status** whose payload states a failure at
+    its top level (`is_error`, a non-empty `error`, a non-zero `exit_code`,
+    or a failing `status`) is an issue. A recorded status still wins.
+  Issue counts of existing traces can change in both directions. See
+  [docs/events.md](docs/events.md#what-counts-as-an-issue).
+- Viewer: a run that ended without an exit status reads `Unknown`, not
+  `Passed`, and a trace list row applies the same outcome rules as the open
+  run (signalled, interrupted and unknown runs included). The open run's row
+  shows the outcome its header shows.
+- Viewer: model usage counts each call once. A call recorded as a request
+  event and a response event is one call with one set of tokens, and an
+  end-of-run total on an event such as `agent.result` is used only when no
+  call reported usage of its own. A total worked out from its parts follows
+  the provider's convention for cached tokens: Anthropic's cache counts are
+  added to `input_tokens`, OpenAI's and Gemini's are already inside the
+  prompt count. Gemini `usageMetadata` is read. Totals for Anthropic-shaped
+  usage without `total_tokens` are higher than before.
+- Viewer: the analytics event mix and latency cards file each event under its
+  recorded family (`Tool`, `Model`, …) like the run header and the filter
+  tabs; the separate `Issue` slice is gone and failures are reported by the
+  issue rate and the chart's markers.
+- Viewer: the comparison lists differences in trace order (its first row is
+  the first divergence) with both sequence numbers on each row, instead of
+  grouping them by status.
+- Viewer: a run title derived from the command no longer shows inline source
+  for `bash -lc`, `python -u -c`, `cmd.exe /c`, `env VAR=… sh -c` and similar
+  forms, masks credential-shaped arguments (`--token x`, `KEY=x`, URL user
+  info), and is at most 80 characters.
+- Viewer: a provider is recognised by whole words of the model name first,
+  so a model served by Ollama, Bedrock or Vertex is no longer attributed to
+  the host (`ollama` + `qwen` is not Meta).
+- `GET /api/assistants` reports every provider as unavailable, with the
+  reason, to credentials without the `assistant:use` scope.
 
 - **Breaking: `premier diff` output.** `--json` is now
   `format: "premier.semantic-diff.v2"` with `identical`, `alignment`,
@@ -662,9 +734,18 @@ integrations may depend on.
 - Viewer: search matches the same text as `premier query --search`,
   including `parent_event_id`, `links`, and payload strings as displayed.
 - Viewer: Ask AI is disabled until a readable run is open.
+- Viewer: closing the assistant panel no longer discards the conversation,
+  the draft, or an answer that was still on its way; they are kept per trace
+  until the page is reloaded.
 
 ### Fixed
 
+- Viewer: with a locked, unsupported, or damaged trace open, the filter bar
+  and the workspace keep their rows. They each moved up one, which left the
+  workspace 48 pixels tall and the run list unable to scroll to runs below
+  the fold.
+- Viewer: the first-divergence line reads `baseline #1 → current #1`; the
+  two positions ran together as `baseline #1,current #1`.
 - `premier diff` no longer attributes one inserted call to every later call
   of the same kind, and no longer reports reordered events as unchanged.
 - Viewer: a time-cropped System map dropped every connection whose parent

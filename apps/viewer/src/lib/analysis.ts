@@ -1,4 +1,4 @@
-import { nativeExitCode, nativeFailure, nativeOf, nativeText, nativeType, payloadError, payloadModel, payloadTool, payloadTotalTokens, record } from './nativePayload';
+import { nativeExitCode, nativeFailure, payloadFailure, nativeOf, nativeText, nativeType, payloadError, payloadModel, payloadTool, payloadTotalTokens, record } from './nativePayload';
 import { parentResolver } from './causal';
 import { isAbandoned, type EventCategory, type EventFamily, type EventFilters, type TraceEvent, type TraceManifest } from './types';
 
@@ -22,7 +22,7 @@ export interface ActorInventory {
 }
 
 export interface RunHealth {
-  label: 'Running' | 'Abandoned' | 'Locked' | 'Unsupported' | 'Awaiting approval' | 'Blocked' | 'Needs attention' | 'Interrupted' | 'Failed' | 'Passed' | 'Unverified';
+  label: 'Running' | 'Abandoned' | 'Locked' | 'Unsupported' | 'Awaiting approval' | 'Blocked' | 'Needs attention' | 'Interrupted' | 'Failed' | 'Passed' | 'Unknown' | 'Unverified';
   tone: 'running' | 'warning' | 'error' | 'success';
   detail: string;
 }
@@ -46,61 +46,92 @@ export function actorRole(event: TraceEvent): ActorRole {
   return actorId(event) === 'root' ? 'process' : 'agent';
 }
 
+/** Statuses that make an event an issue. `rejected` is a refusal, like `denied`. */
+const ISSUE_STATUSES = new Set(['error', 'failed', 'denied', 'blocked', 'rejected']);
+/** Statuses that refuse an operation: the run was stopped by a decision, not by a fault. */
+export const REFUSAL_STATUSES = new Set(['denied', 'blocked', 'rejected']);
+/** Whole words of a kind that name a failure. `tool.failover` and `process.stderr` have none. */
+const FAILURE_SEGMENTS = new Set(['error', 'errors', 'errored', 'fail', 'failed', 'failure']);
+/** Payload keys that can state a failure; an event without any of them is never decoded. */
+const FAILURE_KEYS = /"(?:is_error|isError|error|exit_code|exitCode|status|state)"/;
+
 /**
- * The one authoritative issue predicate for the viewer.
- * Keep this aligned with the recorder summary contract in premier-cli.
+ * The one authoritative issue predicate for the viewer. An event is an issue when
+ *
+ * 1. its status is `error`, `failed`, `denied`, `blocked` or `rejected`; or
+ * 2. a whole segment of its kind (split at every character that is not a letter or digit) is
+ *    `error`, `errors`, `errored`, `fail`, `failed` or `failure`; or
+ * 3. the provider object under `payload.native` states a failure; or
+ * 4. it has no status at all and its payload states a failure at the top level (`is_error`, a
+ *    non-empty `error`, a non-zero `exit_code`, or a failing `status`). A status the producer did
+ *    record is its own statement of the outcome and is not second-guessed.
+ *
+ * `crates/premier-cli/src/issues.rs` is the server's copy; both run the cases in
+ * `crates/premier-cli/tests/fixtures/issues/issue-cases.json`. Change one and the other must follow.
  */
 export function isIssue(event: TraceEvent): boolean {
-  const status = event.status.trim().toLowerCase();
-  const kind = event.kind.trim().toLowerCase();
-  return ['error', 'failed', 'denied', 'blocked'].includes(status)
-    || kind.includes('error')
-    || kind.includes('fail')
-    || statesNativeFailure(event);
+  return issueBasis(event) !== null;
 }
 
-const nativeFailures = new WeakMap<TraceEvent, boolean>();
+/** Which of the rules above makes an event an issue: what it says outright, or only its payload. */
+export function issueBasis(event: TraceEvent): 'status' | 'kind' | 'payload' | null {
+  const status = event.status.trim().toLowerCase();
+  if (ISSUE_STATUSES.has(status)) return 'status';
+  if (event.kind.trim().toLowerCase().split(/[^a-z0-9]+/).some((segment) => FAILURE_SEGMENTS.has(segment))) return 'kind';
+  return statesPayloadFailure(event, status === '') ? 'payload' : null;
+}
+
+const payloadFailures = new WeakMap<TraceEvent, boolean>();
 
 /**
- * Older adapter traces record a provider's explicit failure only under payload.native.
- * The predicate runs for every row and count, so the decoded answer is kept per event.
+ * A failure stated only in the payload: by the provider object of an adapter event, or at the top
+ * level of an event recorded without a status. The predicate runs for every row and count, so the
+ * decoded answer is kept per event.
  */
-function statesNativeFailure(event: TraceEvent): boolean {
-  // Most events are not adapter envelopes; skip decoding their payload.
-  if (!event.payload_json.includes('"native"')) return false;
-  const known = nativeFailures.get(event);
+function statesPayloadFailure(event: TraceEvent, unstated: boolean): boolean {
+  // Most events carry neither; skip decoding their payload.
+  const envelope = event.payload_json.includes('"native"');
+  if (!envelope && !(unstated && FAILURE_KEYS.test(event.payload_json))) return false;
+  const known = payloadFailures.get(event);
   if (known !== undefined) return known;
   let failed = false;
   try {
     const payload = record(JSON.parse(event.payload_json));
-    failed = payload !== null && nativeFailure(payload, event.correlation_id);
+    failed = payload !== null && (nativeFailure(payload, event.correlation_id) || (unstated && payloadFailure(payload)));
   } catch {
     failed = false;
   }
-  nativeFailures.set(event, failed);
+  payloadFailures.set(event, failed);
   return failed;
 }
 
+/** The status of an event that answers an approval request. */
+const DECIDED_STATUSES = new Set(['approved', 'denied', 'rejected']);
+
 /**
  * Pending events nobody has answered yet. A request is settled by a later `approval.decision`, or by
- * any later approved/denied event, that shares its correlation id or span.
+ * any later approved/denied/rejected event, that shares its correlation id or span, or that names the
+ * request as its parent event.
  */
 export function awaitingApprovals(events: TraceEvent[]): TraceEvent[] {
   const decidedCorrelations = new Set<string>();
   const decidedSpans = new Set<string>();
+  const decidedParents = new Set<string>();
   const awaiting: TraceEvent[] = [];
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     const status = event.status.trim().toLowerCase();
     if (status === 'pending') {
       const settled = (event.correlation_id !== '' && decidedCorrelations.has(event.correlation_id))
-        || (event.span_id !== '' && decidedSpans.has(event.span_id));
+        || (event.span_id !== '' && decidedSpans.has(event.span_id))
+        || decidedParents.has(event.event_id);
       if (!settled) awaiting.push(event);
       continue;
     }
-    if (['approved', 'denied'].includes(status) || event.kind.trim().toLowerCase() === 'approval.decision') {
+    if (DECIDED_STATUSES.has(status) || event.kind.trim().toLowerCase() === 'approval.decision') {
       if (event.correlation_id) decidedCorrelations.add(event.correlation_id);
       if (event.span_id) decidedSpans.add(event.span_id);
+      if (event.parent_event_id) decidedParents.add(event.parent_event_id);
     }
   }
   return awaiting.reverse();
@@ -148,7 +179,7 @@ export function summarizeAgents(events: TraceEvent[]): AgentSummary[] {
       status: 'ok'
     };
     current.events += 1;
-    if (categoryOf(event) === 'error' || ['failed', 'denied', 'blocked'].includes(event.status)) {
+    if (isIssue(event)) {
       current.errors += 1;
       current.status = 'error';
     } else if ((event.status === 'running' || awaiting.has(event)) && current.status !== 'error') {
@@ -180,6 +211,27 @@ export function integrityProtectionLabel(trace: TraceManifest): string {
 }
 
 export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth {
+  const unreadable = unreadableHealth(trace);
+  if (unreadable) return unreadable;
+  return outcomeFrom(trace, {
+    errors: events.filter(isIssue).length,
+    refused: events.filter((event) => REFUSAL_STATUSES.has(event.status.trim().toLowerCase())).length,
+    pending: awaitingApprovals(events).length
+  });
+}
+
+/**
+ * The outcome of a trace list row, from the manifest and the server's summary alone. It applies the
+ * same rules in the same order as `runHealth`, so a row and the open run cannot disagree about how a
+ * run ended. The summary counts issues but not which of them were refusals or pending approvals, so
+ * those two states are only named once the run's events are loaded.
+ */
+export function listHealth(trace: TraceManifest): RunHealth {
+  return unreadableHealth(trace) ?? outcomeFrom(trace, { errors: trace.summary?.issue_count ?? 0, refused: 0, pending: 0 });
+}
+
+/** States in which there is no outcome to report, because the trace cannot be trusted or read. */
+function unreadableHealth(trace: TraceManifest): RunHealth | null {
   if (trace.integrity === 'invalid') {
     return {
       label: 'Unverified',
@@ -208,9 +260,11 @@ export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth
       detail: trace.integrity_detail?.trim() || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.'
     };
   }
-  const errorCount = events.filter((event) => categoryOf(event) === 'error').length;
-  const deniedCount = events.filter((event) => ['denied', 'blocked'].includes(event.status)).length;
-  const pendingCount = awaitingApprovals(events).length;
+  return null;
+}
+
+function outcomeFrom(trace: TraceManifest, counts: { errors: number; refused: number; pending: number }): RunHealth {
+  const { errors: errorCount, refused: deniedCount, pending: pendingCount } = counts;
   if (trace.termination?.kind === 'interrupted') {
     return { label: 'Interrupted', tone: 'warning', detail: 'Recovered after recorder interruption' };
   }
@@ -218,13 +272,17 @@ export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth
     const signal = trace.termination.signal_name?.trim() || (trace.termination.signal ? `signal ${trace.termination.signal}` : 'a signal');
     return { label: 'Failed', tone: 'error', detail: `Terminated by ${signal}` };
   }
-  if (trace.exit_code !== null && trace.exit_code !== 0) {
-    return { label: 'Failed', tone: 'error', detail: `Exit ${trace.exit_code}${errorCount ? ` · ${errorCount} error${errorCount === 1 ? '' : 's'}` : ''}` };
+  // Older manifests carry the exit status only in the termination block.
+  const exitCode = trace.exit_code ?? trace.termination?.exit_code ?? null;
+  if (exitCode !== null && exitCode !== 0) {
+    return { label: 'Failed', tone: 'error', detail: `Exit ${exitCode}${errorCount ? ` · ${errorCount} error${errorCount === 1 ? '' : 's'}` : ''}` };
   }
-  if (deniedCount) return { label: 'Blocked', tone: 'error', detail: `${deniedCount} denied or blocked operation${deniedCount === 1 ? '' : 's'}` };
-  if (errorCount) return { label: 'Needs attention', tone: 'warning', detail: `${errorCount} recorded error${errorCount === 1 ? '' : 's'} despite a clean exit` };
+  if (deniedCount) return { label: 'Blocked', tone: 'error', detail: `${deniedCount} denied, rejected or blocked operation${deniedCount === 1 ? '' : 's'}` };
+  if (errorCount) return { label: 'Needs attention', tone: 'warning', detail: `${errorCount} recorded error${errorCount === 1 ? '' : 's'}${exitCode === 0 ? ' despite a clean exit' : ''}` };
   if (pendingCount) return { label: 'Awaiting approval', tone: 'warning', detail: `${pendingCount} pending decision${pendingCount === 1 ? '' : 's'}` };
   if (trace.ended_at === null || trace.integrity === 'live') return { label: 'Running', tone: 'running', detail: 'Trace is still receiving evidence' };
+  // A run that ended without an exit status did not demonstrably succeed.
+  if (exitCode === null) return { label: 'Unknown', tone: 'warning', detail: 'The run ended without a recorded exit status, so its outcome is not known' };
   const verified = trace.integrity === 'verified' ? ` · ${integrityProtectionLabel(trace)}` : '';
   return { label: 'Passed', tone: 'success', detail: `Clean exit with no recorded errors${verified}` };
 }

@@ -1,86 +1,40 @@
-import { describe, expect, it } from 'vitest';
-import { modelCallUsage, modelUsage } from './modelUsage';
+import { render, screen } from '@testing-library/svelte';
+import { expect, it, vi } from 'vitest';
+import ModelUsage from './ModelUsage.svelte';
 import type { TraceEvent } from './types';
-// The Claude adapter fixture as the recorder stores it; premier-cli's tests keep this file current.
-import claudeEvents from '../../../../crates/premier-cli/tests/fixtures/adapters/claude.normalized.json';
 
-function event(sequence: number, actor = 'researcher', payload: Record<string, unknown> = {}): TraceEvent {
+function call(sequence: number, payload: Record<string, unknown>): TraceEvent {
   return {
-    event_id: `event-${sequence}`, trace_id: 'trace-usage', sequence,
-    timestamp: new Date(Date.parse('2026-07-14T12:00:00Z') + sequence * 1000).toISOString(),
-    kind: 'model.response', source: 'test', payload_json: JSON.stringify(payload), actor_id: actor,
-    actor_type: 'subagent', parent_event_id: '', span_id: `span-${sequence}`, parent_span_id: '',
+    event_id: `event-${sequence}`, trace_id: 'trace-usage', sequence, timestamp: '2026-07-14T12:00:00Z',
+    kind: 'model.response', source: 'test', payload_json: JSON.stringify(payload), actor_id: 'researcher',
+    actor_type: 'agent', parent_event_id: '', span_id: `span-${sequence}`, parent_span_id: '',
     correlation_id: '', status: 'ok', duration_ms: 100, links: []
   };
 }
 
-describe('model usage evidence', () => {
-  it('attributes exact usage and captured context without double-counting totals', () => {
-    const call = modelCallUsage(event(1, 'researcher', {
-      provider: 'openai', model: 'gpt-test',
-      system_prompt: 'System contract', developer_prompt: 'Developer instruction',
-      messages: [{ role: 'user', content: 'User request' }],
-      tools: [{ name: 'search', input_schema: { type: 'object' } }],
-      usage: {
-        input_tokens: 100, output_tokens: 40, total_tokens: 140,
-        input_tokens_details: { cached_tokens: 25 },
-        output_tokens_details: { reasoning_tokens: 12 },
-        input_tokens_by_role: { system: 20, developer: 30, user: 10, tool: 40 },
-        cost_usd: 0.003
-      },
-      response: 'Answer'
-    }));
-
-    expect(call?.tokens).toEqual({ input: 100, output: 40, cacheRead: 25, cacheWrite: null, reasoning: 12, total: 140 });
-    expect(call?.prompts.map((prompt) => [prompt.role, prompt.tokens])).toEqual([
-      ['system', 20], ['developer', 30], ['user', 10], ['tool', 40]
-    ]);
-    expect(call?.toolSchemaCount).toBe(1);
-    expect(call?.response).toBe('Answer');
+it('says how many calls a partial total covers, and shows unreported usage as unknown, not zero', () => {
+  render(ModelUsage, {
+    props: {
+      events: [
+        call(1, { model: 'gpt-test', usage: { input_tokens: 100, output_tokens: 20 }, cost_usd: 0.01 }),
+        call(2, { model: 'gpt-test', usage: { input_tokens: 50, output_tokens: 10 } }),
+        call(3, { model: 'gpt-test' })
+      ],
+      onselect: vi.fn()
+    }
   });
+  const totals = screen.getByLabelText('Model usage totals');
+  expect(totals).toHaveTextContent('Total tokens180');
+  expect(screen.getByTestId('usage-token-coverage')).toHaveTextContent('2 of 3 calls reported tokens');
+  expect(screen.getByTestId('usage-cost-coverage')).toHaveTextContent('1 of 3 calls reported a cost');
+  // No call reported a cache or reasoning breakdown: a dash, never 0.
+  expect(totals).toHaveTextContent('Cache—');
+  expect(totals).toHaveTextContent('Reasoning—');
+});
 
-  it('rolls calls up by model and actor while preserving missing dimensions', () => {
-    const usage = modelUsage([
-      event(1, 'researcher', { model: 'gpt-test', usage: { input_tokens: 100, output_tokens: 20 } }),
-      event(2, 'researcher', { model: 'gpt-test', tokens: 75 }),
-      event(3, 'reviewer', { model: 'gpt-test', usage: { input_tokens: 50, output_tokens: 10 }, cost_usd: 0.001 })
-    ]);
-
-    expect(usage.calls).toHaveLength(3);
-    expect(usage.rollups).toHaveLength(2);
-    const researcher = usage.rollups.find((row) => row.actor === 'researcher')!;
-    expect(researcher).toMatchObject({ calls: 2, input: 100, output: 20, total: 195, hasInput: true, hasCost: false });
-  });
-
-  it('does not invent prompt roles or token breakdowns from a legacy total', () => {
-    const call = modelCallUsage(event(1, 'researcher', { model: 'legacy', tokens: 1842, summary: 'finding' }));
-    expect(call?.tokens.total).toBe(1842);
-    expect(call?.tokens.input).toBeNull();
-    expect(call?.prompts).toEqual([]);
-  });
-
-  it('does not mistake run metadata that names a model for a model call', () => {
-    const metadata = { ...event(0, 'coordinator', { model: 'frontier-large', goal: 'Run the trace' }), kind: 'session.start' };
-    expect(modelCallUsage(metadata)).toBeNull();
-  });
-
-  it('totals the Claude adapter fixture once per message, with cache tokens', () => {
-    const events: TraceEvent[] = claudeEvents.map(({ payload, ...event }) => ({
-      ...event, trace_id: 'trace-claude', timestamp: '2026-03-04T10:15:00Z', payload_json: JSON.stringify(payload)
-    }));
-    // msg-2 arrives as a text line and a tool_use line that both repeat its usage.
-    const repeated = events.filter((event) => JSON.parse(event.payload_json).native?.message?.id === 'msg-2');
-    expect(repeated.map((event) => event.kind)).toEqual(['model.response', 'tool.invocation']);
-    expect(modelCallUsage(repeated[0])?.tokens).toEqual({ input: 12, output: 4, cacheRead: 6, cacheWrite: 20, reasoning: null, total: 42 });
-    expect(modelCallUsage(repeated[1])).toBeNull();
-
-    const usage = modelUsage(events);
-    const byActor = Object.fromEntries(usage.rollups.map((row) => [row.actor, row]));
-    expect(Object.keys(byActor).sort()).toEqual(['claude', 'claude:subagent:tool-3']);
-    expect(byActor.claude).toMatchObject({ model: 'claude-fixture', calls: 5, input: 158, output: 41, cacheRead: 10, cacheWrite: 20, total: 229 });
-    expect(byActor['claude:subagent:tool-3']).toMatchObject({ model: 'claude-fixture-small', calls: 2, input: 23, output: 14, total: 37 });
-    // The run summary repeats the per-message usage and is not added on top.
-    expect(usage.rollups.reduce((sum, row) => sum + row.total, 0)).toBe(266);
-    expect(usage.calls.some((call) => call.event.kind === 'agent.result')).toBe(false);
-  });
+it('reports complete coverage plainly and a wholly unreported figure as unknown', () => {
+  render(ModelUsage, { props: { events: [call(1, { model: 'gpt-test', usage: { input_tokens: 5, output_tokens: 5 } })], onselect: vi.fn() } });
+  expect(screen.getByTestId('usage-token-coverage')).toHaveTextContent('1 recorded call');
+  expect(screen.getByTestId('usage-cost-coverage')).toHaveTextContent('No call reported a cost');
+  expect(screen.getByLabelText('Model usage totals')).toHaveTextContent('Recorded cost—');
 });

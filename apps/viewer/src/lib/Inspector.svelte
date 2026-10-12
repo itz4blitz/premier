@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
   import type { TraceEvent } from './types';
   import { eventPayload } from './types';
-  import { actorId, categoryOf, eventSummary } from './analysis';
+  import { actorId, categoryOf, eventSummary, isIssue } from './analysis';
   import { payloadModel, payloadProvider, payloadTool } from './nativePayload';
   import { relatedSummary, resolveRelatedTarget } from './causal';
   import { parseInvestigationParams, serializeInvestigationUrl } from './deepLink';
@@ -189,7 +189,7 @@
   }
 
   function eventFamilyIcon(current: TraceEvent) {
-    if (['error', 'failed', 'denied'].includes(current.status) || current.kind.endsWith('.error')) return CircleAlert;
+    if (isIssue(current)) return CircleAlert;
     const family = eventFamily(current);
     if (family === 'agent') return Bot;
     if (family === 'model') return Sparkles;
@@ -528,7 +528,7 @@
   .rail-expand, .rail-tabs button { width: 100%; min-height: 48px; display: grid; place-items: center; padding: 0; border: 0; border-bottom: 1px solid #202a39; color: #8492a7; background: transparent; cursor: pointer; }
   .rail-expand:hover, .rail-tabs button:hover { color: white; background: rgba(111,123,247,.12); }
   .rail-status { width: 100%; display: grid; justify-items: center; gap: 4px; padding: 12px 4px; border-bottom: 1px solid #202a39; color: #a7b5c8; }
-  .rail-status[data-status='error'], .rail-status[data-status='failed'], .rail-status[data-status='denied'] { color: #ff8f8b; }
+  .rail-status[data-status='error'], .rail-status[data-status='failed'], .rail-status[data-status='denied'], .rail-status[data-status='rejected'], .rail-status[data-status='blocked'] { color: #ff8f8b; }
   .rail-status b { font: 8px 'IBM Plex Mono', monospace; }
   .rail-tabs { width: 100%; }
   .rail-tabs button.active { color: #c8d5ff; background: rgba(111,123,247,.17); box-shadow: inset -2px 0 var(--blue); }
@@ -560,8 +560,8 @@
   .category-mark[data-category='tool'] { border-color: rgba(240,185,104,.45); color: #f0c784; }
   .category-mark[data-category='model'] { border-color: rgba(198,141,255,.45); color: #d4aaff; }
   .category-mark[data-category='error'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; }
-  .status-badge[data-status='error'], .status-badge[data-status='failed'], .status-badge[data-status='denied'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; background: rgba(255,113,109,.08); }
-  .status-badge[data-status='error'] i, .status-badge[data-status='failed'] i, .status-badge[data-status='denied'] i { background: var(--red); box-shadow: 0 0 8px rgba(255,124,120,.45); }
+  .status-badge[data-status='error'], .status-badge[data-status='failed'], .status-badge[data-status='denied'], .status-badge[data-status='rejected'], .status-badge[data-status='blocked'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; background: rgba(255,113,109,.08); }
+  .status-badge[data-status='error'] i, .status-badge[data-status='failed'] i, .status-badge[data-status='denied'] i, .status-badge[data-status='rejected'] i, .status-badge[data-status='blocked'] i { background: var(--red); box-shadow: 0 0 8px rgba(255,124,120,.45); }
   .status-badge[data-status='ok'], .status-badge[data-status='approved'] { border-color: rgba(95,214,160,.4); color: #91e3bd; background: rgba(95,214,160,.07); }
   .status-badge[data-status='ok'] i, .status-badge[data-status='approved'] i { background: var(--green); box-shadow: 0 0 8px rgba(99,220,165,.35); }
   .hero-summary p { margin: 15px 0 16px; color: #b7c1cf; font-size: 13px; line-height: 1.58; }

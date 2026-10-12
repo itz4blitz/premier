@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { actorInventory, awaitingApprovals, categoryOf, countByCategory, eventSummary, familyOf, filterEvents, isIssue, isProcessNoise, materialEvent, runHealth, stripControlSequences, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { listHealth, actorInventory, awaitingApprovals, categoryOf, countByCategory, eventSummary, familyOf, filterEvents, isIssue, isProcessNoise, materialEvent, runHealth, stripControlSequences, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
 import type { TraceEvent, TraceManifest } from './types';
 
 function event(sequence: number, actor: string, kind: string, status = 'ok'): TraceEvent {
@@ -359,5 +361,92 @@ describe('review findings: categories, search, clock, and terminal text', () => 
     const base = { format_version: 0, trace_id: 'locked:a.atrace', command: [], started_at: '2026-01-01T00:00:00Z', ended_at: null, exit_code: null, journal: null };
     expect(runHealth({ ...base, integrity: 'locked', integrity_detail: 'No key file was given.' }, [])).toMatchObject({ label: 'Locked', detail: 'No key file was given.' });
     expect(runHealth({ ...base, integrity: 'unsupported' }, [])).toMatchObject({ label: 'Unsupported', tone: 'warning' });
+  });
+});
+
+describe('the issue predicate', () => {
+  const fixture = JSON.parse(readFileSync(
+    resolve(__dirname, '../../../../crates/premier-cli/tests/fixtures/issues/issue-cases.json'),
+    'utf8'
+  )) as { cases: Array<{ name: string; kind: string; status: string; correlation_id?: string; payload: unknown; issue: boolean }> };
+
+  it('agrees with the server on every shared case', () => {
+    expect(fixture.cases.length).toBeGreaterThan(30);
+    for (const item of fixture.cases) {
+      const subject: TraceEvent = {
+        ...event(1, 'worker', item.kind, item.status),
+        correlation_id: item.correlation_id ?? '',
+        payload_json: JSON.stringify(item.payload)
+      };
+      expect(isIssue(subject), item.name).toBe(item.issue);
+    }
+  });
+
+  it('flags a failure an SDK event states only in its payload, and not a kind that merely contains the letters', () => {
+    const sdk = (payload: unknown) => ({ ...event(1, 'worker', 'tool.result', ''), payload_json: JSON.stringify(payload) });
+    expect(isIssue(sdk({ tool: 'deploy', exit_code: 2 }))).toBe(true);
+    expect(isIssue(sdk({ tool: 'deploy', is_error: true }))).toBe(true);
+    expect(isIssue(sdk({ tool: 'deploy', exit_code: 0 }))).toBe(false);
+    expect(isIssue(event(2, 'worker', 'tool.failover'))).toBe(false);
+    expect(categoryOf(event(2, 'worker', 'tool.failover'))).toBe('tool');
+  });
+});
+
+describe('approval outcomes and run outcome wording', () => {
+  const finished: TraceManifest = {
+    format_version: 2, trace_id: 'trace-1', command: ['agent'], started_at: '2026-07-13T12:00:00Z',
+    ended_at: '2026-07-13T12:00:05Z', exit_code: 0, journal: null, integrity: 'verified'
+  };
+
+  it('reads a rejected decision as a refusal, never as a clean pass', () => {
+    const request = { ...event(1, 'coder', 'approval.request', 'pending'), correlation_id: 'apr-1' };
+    const rejected = { ...event(2, 'human', 'approval.decision', 'rejected'), correlation_id: 'apr-1' };
+    expect(isIssue(rejected)).toBe(true);
+    expect(awaitingApprovals([request, rejected])).toEqual([]);
+    expect(runHealth(finished, [request, rejected])).toMatchObject({ label: 'Blocked', tone: 'error' });
+    expect(summarizeAgents([request, rejected]).find((agent) => agent.id === 'human')).toMatchObject({ errors: 1, status: 'error' });
+  });
+
+  it('settles a request by the decision that names it as its parent event', () => {
+    const request = { ...event(1, 'coder', 'approval.request', 'pending'), span_id: 'span-request' };
+    const decision = { ...event(2, 'human', 'approval.decision', 'approved'), span_id: 'span-decision', parent_event_id: request.event_id };
+    expect(awaitingApprovals([request, decision])).toEqual([]);
+    expect(runHealth(finished, [request, decision]).label).toBe('Passed');
+    const unrelated = { ...event(3, 'human', 'approval.decision', 'approved'), span_id: 'span-other', parent_event_id: 'event-99' };
+    expect(awaitingApprovals([request, unrelated])).toEqual([request]);
+    expect(runHealth(finished, [request, unrelated]).label).toBe('Awaiting approval');
+  });
+
+  it('never reports success for a failed, signalled, abandoned or unknown run', () => {
+    const clean = [event(1, 'root', 'process.exit')];
+    const notPassed: Array<[string, Partial<TraceManifest>]> = [
+      ['Failed', { exit_code: 3 }],
+      ['Failed', { exit_code: null, termination: { kind: 'signal', signal: 9, signal_name: 'SIGKILL' } }],
+      ['Failed', { exit_code: null, termination: { kind: 'exit', exit_code: 4 } }],
+      ['Interrupted', { exit_code: null, termination: { kind: 'interrupted' } }],
+      ['Abandoned', { ended_at: null, exit_code: null, integrity: 'abandoned' }],
+      ['Unknown', { exit_code: null }],
+      ['Unverified', { integrity: 'invalid' }],
+      ['Locked', { integrity: 'locked' }]
+    ];
+    for (const [label, overrides] of notPassed) {
+      const health = runHealth({ ...finished, ...overrides }, clean);
+      expect(health.label, JSON.stringify(overrides)).toBe(label);
+      expect(health.tone, JSON.stringify(overrides)).not.toBe('success');
+      // The list row applies the same rule to the manifest alone.
+      expect(listHealth({ ...finished, ...overrides }).label, JSON.stringify(overrides)).toBe(label);
+    }
+    expect(runHealth(finished, clean)).toMatchObject({ label: 'Passed', tone: 'success' });
+    expect(runHealth({ ...finished, exit_code: null }, clean).detail).toContain('without a recorded exit status');
+  });
+
+  it('gives a list row the outcome the open run shows for the same counts', () => {
+    const summary = (issue_count: number) => ({ display_name: null, actor_count: 1, issue_count, event_count: 2 });
+    const failing = [event(1, 'root', 'tool.error', 'error'), event(2, 'root', 'process.exit')];
+    for (const overrides of [{}, { exit_code: 2 }, { ended_at: null, exit_code: null, integrity: 'live' as const }]) {
+      const manifest = { ...finished, ...overrides };
+      expect(listHealth({ ...manifest, summary: summary(1) }).label).toBe(runHealth(manifest, failing).label);
+      expect(listHealth({ ...manifest, summary: summary(0) }).label).toBe(runHealth(manifest, [failing[1]]).label);
+    }
   });
 });

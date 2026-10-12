@@ -1,4 +1,4 @@
-import { actorId, eventSummary, isIssue, runHealth } from './analysis';
+import { actorId, eventSummary, isIssue, issueBasis, runHealth } from './analysis';
 import { modelCallUsage } from './modelUsage';
 import { eventPayload, isAbandoned } from './types';
 import type { TraceEvent, TraceManifest } from './types';
@@ -40,6 +40,8 @@ export interface EvidenceGap {
   severity: GapSeverity;
   label: string;
   detail: string;
+  /** The event a recorder diagnostic is about, when it names one that is loaded. */
+  event?: TraceEvent | null;
 }
 
 export interface RecommendedEvidence {
@@ -136,7 +138,8 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
     return {
       title: `${issue.kind} in ${actorId(issue)}`,
       detail: eventSummary(issue),
-      confidence: issue.status || issue.kind.includes('error') || issue.kind.includes('fail') ? 'high' : 'medium',
+      // A failure the event states in its status or kind is certain; one read from its payload is less so.
+      confidence: issueBasis(issue) === 'payload' ? 'medium' : 'high',
       event: issue,
       role: 'cause'
     };
@@ -226,7 +229,11 @@ function chainFor(events: TraceEvent[], cause: TraceEvent | null, includeCorrela
 
   let frontier = [cause.event_id];
   for (let depth = 0; depth < 3 && frontier.length; depth += 1) {
-    const next = events.filter((event) => frontier.includes(event.parent_event_id) && !included.has(event.event_id));
+    // A child names its parent by event id, or only by the span its parent opened (`premier emit --parent-span`).
+    const next = events.filter((event) => !included.has(event.event_id) && (
+      frontier.includes(event.parent_event_id)
+      || (!byId.has(event.parent_event_id) && event.parent_span_id !== '' && frontier.includes(bySpan.get(event.parent_span_id)?.event_id ?? ''))
+    ));
     for (const event of next) included.set(event.event_id, { event, relation: 'effect' });
     frontier = next.map((event) => event.event_id);
   }
@@ -268,13 +275,22 @@ function hotspotsFor(events: TraceEvent[]): InvestigationHotspot[] {
 function gapsFor(trace: TraceManifest, events: TraceEvent[]): EvidenceGap[] {
   const gaps: EvidenceGap[] = [];
   const add = (gap: EvidenceGap) => { if (!gaps.some((existing) => existing.id === gap.id)) gaps.push(gap); };
+  // One row per diagnostic: two findings with the same code are about different events.
+  const byEventId = new Map(events.map((event) => [event.event_id, event]));
+  const bySequence = new Map(events.map((event) => [event.sequence, event]));
   for (const diagnostic of trace.diagnostics ?? []) {
     const lifecycle = diagnostic.code.includes('lifecycle') || diagnostic.code.includes('pair');
+    const event = (diagnostic.event_id ? byEventId.get(diagnostic.event_id) : undefined)
+      ?? (diagnostic.sequence !== undefined ? bySequence.get(diagnostic.sequence) : undefined)
+      ?? null;
+    const subject = diagnostic.event_id || (diagnostic.sequence !== undefined ? `#${diagnostic.sequence}` : '');
     add({
-      id: `diagnostic-${diagnostic.code}`,
+      // Without a subject, a repeat of the same code and message is the same finding.
+      id: subject ? `diagnostic-${diagnostic.code}-${subject}` : `diagnostic-${diagnostic.code}-${diagnostic.message}`,
       severity: 'medium',
       label: lifecycle ? 'Recorded lifecycle evidence is incomplete' : 'Recorded evidence needs review',
-      detail: diagnostic.message
+      detail: diagnostic.sequence !== undefined && !event ? `${diagnostic.message} (event #${diagnostic.sequence})` : diagnostic.message,
+      event
     });
   }
   // Provider output the adapter could not use is evidence that was lost, and it is recorded only

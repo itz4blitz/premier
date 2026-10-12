@@ -1,3 +1,7 @@
+<script lang="ts" module>
+  let instances = 0;
+</script>
+
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { Check, ChevronDown } from '@lucide/svelte';
@@ -5,14 +9,18 @@
 
   export type PremierSelectOption = { value: string; label: string; description?: string; disabled?: boolean };
 
-  let { value, options, label, disabled = false, placeholder = 'Select…', onchange }: {
+  let { value, options, label, disabled = false, placeholder = 'Select…', onchange, id = undefined }: {
     value: string;
     options: PremierSelectOption[];
     label: string;
     disabled?: boolean;
     placeholder?: string;
     onchange: (value: string) => void;
+    /** Id of the trigger, so a `<label for>` outside the component can point at it. */
+    id?: string;
   } = $props();
+
+  const uid = `premier-select-${++instances}`;
 
   let open = $state(false);
   let activeIndex = $state(0);
@@ -79,7 +87,12 @@
       event.stopPropagation();
       return closeMenu(true);
     }
-    if (event.key === 'Tab') return closeMenu();
+    if (event.key === 'Tab') {
+      // The menu is rendered at the document root, so the browser's next tab stop would be wherever
+      // that happens to lead, possibly outside an open dialog. Return to the trigger instead.
+      event.preventDefault();
+      return closeMenu(true);
+    }
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
       const option = options[activeIndex];
@@ -123,13 +136,19 @@
   });
 </script>
 
-<div class="premier-select" bind:this={root}>
-  <button bind:this={trigger} type="button" class="select-trigger" aria-label={label} aria-haspopup="listbox" aria-expanded={open} {disabled} onclick={() => open ? closeMenu() : showMenu()} onkeydown={triggerKeydown}>
-    <span><strong>{selected?.label ?? placeholder}</strong>{#if selected?.description}<small>{selected.description}</small>{/if}</span>
+<!--
+  The accessible name stays the field's label; the chosen value is the description, so a screen
+  reader announces "Provider CLI, Claude" and not the label alone. The menu is rendered at the
+  document root to escape transformed ancestors; `aria-owns` keeps it inside this component (and so
+  inside an enclosing modal dialog) in the accessibility tree.
+-->
+<div class="premier-select" bind:this={root} aria-owns={open ? `${uid}-menu` : undefined}>
+  <button bind:this={trigger} {id} type="button" class="select-trigger" aria-label={label} aria-describedby={`${uid}-value`} aria-haspopup="listbox" aria-expanded={open} aria-controls={open ? `${uid}-menu` : undefined} {disabled} onclick={() => open ? closeMenu() : showMenu()} onkeydown={triggerKeydown}>
+    <span id={`${uid}-value`} data-testid="select-value"><strong>{selected?.label ?? placeholder}</strong>{#if selected?.description}<small>{selected.description}</small>{/if}</span>
     <ChevronDown size={16} strokeWidth={1.8} aria-hidden="true" />
   </button>
   {#if open}
-    <div use:portal bind:this={menu} class="select-menu" style={menuStyle} role="listbox" tabindex="-1" aria-label={`${label} options`} onkeydown={optionKeydown}>
+    <div use:portal bind:this={menu} id={`${uid}-menu`} class="select-menu" style={menuStyle} role="listbox" tabindex="-1" aria-label={`${label} options`} onkeydown={optionKeydown}>
       {#each options as option, index (option.value)}
         <button type="button" role="option" aria-selected={option.value === value} disabled={option.disabled} data-index={index} tabindex={index === activeIndex ? 0 : -1} onclick={() => choose(option)} onpointerenter={() => { if (!option.disabled) activeIndex = index; }}>
           <span><strong>{option.label}</strong>{#if option.description}<small>{option.description}</small>{/if}</span>
@@ -154,7 +173,14 @@
   .select-trigger[aria-expanded='true'] :global(svg) { color: #9bb4ff; transform: rotate(180deg); }
   .select-menu { position: fixed; z-index: 100; left: var(--menu-left); top: var(--menu-top); width: var(--menu-width); max-height: var(--menu-height); padding: 5px; overflow-y: auto; transform: var(--menu-transform); border: 1px solid #40506a; border-radius: 9px; background: rgba(10,14,21,.985); box-shadow: 0 22px 70px rgba(0,0,0,.68), inset 0 1px rgba(255,255,255,.045); backdrop-filter: blur(18px); }
   .select-menu button { width: 100%; min-width: 0; min-height: 42px; display: grid; grid-template-columns: minmax(0,1fr) 18px; align-items: center; gap: 10px; padding: 7px 9px; border: 0; border-radius: 5px; color: #cbd5e2; background: transparent; text-align: left; cursor: pointer; }
-  .select-menu button:hover:not(:disabled), .select-menu button:focus-visible { color: white; background: rgba(111,123,247,.15); outline: 1px solid rgba(158,170,255,.28); }
+  .select-trigger:focus-visible { outline: 2px solid var(--focus, #aab4ff); outline-offset: 2px; border-color: var(--focus, #aab4ff); }
+  .select-menu button:hover:not(:disabled) { color: white; background: rgba(111,123,247,.15); }
+  /* Keyboard focus is a solid ring, distinct from the hover tint a pointer leaves behind. */
+  .select-menu button:focus-visible { color: white; background: rgba(111,123,247,.22); outline: 2px solid var(--focus, #aab4ff); outline-offset: -2px; }
+  @media (forced-colors: active) {
+    .select-trigger:focus-visible, .select-menu button:focus-visible { outline: 2px solid Highlight; }
+    .select-menu button[aria-selected='true'] { outline: 1px solid ButtonText; outline-offset: -3px; }
+  }
   .select-menu button[aria-selected='true'] { color: #f4f7fb; background: rgba(111,123,247,.19); }
   .select-menu button:disabled { opacity: .4; cursor: not-allowed; }
   .select-menu strong { font-size: 12px; font-weight: 700; }

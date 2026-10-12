@@ -1,30 +1,85 @@
-//! The issue predicate behind trace list counts.
+//! The issue predicate behind trace list counts, `premier query --issues`
+//! and the viewer's timeline.
 //!
-//! Keep this aligned with `isIssue` in the viewer (`apps/viewer/src/lib/analysis.ts`
-//! and `nativeFailure` in `nativePayload.ts`) so list counts match what the
-//! timeline flags.
+//! An event is an issue when
+//!
+//! 1. its status is `error`, `failed`, `denied`, `blocked` or `rejected`; or
+//! 2. a whole segment of its kind (split at every character that is not a
+//!    letter or digit) is `error`, `errors`, `errored`, `fail`, `failed` or
+//!    `failure`, so `tool.execution_failed` is one and `tool.failover` is not;
+//!    or
+//! 3. the provider object under `payload.native` states a failure; or
+//! 4. it has no status at all and its payload states a failure at the top
+//!    level (`is_error`, a non-empty `error`, a non-zero `exit_code`, or a
+//!    failing `status`). A status the producer did record is its own statement
+//!    of the outcome and is not second-guessed.
+//!
+//! `isIssue` in the viewer (`apps/viewer/src/lib/analysis.ts`, with
+//! `nativeFailure` and `payloadFailure` in `nativePayload.ts`) is the same
+//! rule. Both run `tests/fixtures/issues/issue-cases.json`; change one and
+//! the other must follow.
 
 use premier_trace::TraceEvent;
 use serde_json::Value;
 
 pub fn is_issue(event: &TraceEvent) -> bool {
-    let status = event.status.to_ascii_lowercase();
-    let kind = event.kind.to_ascii_lowercase();
-    matches!(status.as_str(), "error" | "failed" | "denied" | "blocked")
-        || kind.contains("error")
-        || kind.contains("fail")
-        || native_failure(event)
+    let status = event.status.trim().to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "error" | "failed" | "denied" | "blocked" | "rejected"
+    ) {
+        return true;
+    }
+    let kind = event.kind.trim().to_ascii_lowercase();
+    if kind
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|segment| {
+            matches!(
+                segment,
+                "error" | "errors" | "errored" | "fail" | "failed" | "failure"
+            )
+        })
+    {
+        return true;
+    }
+    payload_failure(event, status.is_empty())
 }
 
-/// True when the provider object an adapter kept under `payload.native` states
-/// outright that the event failed. Current adapters also record that as the
-/// event status; older traces carry it only here.
-fn native_failure(event: &TraceEvent) -> bool {
-    // Most events are not adapter envelopes; skip decoding their payload.
-    if !event.payload_json.contains("\"native\"") {
+/// Payload keys that can state a failure; an event without any of them is
+/// never decoded.
+const FAILURE_KEYS: [&str; 7] = [
+    "\"is_error\"",
+    "\"isError\"",
+    "\"error\"",
+    "\"exit_code\"",
+    "\"exitCode\"",
+    "\"status\"",
+    "\"state\"",
+];
+
+/// A failure stated only in the payload: by the provider object an adapter
+/// kept under `payload.native` (current adapters also record that as the
+/// event status; older traces carry it only there), or at the top level of an
+/// event recorded without a status (`unstated`).
+fn payload_failure(event: &TraceEvent, unstated: bool) -> bool {
+    // Most events carry neither; skip decoding their payload.
+    let envelope = event.payload_json.contains("\"native\"");
+    if !envelope
+        && !(unstated
+            && FAILURE_KEYS
+                .iter()
+                .any(|key| event.payload_json.contains(key)))
+    {
         return false;
     }
     let payload = event.payload();
+    if !payload.is_object() {
+        return false;
+    }
+    native_failure(&payload, &event.correlation_id) || (unstated && states_failure(&payload))
+}
+
+fn native_failure(payload: &Value, correlation_id: &str) -> bool {
     let Some(native) = payload.get("native").filter(|native| native.is_object()) else {
         return false;
     };
@@ -33,7 +88,7 @@ fn native_failure(event: &TraceEvent) -> bool {
             .get("type")
             .and_then(Value::as_str)
             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("error"))
-        || failed_block(native, &event.correlation_id)
+        || failed_block(native, correlation_id)
 }
 
 /// Objects in which a provider states the outcome of the event itself: the
@@ -193,13 +248,44 @@ mod tests {
         ] {
             assert!(!is_issue(&native(healthy.clone())), "{healthy}");
         }
-        // Without an adapter envelope the same fields are ordinary payload data.
+        // A status the producer recorded outranks what the payload says.
         assert!(!is_issue(&event(
             "tool.result",
             "ok",
             "",
             json!({"is_error": true})
         )));
+        // Without one, the payload's own statement decides.
+        assert!(is_issue(&event(
+            "tool.result",
+            "",
+            "",
+            json!({"is_error": true})
+        )));
+    }
+
+    /// The cases the viewer's `isIssue` is tested against too.
+    #[test]
+    fn agrees_with_the_shared_issue_cases() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/issues/issue-cases.json"))
+                .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(cases.len() > 30);
+        for case in cases {
+            let subject = event(
+                case["kind"].as_str().unwrap(),
+                case["status"].as_str().unwrap(),
+                case["correlation_id"].as_str().unwrap_or(""),
+                case["payload"].clone(),
+            );
+            assert_eq!(
+                is_issue(&subject),
+                case["issue"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
     }
 
     #[test]

@@ -236,7 +236,8 @@ describe('buildInvestigationSummary', () => {
       diagnostics: [{ severity: 'warning', code: 'missing_lifecycle_result', message: 'agent.spawn has no matching agent.result', event_id: 'event-1', sequence: 1 }]
     }), [event(1, 'agent.spawn')]);
     expect(result.gaps).toContainEqual(expect.objectContaining({
-      id: 'diagnostic-missing_lifecycle_result',
+      id: 'diagnostic-missing_lifecycle_result-event-1',
+      event: expect.objectContaining({ event_id: 'event-1' }),
       label: 'Recorded lifecycle evidence is incomplete'
     }));
   });
@@ -259,5 +260,43 @@ describe('buildInvestigationSummary', () => {
     });
     expect(result.cause.event?.event_id).toBe(spawnFailed.event_id);
     expect(result.gaps.map((gap) => gap.id)).not.toContain('exit-cause');
+  });
+
+  it('keeps one finding per recorder diagnostic, each linked to the event it is about', () => {
+    const diagnostics = [
+      { severity: 'warning' as const, code: 'missing_lifecycle_result', message: 'agent.spawn has no matching agent.result', event_id: 'event-1', sequence: 1 },
+      { severity: 'warning' as const, code: 'missing_lifecycle_result', message: 'agent.spawn has no matching agent.result', event_id: 'event-2', sequence: 2 },
+      { severity: 'warning' as const, code: 'missing_lifecycle_result', message: 'tool.call has no matching tool.result', sequence: 9 },
+      // A repeat with no subject is the same finding.
+      { severity: 'warning' as const, code: 'clock_skew', message: 'timestamps go backwards' },
+      { severity: 'warning' as const, code: 'clock_skew', message: 'timestamps go backwards' }
+    ];
+    const result = buildInvestigationSummary(trace({ exit_code: 0, diagnostics }), [event(1, 'agent.spawn'), event(2, 'agent.spawn'), event(3, 'process.exit')]);
+    const found = result.gaps.filter((gap) => gap.id.startsWith('diagnostic-'));
+    expect(found).toHaveLength(4);
+    expect(found.map((gap) => gap.event?.event_id ?? null).sort()).toEqual(['event-1', 'event-2', null, null].sort());
+    // An event that is not loaded is still named by its sequence.
+    expect(found.find((gap) => gap.detail.includes('tool.call'))?.detail).toContain('event #9');
+  });
+
+  it('follows effects that name the failure only by the span it opened', () => {
+    const events = [
+      event(1, 'agent.turn', { span_id: 'turn' }),
+      event(2, 'tool.error', { status: 'error', span_id: 'deploy', parent_span_id: 'turn' }),
+      // Recorded with `premier emit --parent-span deploy`: no parent event id.
+      event(3, 'agent.retry', { span_id: 'retry', parent_span_id: 'deploy' }),
+      event(4, 'agent.note', { span_id: 'note', parent_span_id: 'retry' }),
+      event(5, 'agent.unrelated', { span_id: 'other', parent_span_id: 'turn', correlation_id: 'elsewhere' })
+    ];
+    const chain = buildInvestigationSummary(trace({ exit_code: 0 }), events).failureChain;
+    expect(chain.filter((item) => item.relation === 'effect').map((item) => item.event.kind)).toEqual(['agent.retry', 'agent.note']);
+    expect(chain.map((item) => item.event.kind)).not.toContain('agent.unrelated');
+  });
+
+  it('is less sure of a failure only the payload states', () => {
+    const stated = buildInvestigationSummary(trace(), [event(1, 'tool.result', { status: 'error' })]);
+    expect(stated.cause).toMatchObject({ confidence: 'high', role: 'cause' });
+    const payloadOnly = buildInvestigationSummary(trace(), [event(1, 'tool.result', { status: '', payload_json: '{"tool":"deploy","exit_code":2}' })]);
+    expect(payloadOnly.cause).toMatchObject({ confidence: 'medium', role: 'cause', event: expect.objectContaining({ event_id: 'event-1' }) });
   });
 });

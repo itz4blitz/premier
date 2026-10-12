@@ -185,8 +185,29 @@ export interface AssistantRequest {
   history?: AssistantHistoryMessage[];
 }
 
+/** Which part of a trace an assistant prompt carries; see `AssistantContext` in premier-cli. */
+export interface AssistantContext {
+  scope: 'run' | 'event';
+  total_events: number;
+  /** Events sent in full: always the newest ones. */
+  included_events: number;
+  first_sequence?: number;
+  last_sequence?: number;
+  selected_sequence?: number;
+  history_messages: number;
+  prompt_chars: number;
+}
+
 export interface AssistantResponse {
   provider: string;
   answer: string;
   elapsed_ms: number;
+  /** What the answer was based on. Absent from servers that predate it. */
+  context?: AssistantContext;
+}
+
+/** The exact prompt a question would send, and what it covers. Nothing is sent to produce it. */
+export interface AssistantPreview {
+  context: AssistantContext;
+  prompt: string;
 }

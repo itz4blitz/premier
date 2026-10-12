@@ -51,7 +51,7 @@ describe('native adapter payloads', () => {
     expect(call).not.toBeNull();
     expect(call?.model).toBe('claude-sonnet-4-5');
     expect(call?.provider).toBe('claude');
-    expect(call?.tokens).toMatchObject({ input: 120, output: 30, cacheRead: 900, cacheWrite: 40, total: 150 });
+    expect(call?.tokens).toMatchObject({ input: 120, output: 30, cacheRead: 900, cacheWrite: 40, total: 1090 });
     expect(call?.response).toBe('I will read the config.');
   });
 
@@ -102,7 +102,7 @@ describe('native adapter payloads', () => {
     const { calls, rollups } = modelUsage(events);
     expect(calls.map((call) => call.event.kind)).toEqual(['model.response', 'tool.invocation']);
     expect(rollups).toHaveLength(1);
-    expect(rollups[0]).toMatchObject({ model: 'claude-sonnet-4-5', calls: 2, input: 320, output: 42, total: 362 });
+    expect(rollups[0]).toMatchObject({ model: 'claude-sonnet-4-5', calls: 2, input: 320, output: 42, cacheRead: 900, cacheWrite: 40, total: 1302 });
     expect(modelCallUsage(events[2])).toBeNull();
     expect(modelCallUsage(adapterEvent('claude', 'provider.event', claudeResult, { model: 'claude-sonnet-4-5', usage: { input_tokens: 320, output_tokens: 42, total_tokens: 362 } }))).toBeNull();
   });

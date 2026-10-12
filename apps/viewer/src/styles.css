@@ -63,13 +63,14 @@ main { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 }
 .time-navigator { position:relative;min-width:0;min-height:0;overflow:hidden;border-bottom:1px solid var(--line);background:#07090d; }
 .time-navigator > .architecture-view { height:100%;min-height:0; }
-.run-overview { min-width: 0; display: none; }
-.run-metrics { display: grid; grid-template-columns: 1.2fr .8fr .8fr 1.15fr .75fr; border-right: 1px solid var(--line); }
-.run-metrics div { min-width: 0; display: grid; align-content: center; gap: 6px; padding: 0 13px; border-right: 1px solid var(--line-soft); }
-.run-metrics div:last-child { border-right: 0; }
-.run-metrics span { color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.run-metrics strong { overflow: hidden; color: #eef2f7; font-family: 'IBM Plex Sans Variable', 'IBM Plex Sans', sans-serif; font-size: 14px; font-weight: 700; white-space: nowrap; text-overflow: ellipsis; }
-.run-metrics strong.error { color: var(--red); }
+/* The full run overview. Scoped to it, so other components' own .run-metrics are not restyled. */
+.run-overview { min-width: 0; }
+:where(.run-overview) .run-metrics { display: grid; grid-template-columns: 1.2fr .8fr .8fr 1.15fr .75fr; border-right: 1px solid var(--line); }
+:where(.run-overview) .run-metrics div { min-width: 0; display: grid; align-content: center; gap: 6px; padding: 0 13px; border-right: 1px solid var(--line-soft); }
+:where(.run-overview) .run-metrics div:last-child { border-right: 0; }
+:where(.run-overview) .run-metrics span { color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+:where(.run-overview) .run-metrics strong { overflow: hidden; color: #eef2f7; font-family: 'IBM Plex Sans Variable', 'IBM Plex Sans', sans-serif; font-size: 14px; font-weight: 700; white-space: nowrap; text-overflow: ellipsis; }
+:where(.run-overview) .run-metrics strong.error { color: var(--red); }
 .agent-strip { min-width: 0; display: flex; align-items: stretch; overflow-x: auto; scrollbar-width: thin; }
 .agent-strip button { flex: 0 0 auto; min-width: 152px; max-width: 252px; min-height: 44px; display: flex; align-items: center; gap: 10px; padding: 0 14px; border: 0; border-right: 1px solid var(--line-soft); color: inherit; text-align: left; background: transparent; cursor: pointer; }
 .agent-strip button:hover { background: #10151d; }
@@ -114,7 +115,7 @@ main { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .category-tabs button.unavailable { opacity: .34; cursor: not-allowed; }
 .filter-count { display: grid; gap: 1px; color: #aab6c7; font: 10px 'Source Sans 3 Variable', sans-serif; line-height: 1.2; white-space: nowrap; }
 .filter-count strong { color: #eef3fa; font: 700 11px 'IBM Plex Mono', monospace; }
-.filter-count small { color: #677589; font: 8px 'IBM Plex Mono', monospace; }
+.filter-count small { color: var(--muted); font: 9px 'IBM Plex Mono', monospace; }
 
 .workspace { position: relative; min-width: 0; min-height: 0; isolation: isolate; display: grid; grid-template-columns: var(--trace-pane, 260px) var(--left-divider, 8px) minmax(320px, 1fr) var(--right-divider, 8px) var(--inspector-pane, 420px); }
 .workspace > .trace-list { grid-column: 1; grid-row: 1; min-width: 0; overflow: hidden; }
@@ -233,7 +234,7 @@ main { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .state-screen code { margin-top: 10px; padding: 10px 14px; border: 1px solid var(--line); color: #cbd3e0; background: #090c11; }
 .state-icon { display: grid; width: 42px; height: 42px; place-items: center; border: 1px solid var(--line); color: var(--blue) !important; font-size: 20px !important; }
 .loader { width: 28px; height: 28px; border: 2px solid #273044; border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
-.state-screen button { margin-top: 8px; padding: 8px 13px; border: 1px solid var(--blue); background: var(--blue); color: white; cursor: pointer; }
+.state-screen button { margin-top: 8px; padding: 8px 13px; border: 1px solid var(--blue); background: var(--accent-solid); color: white; cursor: pointer; }
 .empty-onboarding { padding: 28px 18px; }
 .empty-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 4px; }
 .empty-commands { display: grid; gap: 8px; width: min(560px, 100%); margin-top: 8px; }
@@ -588,6 +589,13 @@ main { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 @media (prefers-contrast: more) {
   :root { --line: #49566b; --line-soft: #344055; --muted: #aeb9c9; }
   .event-mark, .status, .span-bar { box-shadow: 0 0 0 1px currentColor; }
+}
+
+/* Windows High Contrast and similar: system colours replace ours, so state must not rest on colour. */
+@media (forced-colors: active) {
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible, a:focus-visible { outline: 2px solid Highlight; }
+  .event-mark, .status, .status-mark, .span-bar { forced-color-adjust: none; }
+  .action-primary, .state-screen button, [aria-pressed='true'], [aria-selected='true'], [aria-current='true'] { outline: 1px solid ButtonText; outline-offset: -2px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

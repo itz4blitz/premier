@@ -155,6 +155,45 @@ an arbitrary URL and works with npm 12's secure install-time defaults.
 `scripts/tests/release-config.test.mjs` checks these, and the order of the
 release build, on every pull request.
 
+### Third-party notices
+
+`THIRD_PARTY_NOTICES.md` at the repository root lists the third-party code
+inside a release with the licence each package declares: the Rust crates
+linked into the `premier` binary, and the JavaScript packages bundled into
+the embedded viewer. It is generated, not written:
+
+```sh
+cargo fetch --locked                        # once per machine; the only step that uses the network
+node scripts/third-party-notices.mjs        # rewrite THIRD_PARTY_NOTICES.md
+node scripts/third-party-notices.mjs --check  # exit 1 when the checked-in file is out of date
+```
+
+Regenerate it whenever `Cargo.lock` or `package-lock.json` changes.
+
+- **Rust.** `Cargo.lock` pins versions but records no licences, so the script
+  asks `cargo metadata --locked --offline` for the normal (not build-time,
+  not test-only) dependency closure of `premier-cli`, once per release
+  target, and reads each crate's declared licence from the local registry.
+  That needs the crates of all four targets on disk, which a machine that has
+  only built for itself does not have: hence `cargo fetch --locked`. Without
+  it, `--targets aarch64-apple-darwin,aarch64-unknown-linux-gnu` (any subset)
+  writes a file for the targets that do resolve, and the file says in its own
+  text which release targets it does not cover.
+- **JavaScript.** Every package in `package-lock.json` that is not
+  development-only, with the licence the lockfile records.
+- The script stops if any listed package declares no licence.
+- The file lists declared licences and where each package is published. It
+  does not reproduce licence texts or copyright lines.
+
+The checked-in file currently covers the two `aarch64` targets only and says
+so; regenerate it after `cargo fetch --locked` before relying on it for an
+`x86_64` release. It is not yet copied into release archives or npm packages:
+doing that means adding it beside `LICENSE` in `scripts/package-release.sh`
+(the copy and the `SHA256SUMS` list), `scripts/stage-npm-packages.sh`, the
+`files` arrays of `packages/premier-cli/package.json` and
+`npm/platforms/*/package.json`, and the exact file lists in
+`scripts/verify-staged-npm.mjs` and `scripts/test-npm-distribution.mjs`.
+
 ### Before enabling the public channel
 
 Repository administrators must protect the `v*` tag namespace, require

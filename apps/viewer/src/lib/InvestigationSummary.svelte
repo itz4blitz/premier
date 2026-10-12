@@ -44,7 +44,7 @@
       aria-label={`${expanded ? 'Hide' : 'Show'} investigation details`}
       onclick={() => expanded = !expanded}
     >
-      Details <ChevronDown size={13} />
+      Details{#if summary.gaps.length}<span class="gap-count" data-testid="investigation-gap-count" title="Findings about missing or incomplete evidence">{summary.gaps.length} gap{summary.gaps.length === 1 ? '' : 's'}</span>{/if} <ChevronDown size={13} />
     </button>
   </header>
 
@@ -110,7 +110,13 @@
         <ul>
           {#each summary.gaps as gap (gap.id)}
             <li data-severity={gap.severity}>
-              <i></i><span><strong>{gap.label}</strong><small>{gap.detail}</small></span>
+              {#if gap.event}
+                <button class="gap-event" type="button" onclick={() => onselect(gap.event!)} aria-label={`Inspect event #${gap.event.sequence} for: ${gap.label}`} title={gap.detail}>
+                  <i></i><span><strong>{gap.label}</strong><small>{gap.detail}</small><em>#{gap.event.sequence} · {gap.event.kind}</em></span>
+                </button>
+              {:else}
+                <i></i><span><strong>{gap.label}</strong><small>{gap.detail}</small></span>
+              {/if}
             </li>
           {/each}
         </ul>
@@ -173,6 +179,12 @@
   .gaps li > i { width: 6px; height: 6px; margin-top: 4px; border: 0; background: #71829b; }
   .gaps li[data-severity='high'] > i { background: #ff817c; box-shadow: 0 0 0 3px rgba(255,129,124,.1); }
   .gaps li[data-severity='medium'] > i { background: #efba6c; }
+  .gap-count { margin-left: 4px; padding: 1px 5px; border: 1px solid rgba(239,186,108,.4); border-radius: 999px; color: #f2c57f; font-weight: 760; }
+  .gaps li:has(> .gap-event) { display: block; padding: 0; }
+  .gap-event { width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; padding: 8px 10px; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+  .gap-event:hover { background: rgba(111,123,247,.1); }
+  .gap-event > i { width: 6px; height: 6px; margin-top: 4px; border-radius: 50%; background: #efba6c; }
+  .gap-event em { display: block; margin-top: 2px; color: #9eaaff; font-size: 10px; font-style: normal; }
   .empty, .complete { margin: 0; padding: 14px 10px; color: #718096; font-size: 10px; line-height: 1.45; }
   .complete { display: grid; gap: 3px; }
   .complete span { color: #79d7aa; font-weight: 700; }

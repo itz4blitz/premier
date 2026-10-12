@@ -137,6 +137,16 @@
   /** Listed, but with no events the server can serve: locked, a newer format, or damaged. */
   let unreadable = $derived(selectedTrace !== null && isUnreadable(selectedTrace));
   /** Only a dialog that is actually on screen may take the rest of the page out of reach. */
+  /**
+   * The open run's outcome from its loaded events; its list row shows this instead of the summary's.
+   * Only once every event the list knows of is loaded: until then the server's summary knows more.
+   */
+  let selectedRowHealth = $derived.by(() => {
+    if (!selectedTrace || pendingTraceId || !events.length) return null;
+    const key = listKey(selectedTrace);
+    const listed = traces.find((trace) => listKey(trace) === key)?.summary?.event_count ?? 0;
+    return events.length >= listed ? runHealth(selectedTrace, events) : null;
+  });
   let dialogOpen = $derived(Boolean((assistantOpen && selectedTrace) || (compareOpen && selectedTrace) || runsSheetOpen || shortcutsOpen));
 
   function unreadableTitle(trace: TraceManifest): string {
@@ -629,7 +639,8 @@
     anchor.href = url;
     anchor.download = `${runTitle(selectedTrace).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase()}.redacted.json`;
     anchor.click();
-    URL.revokeObjectURL(url);
+    // Released once the browser has had time to start the download; revoking in the same task can cancel it.
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
     showFeedback(label, 6000);
   }
 
@@ -659,7 +670,11 @@
     }, 700);
   }
 
+  /** Counts baseline loads, so a slow one cannot overwrite the baseline chosen after it. */
+  let comparisonEpoch = 0;
+
   async function compareAgainst(traceId: string) {
+    const epoch = ++comparisonEpoch;
     baselineId = traceId;
     comparison = null;
     comparisonError = '';
@@ -668,20 +683,43 @@
     comparisonLoading = true;
     try {
       const baselineEvents = await loadAllEvents((afterSequence, limit) => api.eventsPage(traceId, { afterSequence, limit }));
+      if (epoch !== comparisonEpoch) return;
       comparison = { baseline, baselineEvents };
     } catch (cause) {
+      if (epoch !== comparisonEpoch) return;
       comparisonError = cause instanceof Error ? cause.message : 'Unable to compare traces.';
     } finally {
-      comparisonLoading = false;
+      if (epoch === comparisonEpoch) comparisonLoading = false;
     }
   }
 
   function openCompare() {
     compareOpen = true;
     const selectedKey = selectedTrace ? listKey(selectedTrace) : null;
-    const initial = traces.find((trace) => listKey(trace) !== selectedKey && trace.command[0] === selectedTrace?.command[0])
+    // Reopening keeps the baseline that was chosen, as long as it is still a different, listed run.
+    const kept = traces.find((trace) => listKey(trace) === baselineId && listKey(trace) !== selectedKey);
+    if (kept && comparison && listKey(comparison.baseline) === baselineId && !comparisonError) return;
+    const initial = kept
+      ?? traces.find((trace) => listKey(trace) !== selectedKey && trace.command[0] === selectedTrace?.command[0])
       ?? traces.find((trace) => listKey(trace) !== selectedKey);
     if (initial) void compareAgainst(listKey(initial));
+  }
+
+  /** What tells two runs with the same title apart in the baseline picker. */
+  function baselineDescription(trace: TraceManifest): string {
+    const count = trace.summary?.event_count ?? trace.journal?.event_count ?? 0;
+    const started = Date.parse(trace.started_at);
+    return [
+      Number.isFinite(started) ? new Date(started).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : null,
+      `${count} event${count === 1 ? '' : 's'}`,
+      trace.artifact ?? null
+    ].filter(Boolean).join(' · ');
+  }
+
+  /** Open an event of the baseline run: that run becomes the open one. */
+  function inspectBaselineEvent(baseline: TraceManifest, event: TraceEvent) {
+    compareOpen = false;
+    void selectTrace(baseline, { eventId: event.event_id, eventSequence: event.sequence }, true);
   }
 
   function closeMore(restoreFocus = false) {
@@ -1006,6 +1044,13 @@
             </div>
           {/if}
         </div>
+      {:else if unreadable}
+        <!--
+          The run shell is a three-row grid: time navigator, filters, workspace. A trace that cannot be
+          read has no time navigator; this keeps its (zero-height) row, so the filters and the
+          workspace do not each move up a row and leave the workspace 48 pixels tall.
+        -->
+        <div class="time-navigator-placeholder" aria-hidden="true"></div>
       {/if}
       {#if relatedFeedback}<div class="relation-banner" role="status">{relatedFeedback}</div>{/if}
       <FilterBar
@@ -1025,7 +1070,7 @@
         style={`--trace-pane: ${leftCollapsed ? leftRailWidth : leftWidth}px; --left-divider: ${leftCollapsed ? 0 : 8}px; --inspector-pane: ${rightCompact ? rightRailWidth : rightWidth}px; --right-divider: ${rightCompact ? 0 : 8}px;`}
         bind:this={workspaceElement}
       >
-        <TraceList {traces} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => void selectTrace(trace, undefined, true)} compact={leftCollapsed} onrestore={() => togglePane('left')} />
+        <TraceList {traces} selectedHealth={selectedRowHealth} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => void selectTrace(trace, undefined, true)} compact={leftCollapsed} onrestore={() => togglePane('left')} />
         <SplitHandle side="left" label="trace list" value={leftWidth} min={leftLimits.min} max={leftLimits.max} collapsed={leftCollapsed} onresize={(value) => resizePane('left', value)} oncollapse={() => togglePane('left')} />
         <section class="evidence-main" aria-label="Trace visualization workspace">
           <div class="evidence-view-toolbar">
@@ -1085,11 +1130,11 @@
     <div class="compare-overlay" role="presentation" onclick={(event) => { if (event.currentTarget === event.target) compareOpen = false; }}>
       <div class="compare-panel" role="dialog" aria-modal="true" aria-labelledby="compare-title" tabindex="-1" use:focusTrap={{ onEscape: () => compareOpen = false, initialFocus: '.inspector-close' }}>
         <div class="compare-header"><div><span>Regression analysis</span><strong id="compare-title">Compare runs</strong></div><button class="inspector-close" onclick={() => compareOpen = false} aria-label="Close comparison">×</button></div>
-        <div class="compare-controls"><label>Baseline<PremierSelect label="Comparison baseline" value={baselineId} options={traces.filter((trace) => !selectedTrace || listKey(trace) !== listKey(selectedTrace)).map((trace) => ({ value: listKey(trace), label: runTitle(trace), description: `${trace.summary?.event_count ?? trace.journal?.event_count ?? 0} recorded events` }))} onchange={(value) => void compareAgainst(value)} /></label><span>Candidate<strong>{runTitle(selectedTrace)}</strong></span></div>
+        <div class="compare-controls"><label>Baseline<PremierSelect label="Comparison baseline" value={baselineId} options={traces.filter((trace) => !selectedTrace || listKey(trace) !== listKey(selectedTrace)).map((trace) => ({ value: listKey(trace), label: runTitle(trace), description: baselineDescription(trace) }))} onchange={(value) => void compareAgainst(value)} /></label><span>Candidate<strong>{runTitle(selectedTrace)}</strong></span></div>
         {#if comparisonLoading}<div class="compare-divergence">Loading baseline evidence…</div>
         {:else if comparisonError}<div class="compare-divergence error">{comparisonError}</div>
         {:else if comparison}
-          <div class="compare-content"><TraceComparison baseline={comparison.baseline} current={selectedTrace} baselineEvents={comparison.baselineEvents} currentEvents={events} onselectCurrent={(event) => { compareOpen = false; inspectEvent(event); }} /></div>
+          <div class="compare-content"><TraceComparison baseline={comparison.baseline} current={selectedTrace} baselineEvents={comparison.baselineEvents} currentEvents={events} onselectCurrent={(event) => { compareOpen = false; inspectEvent(event); }} onselectBaseline={(event) => inspectBaselineEvent(comparison!.baseline, event)} /></div>
         {/if}
       </div>
     </div>
@@ -1109,7 +1154,7 @@
           <button type="button" class="runs-sheet-close inspector-close" onclick={() => runsSheetOpen = false} aria-label="Close runs">×</button>
         </div>
         <div class="runs-sheet-body">
-          <TraceList traces={traces} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => { runsSheetOpen = false; void selectTrace(trace, undefined, true); }} />
+          <TraceList traces={traces} selectedHealth={selectedRowHealth} selectedId={pendingTraceId ?? (selectedTrace ? listKey(selectedTrace) : null)} onselect={(trace) => { runsSheetOpen = false; void selectTrace(trace, undefined, true); }} />
         </div>
       </div>
     </div>

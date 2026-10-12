@@ -1,5 +1,5 @@
 import { actorId } from './analysis';
-import { isRunSummary, nativeCost, nativeText, nativeUsage, payloadModel, payloadProvider, usageReportedElsewhere } from './nativePayload';
+import { directUsage, isRunSummary, nativeCost, nativeOf, nativeText, nativeUsage, payloadModel, payloadProvider, tokensOutsideInputAndOutput, usageReportedElsewhere } from './nativePayload';
 import { eventPayload, type TraceEvent } from './types';
 
 export type PromptRole = 'system' | 'developer' | 'user' | 'tool' | 'assistant';
@@ -172,7 +172,7 @@ function callUsage(event: TraceEvent, payload: Record<string, unknown>, summary:
   // message only name it, and the provider's repeated copy under `native` must not be counted again.
   if (usageReportedElsewhere(payload)) return null;
   const isModelEvent = isModelKind(event);
-  const direct = record(payload.usage);
+  const direct = directUsage(payload);
   // On an event that is not a model call, only usage attached to a single provider message is one call's usage.
   const native = nativeUsage(payload, !isModelEvent && !summary);
   const usage = direct ?? native;
@@ -190,7 +190,8 @@ function callUsage(event: TraceEvent, payload: Record<string, unknown>, summary:
   const cacheWrite = numberFrom([inputDetails, ...sources], ['cache_creation_tokens', 'cache_write_tokens', 'cache_creation_input_tokens']);
   const reasoning = numberFrom([outputDetails, ...sources], ['reasoning_tokens', 'reasoning_output_tokens']);
   const explicitTotal = numberFrom(sources, ['total_tokens', 'tokens']);
-  const total = explicitTotal ?? (input !== null || output !== null ? (input ?? 0) + (output ?? 0) : null);
+  // Worked out from the parts, a total also counts what the provider reports beside them.
+  const total = explicitTotal ?? (input !== null || output !== null ? (input ?? 0) + (output ?? 0) + tokensOutsideInputAndOutput(usage) : null);
   const { prompts, toolSchemaCount } = promptEvidence(payload, usage);
   return {
     event,
@@ -205,34 +206,105 @@ function callUsage(event: TraceEvent, payload: Record<string, unknown>, summary:
   };
 }
 
+/** Last words of a kind that close a run, turn or agent: usage on such an event is a total. */
+const AGGREGATE_ENDINGS = new Set(['result', 'summary', 'end', 'ended', 'complete', 'completed', 'finish', 'finished', 'done', 'total', 'usage']);
+
+/**
+ * An SDK or collector event that closes a run, turn or agent (`agent.result`, `session.end`) and
+ * carries usage at its top level: the sum of calls that are normally recorded one by one too.
+ */
+function isAggregateEvent(event: TraceEvent, payload: Record<string, unknown>): boolean {
+  if (isModelKind(event) || event.kind.startsWith('tool.') || event.kind.startsWith('mcp.') || nativeOf(payload)) return false;
+  return AGGREGATE_ENDINGS.has(event.kind.trim().toLowerCase().split(/[^a-z0-9]+/).pop() ?? '');
+}
+
 /** A provider's end-of-run total on an event that is not itself a model call. */
 function isSummaryEvent(event: TraceEvent, payload: Record<string, unknown>): boolean {
   return !isModelKind(event) && isRunSummary(payload);
 }
 
+/** Last words of a model kind that open a call which a later event answers. */
+const REQUEST_ENDINGS = new Set(['request', 'requested', 'start', 'started', 'call', 'prompt', 'input']);
+
+function isRequestKind(event: TraceEvent): boolean {
+  return isModelKind(event) && REQUEST_ENDINGS.has(event.kind.trim().toLowerCase().split(/[^a-z0-9]+/).pop() ?? '');
+}
+
+/**
+ * The model event that answers a request: the next one that is not itself a request and names the
+ * request as its parent, shares its span, or shares its correlation id and actor.
+ */
+function answers(request: TraceEvent, candidate: TraceEvent): boolean {
+  if (!isModelKind(candidate) || isRequestKind(candidate) || candidate.sequence <= request.sequence) return false;
+  return candidate.parent_event_id === request.event_id
+    || (request.span_id !== '' && candidate.span_id === request.span_id)
+    || (request.correlation_id !== '' && candidate.correlation_id === request.correlation_id && actorId(candidate) === actorId(request));
+}
+
+/** One call recorded as a request and a response: the response's row, completed from the request. */
+function mergeRequest(response: ModelCallUsage, request: ModelCallUsage): ModelCallUsage {
+  const tokens = { ...response.tokens };
+  // Whichever event the provider's usage was attached to, it is counted once.
+  if (Object.values(tokens).every((value) => value === null)) Object.assign(tokens, request.tokens);
+  return {
+    ...response,
+    provider: response.provider ?? request.provider,
+    model: response.model === 'Unknown model' ? request.model : response.model,
+    tokens,
+    costUsd: response.costUsd ?? request.costUsd,
+    prompts: response.prompts.length ? response.prompts : request.prompts,
+    toolSchemaCount: response.toolSchemaCount || request.toolSchemaCount
+  };
+}
+
 export function modelCallUsage(event: TraceEvent): ModelCallUsage | null {
   const payload = eventPayload(event);
   // Run summaries repeat the per-call usage; modelUsage() decides whether one is needed.
-  if (isSummaryEvent(event, payload)) return null;
+  if (isSummaryEvent(event, payload) || isAggregateEvent(event, payload)) return null;
   return callUsage(event, payload, false);
 }
 
+/**
+ * The model calls of a run, each counted once:
+ *
+ * - a call recorded as a request event and a response event is one call, with one set of tokens;
+ * - a provider's or SDK's end-of-run total is used only when no call reported usage of its own.
+ */
 export function modelUsage(events: TraceEvent[]): { calls: ModelCallUsage[]; rollups: ModelUsageRollup[] } {
   const perCall = new Map<string, ModelCallUsage>();
   const summaries = new Map<string, ModelCallUsage>();
+  const aggregates = new Map<string, ModelCallUsage>();
   for (const event of events) {
     const payload = eventPayload(event);
     const summary = isSummaryEvent(event, payload);
     const call = callUsage(event, payload, summary);
-    if (call) (summary ? summaries : perCall).set(event.event_id, call);
+    if (!call) continue;
+    if (summary) summaries.set(event.event_id, call);
+    else if (isAggregateEvent(event, payload)) aggregates.set(event.event_id, call);
+    else perCall.set(event.event_id, call);
+  }
+  // Fold each answered request into its response.
+  const modelEvents = events.filter((event) => perCall.has(event.event_id) && isModelKind(event));
+  const answered = new Set<string>();
+  for (const [index, request] of modelEvents.entries()) {
+    if (!isRequestKind(request)) continue;
+    const response = modelEvents.slice(index + 1).find((candidate) => !answered.has(candidate.event_id) && answers(request, candidate));
+    if (!response) continue;
+    answered.add(response.event_id);
+    perCall.set(response.event_id, mergeRequest(perCall.get(response.event_id)!, perCall.get(request.event_id)!));
+    perCall.delete(request.event_id);
   }
   // A run summary is the only usage evidence when the provider reported nothing per call.
-  const actorsWithUsage = new Set([...perCall.values()].filter((call) => call.tokens.total !== null).map((call) => call.actor));
+  const reported = [...perCall.values()].filter((call) => call.tokens.total !== null);
+  const actorsWithUsage = new Set(reported.map((call) => call.actor));
   const calls = events.flatMap((event) => {
     const call = perCall.get(event.event_id);
     if (call) return [call];
     const summary = summaries.get(event.event_id);
-    return summary && !actorsWithUsage.has(summary.actor) && (summary.tokens.total !== null || summary.costUsd !== null) ? [summary] : [];
+    if (summary) return !actorsWithUsage.has(summary.actor) && (summary.tokens.total !== null || summary.costUsd !== null) ? [summary] : [];
+    // An SDK total may cover every actor's calls, so any per-call usage at all replaces it.
+    const aggregate = aggregates.get(event.event_id);
+    return aggregate && reported.length === 0 && (aggregate.tokens.total !== null || aggregate.costUsd !== null) ? [aggregate] : [];
   });
   const groups = new Map<string, ModelUsageRollup>();
   for (const call of calls) {

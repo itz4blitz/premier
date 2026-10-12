@@ -1,16 +1,19 @@
 <script lang="ts">
+  import { listHealth, type RunHealth } from './analysis';
   import { deriveRunIdentity } from './runIdentity';
   import { isAbandoned, isRecording, isUnreadable, listKey, type TraceManifest } from './types';
   import { PanelLeftOpen } from '@lucide/svelte';
 
   type RunFilter = 'all' | 'issues' | 'live';
 
-  let { traces, selectedId, onselect, compact = false, onrestore = () => undefined }: {
+  let { traces, selectedId, onselect, compact = false, onrestore = () => undefined, selectedHealth = null }: {
     traces: TraceManifest[];
     selectedId: string | null;
     onselect: (trace: TraceManifest) => void;
     compact?: boolean;
     onrestore?: () => void;
+    /** The open run's outcome as its header shows it, so its row never says something else. */
+    selectedHealth?: RunHealth | null;
   } = $props();
 
   let filter = $state<RunFilter>('all');
@@ -56,15 +59,16 @@
     return trace.summary?.event_count ?? trace.journal?.event_count ?? null;
   }
 
+  /**
+   * A row's outcome. The open run's row shows the outcome its header shows (`selectedHealth`, computed
+   * from its events); every other row applies the same rules to the manifest and the server's summary.
+   */
   function health(trace: TraceManifest): { label: string; tone: 'success' | 'warning' | 'error' | 'live' } {
     if (trace.integrity === 'invalid') return { label: isUnreadable(trace) ? 'Damaged' : 'Unverified', tone: 'error' };
     if (trace.integrity === 'locked') return { label: 'Encrypted · key required', tone: 'warning' };
     if (trace.integrity === 'unsupported') return { label: 'Needs a newer Premier', tone: 'warning' };
-    if (isAbandoned(trace)) return { label: 'Abandoned', tone: 'warning' };
-    if (trace.exit_code !== null && trace.exit_code !== 0) return { label: 'Failed', tone: 'error' };
-    if ((trace.summary?.issue_count ?? 0) > 0) return { label: 'Needs attention', tone: 'warning' };
-    if (!trace.ended_at || trace.integrity === 'live') return { label: 'Running', tone: 'live' };
-    return { label: 'Passed', tone: 'success' };
+    const shared = selectedHealth && listKey(trace) === selectedId ? selectedHealth : listHealth(trace);
+    return { label: shared.label, tone: shared.tone === 'running' ? 'live' : shared.tone };
   }
 
   /** Why an entry cannot be opened, in the server's words, with a fallback per state. */

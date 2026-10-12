@@ -56,4 +56,22 @@ describe('InvestigationSummary', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'true');
     expect(toggle).toHaveAccessibleName(/hide investigation details/i);
   });
+
+  it('counts evidence gaps while collapsed and opens the event a recorder diagnostic is about', async () => {
+    const onselect = vi.fn();
+    const diagnostics = [
+      { severity: 'warning' as const, code: 'missing_lifecycle_result', message: 'agent.spawn has no matching agent.result', event_id: 'event-1', sequence: 1 },
+      { severity: 'warning' as const, code: 'missing_lifecycle_result', message: 'agent.spawn has no matching agent.result', event_id: 'event-2', sequence: 2 }
+    ];
+    const events = [event(1, 'agent.spawn'), event(2, 'agent.spawn'), event(3, 'process.exit', { payload_json: '{"exit_code":0}' })];
+    render(InvestigationSummary, { props: { trace: { ...trace, exit_code: 0, diagnostics }, events, onselect } });
+
+    // Shown on the header before Details is opened.
+    expect(screen.getByRole('button', { name: /show investigation details/i })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByTestId('investigation-gap-count')).toHaveTextContent('2 gaps');
+    const rows = screen.getAllByRole('button', { name: /^Inspect event #\d+ for: Recorded lifecycle evidence is incomplete/ });
+    expect(rows).toHaveLength(2);
+    await fireEvent.click(rows[1]);
+    expect(onselect).toHaveBeenCalledWith(expect.objectContaining({ event_id: 'event-2' }));
+  });
 });

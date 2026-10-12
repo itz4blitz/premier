@@ -341,7 +341,9 @@ The prompt contains:
 - the selected event, if any (at most 8,000 characters);
 - the newest events, up to 40 of them and 24,000 characters in total, each
   at most 6,000 characters. The budget is spent from the newest event
-  backwards, so what does not fit is the oldest;
+  backwards, so what does not fit is the oldest. The prompt names the
+  sequence range it carries and how many earlier events it leaves out, and
+  tells the model to say so when a question is about the whole run;
 - the conversation so far in the panel (at most 12 messages and 12,000
   characters);
 - your question (at most 6,000 characters).
@@ -378,6 +380,24 @@ window.
   character limits above allow, whatever the script.
 - The endpoint requires the `assistant:use` scope and passes the Host and
   cross-origin checks like every other API route.
+
+**Seeing what will be sent.** Under the consent checkbox the panel states
+what the next question would send: the event range (`events #261–#300 (the
+newest 40 of 300)`), the number of earlier messages, and the size of the
+prompt, with a warning when earlier events are left out. **Show the exact
+text** displays the prompt itself, question included. Both come from `POST
+/api/traces/{trace}/assistant/preview`, which builds the prompt on the
+Premier server exactly as a question would and runs no provider: nothing
+leaves the machine to produce the preview. Every answer is followed by the
+range it was based on (`Based on events #261–#300 …`), taken from the
+`context` block the server returns with the answer, not from the model's
+own account.
+
+The conversation, the draft, the chosen provider and the consent given are
+kept per trace for as long as the page is open, so closing the panel does not
+discard them, and an answer that arrives after the panel was closed is there
+when it is reopened. They are held in the page's memory only; a reload
+clears them.
 
 Limits of that confinement:
 

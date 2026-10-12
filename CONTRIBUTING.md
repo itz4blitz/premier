@@ -96,7 +96,7 @@ Each suite on its own:
 | SDK | `npm run test:sdk` | Builds the SDK first; the tests import `dist`. `test/readme.test.js` runs every example in `sdk/js/README.md`, and the SDK and `premier emit` examples in `README.md`, `docs/collector.md` and `docs/cli.md`, under `premier record`, and requires `premier verify` to report no diagnostics. It needs a built binary (`PREMIER_BIN`, or `target/debug/premier` under `CARGO_TARGET_DIR` or the repository root) and skips those cases without one; CI sets `PREMIER_REQUIRE_CLI=1`, which turns the skip into a failure. |
 | npm launcher | `npm run test:launcher` | `node --test` on `packages/premier-cli/test`. |
 | npm distribution | `npm run test:npm-distribution` | `scripts/test-npm-distribution.mjs`. |
-| End to end | `npm run test:e2e` | Runs `npm run build`, then Playwright. Playwright starts `scripts/e2e-server.mjs`, which builds the viewer, records two traces into `.tmp/e2e-traces`, and serves them on `127.0.0.1:4318` (`PREMIER_E2E_PORT` changes the port). |
+| End to end | `npm run test:e2e` | Runs `npm run build`, then Playwright. Playwright starts `scripts/e2e-server.mjs`, which builds the viewer and the CLI, records seven traces into `.tmp/e2e-traces` (passing, failing, recorded through the Claude adapter fixture, signed, encrypted, a tampered copy, and the demo; the file's header describes each), and serves them without the encryption key on `127.0.0.1:4318` (`PREMIER_E2E_PORT` changes the port; `PREMIER_E2E_SERVER_TIMEOUT_MS` the ten-minute start budget). Set `CARGO_TARGET_DIR` if cargo does not build into `./target`. |
 
 CI also runs these, which `npm run test:all` does not:
 

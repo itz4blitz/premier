@@ -1,6 +1,31 @@
+import { readFileSync } from 'node:fs';
 import { expect, test } from '@playwright/test';
 
 const e2eBaseUrl = `http://127.0.0.1:${process.env.PREMIER_E2E_PORT ?? 4318}`;
+
+// Artifacts seeded by scripts/e2e-server.mjs, which describes each of them.
+const FAILING = 'failing-build.atrace';
+const ADAPTER = 'adapter-claude.atrace';
+const SIGNED = 'signed.atrace';
+const ENCRYPTED = 'encrypted.atrace';
+const TAMPERED = 'tampered.atrace';
+
+interface TraceRow {
+  artifact: string;
+  trace_id: string;
+  exit_code: number | null;
+  integrity: string;
+  integrity_protection?: string;
+  integrity_signer?: string;
+}
+
+interface EventRow {
+  event_id: string;
+  sequence: number;
+  kind: string;
+  status: string;
+  links: string[];
+}
 
 test('explains a multi-agent run through lanes, filters, and causal evidence', async ({ page }) => {
   await page.goto('/');
@@ -466,4 +491,286 @@ test('does not carry failure-only filters into a passing run', async ({ page }) 
 test('password protects both API and viewer', async ({ request }) => {
   expect((await fetch(`${e2eBaseUrl}/api/health`)).status).toBe(401);
   expect((await request.get('/api/health')).status()).toBe(200);
+});
+
+test('refuses the viewer, every API route, and a wrong password without credentials', async ({ request }) => {
+  // The page itself, the list, a trace, its events, and the assistant list.
+  for (const path of ['/', '/api/traces', `/api/traces/${FAILING}`, `/api/traces/${FAILING}/events?after_sequence=0&limit=5`, '/api/assistants']) {
+    const refused = await fetch(`${e2eBaseUrl}${path}`);
+    expect(refused.status, path).toBe(401);
+    // Nothing about the traces leaks into the refusal.
+    expect(await refused.text(), path).not.toContain('Failing build run');
+  }
+  const wrong = await fetch(`${e2eBaseUrl}/api/traces`, {
+    headers: { authorization: `Basic ${Buffer.from('premier:not-the-password').toString('base64')}` }
+  });
+  expect(wrong.status).toBe(401);
+  // The same routes answer with the configured credentials.
+  const listed = await request.get('/api/traces');
+  expect(listed.status()).toBe(200);
+  expect((await listed.json() as TraceRow[]).map((trace) => trace.artifact)).toContain(FAILING);
+  expect((await request.get('/')).status()).toBe(200);
+});
+
+test('finds the failure in a failing real recording', async ({ page, request }) => {
+  const manifest = await (await request.get(`/api/traces/${FAILING}`)).json() as TraceRow;
+  expect(manifest.exit_code).toBe(3);
+  await page.goto(`/?trace=${FAILING}`);
+
+  // The header and the run's own row agree that it failed; neither says it passed.
+  const outcome = page.getByLabel('Run overview').getByTestId('run-outcome');
+  await expect(outcome).toHaveText(/Failed/);
+  await expect(outcome).toHaveAttribute('data-tone', 'error');
+  await expect(outcome).toHaveAttribute('title', /Exit 3/);
+  const row = page.getByRole('button', { name: /^Failing build run\./ });
+  await expect(row).toHaveAttribute('aria-pressed', 'true');
+  await expect(row.locator('.run-outcome')).toHaveText(/Failed · 1 issue/);
+
+  // The summary says what is and is not known, and leads to the event that reports the failure.
+  const investigation = page.getByRole('region', { name: 'Investigation summary' });
+  await expect(investigation).toContainText('Process exited with status 3');
+  await expect(investigation).toContainText('Outcome · cause not recorded');
+  await investigation.getByRole('button', { name: 'Inspect recommended event' }).click();
+  const selected = page.getByRole('option', { selected: true });
+  await expect(selected).toContainText('process.exit');
+  const inspector = page.getByRole('complementary', { name: 'Event inspector' });
+  await expect(inspector).toContainText('process.exit');
+  await expect(inspector).toContainText('Exited with status 3');
+
+  // The issue filter holds exactly that event; the stderr line that explains it is one search away.
+  await page.getByRole('button', { name: 'issues', exact: true }).click();
+  await expect(page.getByRole('option')).toHaveCount(1);
+  await expect(page.getByRole('option')).toContainText('process.exit');
+  await page.getByRole('button', { name: 'all events', exact: true }).click();
+  await page.getByLabel('Search events').fill('rounding check');
+  // The search narrows the run to the events that mention it; the unrelated first output line is gone.
+  await expect(page.getByRole('option', { name: /process\.stderr/ })).toBeVisible();
+  await expect(page.getByRole('option', { name: /process\.stdout/ })).toHaveCount(0);
+  await page.getByRole('option', { name: /process\.stderr/ }).click();
+  await expect(inspector).toContainText('error: rounding check failed');
+});
+
+test('follows causality from a failed tool result to its call in an adapter recording', async ({ page, request }) => {
+  const events = await (await request.get(`/api/traces/${ADAPTER}/events`)).json() as EventRow[];
+  const failed = events.filter((event) => event.kind === 'tool.result' && event.status === 'error');
+  expect(failed).toHaveLength(1);
+  const call = events.find((event) => event.event_id === failed[0].links[0]);
+  expect(call?.kind).toBe('tool.invocation');
+  expect(call!.sequence).toBeLessThan(failed[0].sequence);
+
+  await page.goto(`/?trace=${ADAPTER}`);
+  await expect(page.getByLabel('Run overview').getByTestId('run-outcome')).toHaveText(/Needs attention/);
+  await page.getByRole('button', { name: 'issues', exact: true }).click();
+  await expect(page.getByRole('option')).toHaveCount(1);
+  await page.getByRole('option', { name: /tool\.result/ }).click();
+  const inspector = page.getByRole('complementary', { name: 'Event inspector' });
+  await expect(inspector).toContainText('test parser::rounding failed');
+
+  // Relations lists the call this result answers; opening it selects that event.
+  await inspector.getByRole('tab', { name: /Relations/ }).click();
+  const linked = inspector.locator('.causal-list > div').filter({ hasText: 'Linked evidence' });
+  await expect(linked).toContainText(call!.event_id);
+  await linked.getByRole('button').click();
+
+  const selected = page.getByRole('option', { selected: true });
+  await expect(selected).toContainText('tool.invocation');
+  await expect(selected).toContainText(String(call!.sequence).padStart(3, '0'));
+  await inspector.getByRole('tab', { name: /Relations/ }).click();
+  await expect(inspector.locator('.causal-list > div').filter({ hasText: 'Event ID' })).toContainText(call!.event_id);
+  // The call was outside the issue filter: following the link revealed it rather than hiding it.
+  await expect(page).not.toHaveURL(/kind=error/);
+  // And the call names what was run.
+  await inspector.getByRole('tab', { name: /Overview/ }).click();
+  await expect(inspector).toContainText('Bash');
+});
+
+test('flags a tampered copy as invalid and keeps it apart from the original', async ({ page, request }) => {
+  const traces = await (await request.get('/api/traces')).json() as TraceRow[];
+  const original = traces.find((trace) => trace.artifact === FAILING)!;
+  const tampered = traces.find((trace) => trace.artifact === TAMPERED)!;
+  // One recording, two artifacts: the copy claims a clean exit.
+  expect(tampered.trace_id).toBe(original.trace_id);
+  expect(tampered.exit_code).toBe(0);
+  expect(tampered.integrity).toBe('invalid');
+  expect(original.integrity).toBe('verified');
+
+  await page.goto(`/?trace=${TAMPERED}`);
+  const overview = page.getByLabel('Run overview');
+  const outcome = overview.getByTestId('run-outcome');
+  // Exit 0 in an edited manifest is not a pass.
+  await expect(outcome).toHaveText(/Unverified/);
+  await expect(outcome).toHaveAttribute('data-tone', 'error');
+  await expect(outcome).not.toHaveText(/Passed/);
+  await expect(overview.getByTestId('run-evidence')).toHaveAttribute('data-integrity', 'invalid');
+  const banner = page.locator('.integrity-banner');
+  await expect(banner).toHaveText(/Integrity failed/);
+  await expect(banner).toHaveAttribute('title', /manifest seal mismatch/);
+
+  // Only the copy's row is the open one, and only it is flagged.
+  const copyRow = page.getByRole('button', { name: /^Tampered copy\./ });
+  const originalRow = page.getByRole('button', { name: /^Failing build run\./ });
+  await expect(copyRow).toHaveAttribute('aria-pressed', 'true');
+  await expect(originalRow).toHaveAttribute('aria-pressed', 'false');
+  await expect(copyRow.locator('.run-outcome')).toHaveText(/Unverified/);
+  await expect(originalRow.locator('.run-outcome')).toHaveText(/Failed/);
+  // The evidence stays readable for forensics.
+  await expect(page.getByRole('option', { name: /process\.exit/ })).toBeVisible();
+
+  // The original, opened from the list, is verified and failed.
+  await originalRow.click();
+  await expect(page).toHaveURL(new RegExp(`trace=${FAILING.replace('.', '\\.')}`));
+  await expect(outcome).toHaveText(/Failed/);
+  await expect(overview.getByTestId('run-evidence')).toHaveAttribute('data-integrity', 'verified');
+  await expect(page.locator('.integrity-banner')).toHaveCount(0);
+});
+
+test('labels a signed trace with its signer and an unsigned one as self-consistent only', async ({ page, request }) => {
+  const signed = await (await request.get(`/api/traces/${SIGNED}`)).json() as TraceRow;
+  expect(signed.integrity_protection).toBe('signed');
+  expect(signed.integrity_signer).toMatch(/^sha256:[0-9a-f]+$/);
+
+  await page.goto(`/?trace=${SIGNED}`);
+  const overview = page.getByLabel('Run overview');
+  const evidence = overview.getByTestId('run-evidence');
+  await expect(evidence).toHaveAttribute('data-protection', 'signed');
+  await expect(evidence).toHaveAttribute('title', new RegExp(`signed by ${signed.integrity_signer}`));
+  await expect(overview.getByTestId('run-outcome')).toHaveAttribute('title', new RegExp(`Clean exit.*signed by ${signed.integrity_signer}`));
+
+  // An unsigned trace verifies too, and is never presented as proof.
+  await page.getByRole('button', { name: /^Passing smoke run\./ }).click();
+  await expect(evidence).toHaveAttribute('data-protection', 'sealed');
+  await expect(evidence).toHaveAttribute('title', /unsigned, self-consistent only/);
+  await expect(evidence).not.toHaveAttribute('title', /signed by/);
+  await expect(overview.getByTestId('run-outcome')).toHaveText(/Passed/);
+});
+
+test('shows an encrypted trace as locked and requests none of its evidence', async ({ page, request }) => {
+  const eventRequests: string[] = [];
+  page.on('request', (sent) => {
+    if (new URL(sent.url()).pathname.startsWith(`/api/traces/${ENCRYPTED}/`)) eventRequests.push(sent.url());
+  });
+  await page.goto(`/?trace=${ENCRYPTED}`);
+
+  const reason = page.getByRole('status', { name: 'Why this trace cannot be opened' });
+  await expect(reason).toContainText('key required');
+  await expect(reason).toContainText('--key-file');
+  await expect(reason).toContainText(ENCRYPTED);
+  await expect(page.getByLabel('Run overview').getByTestId('run-outcome')).toHaveText(/Locked/);
+  await expect(page.locator('.connection')).toHaveText('LOCKED');
+  // Sealed, not damaged and not live.
+  const row = page.getByRole('button', { name: /Encrypted · key required/ });
+  await expect(row).toHaveAttribute('aria-pressed', 'true');
+  await expect(row).toContainText('Locked');
+  await expect(row).not.toContainText(/Damaged|Live|Running|Passed/);
+  // There is nothing to list, ask about, or stream.
+  await expect(page.getByRole('option')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Ask AI' })).toBeDisabled();
+  await expect(page.locator('body')).not.toContainText('sealed evidence');
+  expect(eventRequests).toEqual([]);
+  expect((await request.get(`/api/traces/${ENCRYPTED}/events`)).status()).toBe(404);
+
+  // The workspace keeps its place and height without a time navigator above it: the run list is
+  // still a list that fills the window, not a 48-pixel strip.
+  const layout = await page.evaluate(() => {
+    // Copied field by field: a DOMRect's values live on its prototype and do not survive serialization.
+    const box = (selector: string) => {
+      const rect = document.querySelector(selector)!.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, height: rect.height };
+    };
+    return { filters: box('.filter-bar'), workspace: box('.workspace'), list: box('.trace-scroll'), viewport: window.innerHeight };
+  });
+  expect(layout.filters.height).toBeGreaterThanOrEqual(40);
+  expect(layout.workspace.top).toBeGreaterThanOrEqual(layout.filters.bottom - 1);
+  expect(layout.workspace.bottom).toBeLessThanOrEqual(layout.viewport + 1);
+  expect(layout.workspace.height).toBeGreaterThan(layout.viewport / 2);
+  expect(layout.list.bottom).toBeLessThanOrEqual(layout.viewport + 1);
+
+  // It does not stand in the way of a readable run.
+  await page.getByRole('button', { name: /^Passing smoke run\./ }).click();
+  await expect(page.getByRole('option', { name: /process\.stdout/ })).toBeVisible();
+  await expect(page.locator('.connection')).toHaveText('RECORDED');
+});
+
+test('compares two runs, names the first divergence, and keeps the chosen baseline', async ({ page }) => {
+  await page.goto(`/?trace=${FAILING}`);
+  await page.getByRole('button', { name: 'More', exact: true }).click();
+  await page.getByRole('menuitem', { name: /Compare runs/ }).click();
+  const dialog = page.getByRole('dialog', { name: /Compare runs/ });
+  const trigger = dialog.getByRole('button', { name: 'Comparison baseline' });
+  await trigger.click();
+  await page.getByRole('listbox', { name: 'Comparison baseline options' }).getByRole('option', { name: /Passing smoke run/ }).click();
+  await expect(dialog.getByTestId('select-value')).toContainText('Passing smoke run');
+
+  const comparison = dialog.getByRole('region', { name: 'Trace comparison' });
+  await expect(comparison.getByLabel('Baseline run summary')).toContainText('Passed');
+  await expect(comparison.getByLabel('Current run summary')).toContainText('Failed');
+  // Both recordings start the same way; they first differ in the command they were given.
+  const first = comparison.getByTestId('comparison-first-divergence');
+  await expect(first).toContainText('changed · session.start');
+  await expect(first).toContainText('baseline #1 → current #1');
+  await expect(first).toContainText('payload.command');
+  // The list is in trace order, so its first row is that divergence.
+  const rows = comparison.getByLabel('Meaningful differences').getByRole('article');
+  await expect(rows.first()).toHaveAttribute('data-status', 'changed');
+  await expect(rows.first()).toContainText('session.start');
+  // The totals match the rows listed.
+  // Exact: "Changed events" is also the tail of "Unchanged events".
+  const count = async (label: string) => Number(await comparison.getByLabel(label, { exact: true }).locator('strong').innerText());
+  const listed = (await count('Changed events')) + (await count('Added events')) + (await count('Removed events')) + (await count('Moved events'));
+  await expect(rows).toHaveCount(listed);
+  expect(await count('Added events')).toBeGreaterThanOrEqual(1);
+
+  // stderr exists only in the failing run: an added event, which opens in the inspector.
+  const added = comparison.locator('[data-status="added"]').filter({ hasText: 'process.stderr' });
+  await expect(added).toHaveCount(1);
+  await added.getByRole('button', { name: /Inspect current event/ }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole('complementary', { name: 'Event inspector' })).toContainText('error: rounding check failed');
+
+  // Reopening returns to the comparison that was chosen, not to a default baseline.
+  await page.getByRole('button', { name: 'More', exact: true }).click();
+  await page.getByRole('menuitem', { name: /Compare runs/ }).click();
+  await expect(dialog.getByTestId('select-value')).toContainText('Passing smoke run');
+  await expect(dialog.getByTestId('comparison-first-divergence')).toContainText('session.start');
+
+  // An event only the baseline has opens in the baseline run.
+  const changedStart = dialog.getByLabel('Meaningful differences').getByRole('article').first();
+  await changedStart.getByRole('button', { name: /Open baseline event #1 session\.start/ }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page).toHaveURL(/trace=passing-smoke\.atrace/);
+  await expect(page.getByRole('option', { selected: true })).toContainText('session.start');
+});
+
+test('exports a masked copy of a run that keeps the evidence and drops the credential', async ({ page, request }) => {
+  const credential = ['e2e', 'deploy', 'credential', '0001'].join('-');
+  const recorded = await (await request.get(`/api/traces/${FAILING}/events`)).json() as EventRow[];
+  // The recording itself holds the value: the export is what removes it.
+  expect(JSON.stringify(recorded)).toContain(credential);
+
+  await page.goto(`/?trace=${FAILING}`);
+  await expect(page.getByRole('option', { name: /process\.exit/ })).toBeVisible();
+  await page.getByRole('button', { name: 'More', exact: true }).click();
+  const downloading = page.waitForEvent('download');
+  await page.getByRole('menuitem', { name: /Export safe JSON/ }).click();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe('failing-build-run.redacted.json');
+  const exported = JSON.parse(readFileSync(await download.path(), 'utf8')) as {
+    export: { format: string; verified: boolean; source_integrity: string; redaction: { masked_values: number; text_marker: string } };
+    manifest: { exit_code: number; name: string };
+    events: EventRow[];
+  };
+
+  const text = JSON.stringify(exported);
+  expect(text).not.toContain(credential);
+  expect(exported.export.redaction.masked_values).toBeGreaterThanOrEqual(1);
+  expect(text).toContain(exported.export.redaction.text_marker);
+  // Everything that is not a secret is still there, event for event.
+  expect(exported.events.map((event) => [event.sequence, event.kind])).toEqual(recorded.map((event) => [event.sequence, event.kind]));
+  expect(text).toContain('compiling ledger');
+  expect(text).toContain('error: rounding check failed');
+  expect(exported.manifest).toMatchObject({ exit_code: 3, name: 'Failing build run' });
+  // A masked copy is not presented as verified evidence.
+  expect(exported.export).toMatchObject({ format: 'premier.viewer-export.v1', verified: false, source_integrity: 'verified' });
+  // The viewer says what it did.
+  await expect(page.getByText(/Export created: \d+ values? masked/)).toBeVisible();
 });

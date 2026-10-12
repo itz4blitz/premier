@@ -1,6 +1,6 @@
 import type {
   AssistantAvailability,
-  AssistantRequest,
+  AssistantPreview, AssistantRequest,
   AssistantResponse,
   TraceEvent,
   TraceManifest
@@ -48,6 +48,15 @@ export const api = {
   assistants: () => request<AssistantAvailability[]>('/api/assistants'),
   askAssistant: (traceId: string, body: AssistantRequest) => request<AssistantResponse>(
     `/api/traces/${encodeURIComponent(traceId)}/assistant`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }
+  ),
+  /** What `askAssistant` would send for this request. The server builds it and runs nothing. */
+  previewAssistant: (traceId: string, body: AssistantRequest) => request<AssistantPreview>(
+    `/api/traces/${encodeURIComponent(traceId)}/assistant/preview`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

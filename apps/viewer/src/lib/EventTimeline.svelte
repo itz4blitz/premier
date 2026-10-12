@@ -279,7 +279,7 @@
   .process-group { display: block; width: max-content; max-width: 100%; margin-top: 5px; padding: 2px 6px; border: 1px solid rgba(99,215,210,.22); border-radius: 4px; color: #8fd8d3; background: rgba(99,215,210,.06); font-size: 9px; }
   .summary-toggle:hover { color: #dce4ff; text-decoration: underline; }
   .event-status { padding: 3px 6px; border: 1px solid #3b4a64; border-radius: 4px; color: #c3d0e7; background: #121a27; font: 700 9px 'IBM Plex Mono', monospace; text-transform: uppercase; white-space: nowrap; }
-  .event-status[data-status='error'], .event-status[data-status='failed'], .event-status[data-status='denied'], .event-status[data-status='blocked'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; background: rgba(255,113,109,.08); }
+  .event-status[data-status='error'], .event-status[data-status='failed'], .event-status[data-status='denied'], .event-status[data-status='rejected'], .event-status[data-status='blocked'] { border-color: rgba(255,113,109,.45); color: #ffaaa6; background: rgba(255,113,109,.08); }
   .event-status[data-status='ok'], .event-status[data-status='approved'] { border-color: rgba(95,214,160,.4); color: #91e3bd; background: rgba(95,214,160,.07); }
   .sequence, time { font-size: 10px; }
   @media (max-width: 680px) {

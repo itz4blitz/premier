@@ -876,6 +876,10 @@ it('shows why a locked trace cannot be opened instead of "trace not found" and "
     expect(fetchMock.mock.calls.map(([input]) => String(input)).filter((url) => !url.endsWith('/api/traces'))).toEqual([]);
     expect(sources).toEqual([]);
     expect(new URL(window.location.href).searchParams.get('trace')).toBe('sealed.atrace');
+    // With no time navigator its grid row is still held, so the filters and the workspace keep
+    // the second and third rows of the run shell instead of each moving up one.
+    expect([...document.querySelector('.run-shell')!.children].map((child) => child.classList[0]))
+      .toEqual(['time-navigator-placeholder', 'filter-bar', 'workspace']);
   } finally {
     vi.unstubAllGlobals();
   }
@@ -974,6 +978,60 @@ it('keeps the scope a history entry carries when Back lands on a different run',
   await fireEvent.click(screen.getByRole('button', { name: /^Investigation\./ }));
   await waitFor(() => expect(new URL(window.location.href).searchParams.get('trace')).toBe('investigation.atrace'));
   expect(new URL(window.location.href).searchParams.has('kind')).toBe(false);
+});
+
+it('keeps the chosen comparison baseline when reopened, and opens baseline-side events in the baseline run', async () => {
+  const copy = (id: string, artifact: string, name: string, tool: string): [TraceManifest, TraceEvent[]] => [
+    { ...trace, trace_id: id, artifact, name },
+    events.map((event) => ({
+      ...event, trace_id: id, event_id: `${id}-${event.event_id}`,
+      parent_event_id: event.parent_event_id ? `${id}-${event.parent_event_id}` : '',
+      payload_json: event.kind === 'tool.execution' ? JSON.stringify({ tool }) : event.payload_json
+    }))
+  ];
+  const [other, otherEvents] = copy('trace-2', 'other.atrace', 'Other run', 'rg');
+  const [third, thirdEvents] = copy('trace-3', 'third.atrace', 'Third run', 'grep');
+  const fetchMock = mockWorkspace([trace, other, third], { 'trace-1': events, 'trace-2': otherEvents, 'trace-3': thirdEvents });
+  const loads = (artifact: string) => fetchMock.mock.calls.filter(([input]) => String(input).includes(`/api/traces/${artifact}/events`)).length;
+  render(App);
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Investigation'));
+
+  const openCompare = async () => {
+    await fireEvent.click(screen.getByRole('button', { name: 'More' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: /Compare runs/ }));
+    return screen.findByRole('dialog', { name: /Compare runs/ });
+  };
+  let dialog = await openCompare();
+  // The default baseline is the first other run; choose the one after it.
+  await waitFor(() => expect(dialog.querySelector('[data-testid="select-value"]')).toHaveTextContent('Other run'));
+  await fireEvent.click(screen.getByRole('button', { name: 'Comparison baseline' }));
+  await fireEvent.click(screen.getByRole('option', { name: /Third run/ }));
+  await waitFor(() => expect(dialog.querySelector('[data-testid="select-value"]')).toHaveTextContent('Third run'));
+  // The third run called a different tool: its call is removed, this run's is added.
+  const removed = await screen.findByTestId('comparison-removed-0');
+  expect(removed).toHaveTextContent('baseline #2');
+  expect(screen.getByTestId('comparison-first-divergence')).toHaveTextContent('tool.execution');
+  expect(loads('third.atrace')).toBe(1);
+
+  // Inspecting an event of this run closes the dialog...
+  await fireEvent.click(screen.getByTestId('comparison-added-0').querySelector('button[aria-label^="Inspect current event"]')!);
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  expect(screen.getByRole('option', { selected: true })).toHaveTextContent('tool.execution');
+
+  // ...and reopening it returns to the same baseline without loading it again.
+  dialog = await openCompare();
+  expect(dialog.querySelector('[data-testid="select-value"]')).toHaveTextContent('Third run');
+  expect(screen.getByTestId('comparison-removed-0')).toBeInTheDocument();
+  expect(loads('third.atrace')).toBe(1);
+  expect(loads('other.atrace')).toBe(1);
+
+  // An event only the baseline has opens in the baseline run, selected.
+  await fireEvent.click(screen.getByRole('button', { name: /Open baseline event #2 tool\.execution/ }));
+  await waitFor(() => expect(screen.getByLabelText('Current run')).toHaveTextContent('Third run'));
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('third.atrace');
+  await waitFor(() => expect(screen.getByRole('option', { selected: true })).toHaveTextContent('tool.execution'));
+  await waitFor(() => expect(screen.getByRole('complementary', { name: 'Event inspector' })).toHaveTextContent('grep'));
 });
 
 it('drops a stale event_id when recovering from a dead link', async () => {

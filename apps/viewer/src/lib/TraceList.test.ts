@@ -126,4 +126,38 @@ describe('TraceList', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Live' }));
     expect(screen.getByRole('status')).toHaveTextContent('No live runs');
   });
+
+  it('never shows a run that was signalled, interrupted or ended without a status as passed', () => {
+    const rows: Array<[string, Partial<TraceManifest>, string]> = [
+      ['signalled', { exit_code: null, termination: { kind: 'signal', signal: 15, signal_name: 'SIGTERM' } }, 'Failed'],
+      ['interrupted', { exit_code: null, termination: { kind: 'interrupted' } }, 'Interrupted'],
+      ['statusless', { exit_code: null }, 'Unknown'],
+      ['clean', {}, 'Passed']
+    ];
+    render(TraceList, {
+      props: {
+        traces: rows.map(([name, overrides]) => ({ ...trace, trace_id: name, artifact: `${name}.atrace`, name, ...overrides })),
+        selectedId: null,
+        onselect: vi.fn()
+      }
+    });
+    for (const [name, , label] of rows) {
+      const row = screen.getByRole('button', { name: new RegExp(`^${name}\\.`) });
+      expect(row.querySelector('.run-outcome'), name).toHaveTextContent(label);
+      if (label !== 'Passed') expect(row.querySelector('.run-outcome'), name).not.toHaveAttribute('data-tone', 'success');
+    }
+    // The Issues filter keeps every run that did not pass.
+    expect(screen.getAllByRole('button', { name: /\.atrace|events\.$/ }).length).toBeGreaterThan(0);
+  });
+
+  it('shows the open run the outcome its header shows', () => {
+    // The summary counts no issue, but the loaded events hold a pending approval.
+    const props = { traces: [{ ...trace, artifact: 'one.atrace' }, { ...trace, trace_id: 'trace-2', artifact: 'two.atrace', name: 'Other run' }], onselect: vi.fn() };
+    render(TraceList, { props: { ...props, selectedId: 'one.atrace', selectedHealth: { label: 'Awaiting approval', tone: 'warning', detail: '1 pending decision' } } });
+    const open = screen.getByRole('button', { name: /npm test/i });
+    expect(open.querySelector('.run-outcome')).toHaveTextContent('Awaiting approval');
+    expect(open).toHaveAccessibleName(expect.stringContaining('Awaiting approval'));
+    // Other rows keep their own outcome.
+    expect(screen.getByRole('button', { name: /Other run/i }).querySelector('.run-outcome')).toHaveTextContent('Passed');
+  });
 });

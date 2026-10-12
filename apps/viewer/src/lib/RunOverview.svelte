@@ -40,7 +40,7 @@
 
 {#if compact}
   <div class="run-stats" aria-label="Run overview">
-    <span class="stat outcome" data-tone={health.tone} title={health.detail}>
+    <span class="stat outcome" data-testid="run-outcome" data-tone={health.tone} title={health.detail}>
       <small>Outcome</small>
       <strong>{health.label}</strong>
     </span>
@@ -48,7 +48,14 @@
       <small>Actors</small>
       <strong>{participants}</strong>
     </span>
-    <span class="stat" class:error={errors > 0 || trace.integrity === 'invalid'} title={`${evidenceDetail}${redactionDetail ? ` · redacted at capture: ${redactionDetail}` : ''}`}>
+    <span
+      class="stat"
+      class:error={errors > 0 || trace.integrity === 'invalid'}
+      data-testid="run-evidence"
+      data-integrity={trace.integrity ?? 'unknown'}
+      data-protection={trace.integrity === 'verified' ? trace.integrity_protection ?? 'unspecified' : undefined}
+      title={`${evidenceDetail}${redactionDetail ? ` · redacted at capture: ${redactionDetail}` : ''}`}
+    >
       <small>Evidence</small>
       <strong>{evidenceLabel}</strong>
     </span>

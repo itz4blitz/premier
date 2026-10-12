@@ -309,8 +309,9 @@ enum Commands {
         /// Only events before this time (RFC 3339).
         #[arg(long, value_name = "TIME", value_parser = parse_query_time)]
         until: Option<chrono::DateTime<Utc>>,
-        /// Only events that count as issues: an error, failed, denied or
-        /// blocked status, an error or failure kind, or a provider-stated failure.
+        /// Only events that count as issues: an error, failed, denied,
+        /// blocked or rejected status, an error or failure kind, or a failure
+        /// stated by the provider or by the payload of an event with no status.
         #[arg(long)]
         issues: bool,
         /// Maximum events returned (1-1000).

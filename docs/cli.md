@@ -958,7 +958,7 @@ Options:
       --before-sequence <N>  Only events with a sequence less than this
       --since <TIME>         Only events at or after this time (RFC 3339, for example 2026-07-15T12:00:00Z)
       --until <TIME>         Only events before this time (RFC 3339)
-      --issues               Only events that count as issues: an error, failed, denied or blocked status, an error or failure kind, or a provider-stated failure
+      --issues               Only events that count as issues: an error, failed, denied, blocked or rejected status, an error or failure kind, or a failure stated by the provider or by the payload of an event with no status
       --limit <LIMIT>        Maximum events returned (1-1000) [default: 100]
       --json                 Emit one structured JSON result instead of the compact text view
       --allow-unverified     Read a finalized trace even though it fails `premier verify`
@@ -1395,7 +1395,8 @@ checks are described in [security.md](security.md#the-viewer-server).
 | Route | Returns |
 | --- | --- |
 | `GET /api/health` | Server status. |
-| `GET /api/assistants` | The local assistant providers and whether each is available. |
+| `GET /api/assistants` | The local assistant providers and whether each is available to the caller. With credentials that lack the `assistant:use` scope every provider is `available: false` with that as its `reason`. |
+| `POST /api/traces/{trace}/assistant/preview` | The prompt a question would send and the part of the trace it covers (`context`), without running a provider. Takes the same body as the assistant route; `prompt` may be empty. Requires `assistant:use`. |
 | `GET /api/traces` | One entry per trace: the manifest fields plus a summary and the integrity fields below. |
 | `GET /api/traces/{trace}` | The same for one trace. |
 | `GET /api/traces/{trace}/events` | The trace's events. See [Paged events](#paged-events). |
