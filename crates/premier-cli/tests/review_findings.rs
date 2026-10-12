@@ -976,7 +976,7 @@ fn a_terminal_resize_reaches_the_pty_child_and_is_recorded() {
     let flag = temp.path().join("resized.flag");
     // The terminal the recorder runs in: 24 rows by 80 columns to begin with.
     let (mut master, mut slave) = (0, 0);
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: 24,
         ws_col: 80,
         ws_xpixel: 0,
@@ -990,7 +990,8 @@ fn a_terminal_resize_reaches_the_pty_child_and_is_recorded() {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                // The size parameter is `*const` on Linux and `*mut` on macOS.
+                std::ptr::addr_of!(size).cast_mut(),
             ),
             0
         );
