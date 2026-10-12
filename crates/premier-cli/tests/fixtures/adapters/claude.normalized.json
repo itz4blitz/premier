@@ -1,0 +1,765 @@
+[
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "claude-session",
+    "duration_ms": 0,
+    "event_id": "e1",
+    "kind": "agent.turn",
+    "links": [],
+    "parent_event_id": "",
+    "parent_span_id": "",
+    "payload": {
+      "adapter_schema_version": 1,
+      "lifecycle": "session_start",
+      "model": "claude-fixture",
+      "native": {
+        "apiKeySource": "none",
+        "cwd": "/work/app",
+        "mcp_servers": [],
+        "model": "claude-fixture",
+        "permissionMode": "default",
+        "session_id": "claude-session",
+        "subtype": "init",
+        "tools": [
+          "Task",
+          "Bash",
+          "Read",
+          "Grep"
+        ],
+        "type": "system",
+        "uuid": "uuid-00"
+      },
+      "native_type": "system",
+      "provider": "claude",
+      "session_id": "claude-session"
+    },
+    "sequence": 1,
+    "source": "adapter.claude.v1",
+    "span_id": "claude-session",
+    "status": "running"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "msg-1",
+    "duration_ms": 0,
+    "event_id": "e2",
+    "kind": "model.response",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "text": "I will read the README first.",
+              "type": "text"
+            }
+          ],
+          "id": "msg-1",
+          "model": "claude-fixture",
+          "role": "assistant",
+          "stop_reason": null,
+          "type": "message",
+          "usage": {
+            "cache_read_input_tokens": 4,
+            "input_tokens": 12,
+            "output_tokens": 9
+          }
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-01"
+      },
+      "native_type": "assistant",
+      "provider": "claude",
+      "usage": {
+        "input_tokens": 12,
+        "input_tokens_details": {
+          "cached_tokens": 4
+        },
+        "output_tokens": 9,
+        "total_tokens": 25
+      }
+    },
+    "sequence": 2,
+    "source": "adapter.claude.v1",
+    "span_id": "msg-1",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "msg-2",
+    "duration_ms": 0,
+    "event_id": "e3",
+    "kind": "model.response",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "text": "Reading the README.",
+              "type": "text"
+            }
+          ],
+          "id": "msg-2",
+          "model": "claude-fixture",
+          "role": "assistant",
+          "stop_reason": null,
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 20,
+            "cache_read_input_tokens": 6,
+            "input_tokens": 12,
+            "output_tokens": 4
+          }
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-01b"
+      },
+      "native_type": "assistant",
+      "provider": "claude",
+      "usage": {
+        "input_tokens": 12,
+        "input_tokens_details": {
+          "cache_creation_tokens": 20,
+          "cached_tokens": 6
+        },
+        "output_tokens": 4,
+        "total_tokens": 42
+      }
+    },
+    "sequence": 3,
+    "source": "adapter.claude.v1",
+    "span_id": "msg-2",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "tool-1",
+    "duration_ms": 0,
+    "event_id": "e4",
+    "kind": "tool.invocation",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "native": {
+        "hook_name": "PreToolUse",
+        "session_id": "claude-session",
+        "tool_name": "Read",
+        "tool_use_id": "tool-1",
+        "type": "hook_started",
+        "uuid": "uuid-02"
+      },
+      "native_type": "hook_started",
+      "provider": "claude",
+      "tool": "Read"
+    },
+    "sequence": 4,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-1",
+    "status": "running"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "tool-1",
+    "duration_ms": 0,
+    "event_id": "e5",
+    "kind": "tool.invocation",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "id": "tool-1",
+              "input": {
+                "file_path": "README.md"
+              },
+              "name": "Read",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg-2",
+          "model": "claude-fixture",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "type": "message",
+          "usage": {
+            "cache_creation_input_tokens": 20,
+            "cache_read_input_tokens": 6,
+            "input_tokens": 12,
+            "output_tokens": 4
+          }
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-03"
+      },
+      "native_type": "assistant",
+      "provider": "claude",
+      "tool": "Read",
+      "usage_reported_on": "msg-2"
+    },
+    "sequence": 5,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-1",
+    "status": "running"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "tool-1",
+    "duration_ms": 0,
+    "event_id": "e6",
+    "kind": "tool.result",
+    "links": [
+      "e5"
+    ],
+    "parent_event_id": "e5",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "native": {
+        "message": {
+          "content": [
+            {
+              "content": "# App\nA small service.",
+              "is_error": false,
+              "tool_use_id": "tool-1",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "user",
+        "uuid": "uuid-04"
+      },
+      "native_type": "user",
+      "provider": "claude",
+      "tool": "Read"
+    },
+    "sequence": 6,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-1",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "tool-2",
+    "duration_ms": 0,
+    "event_id": "e7",
+    "kind": "tool.invocation",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "id": "tool-2",
+              "input": {
+                "command": "cargo test",
+                "description": "Run the tests"
+              },
+              "name": "Bash",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg-3",
+          "model": "claude-fixture",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "type": "message",
+          "usage": {
+            "input_tokens": 30,
+            "output_tokens": 6
+          }
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-05"
+      },
+      "native_type": "assistant",
+      "provider": "claude",
+      "tool": "Bash",
+      "usage": {
+        "input_tokens": 30,
+        "output_tokens": 6,
+        "total_tokens": 36
+      }
+    },
+    "sequence": 7,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-2",
+    "status": "running"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "tool-2",
+    "duration_ms": 0,
+    "event_id": "e8",
+    "kind": "tool.result",
+    "links": [
+      "e7"
+    ],
+    "parent_event_id": "e7",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "native": {
+        "message": {
+          "content": [
+            {
+              "content": "error: test parser::rounding failed\nExit code 101",
+              "is_error": true,
+              "tool_use_id": "tool-2",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "user",
+        "uuid": "uuid-06"
+      },
+      "native_type": "user",
+      "provider": "claude",
+      "tool": "Bash"
+    },
+    "sequence": 8,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-2",
+    "status": "error"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "tool-3",
+    "duration_ms": 0,
+    "event_id": "e9",
+    "kind": "tool.invocation",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "id": "tool-3",
+              "input": {
+                "description": "Find rounding code",
+                "prompt": "Locate the rounding helper.",
+                "subagent_type": "general-purpose"
+              },
+              "name": "Task",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg-4",
+          "model": "claude-fixture",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "type": "message",
+          "usage": {
+            "input_tokens": 44,
+            "output_tokens": 12
+          }
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-07"
+      },
+      "native_type": "assistant",
+      "provider": "claude",
+      "tool": "Task",
+      "usage": {
+        "input_tokens": 44,
+        "output_tokens": 12,
+        "total_tokens": 56
+      }
+    },
+    "sequence": 9,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-3",
+    "status": "running"
+  },
+  {
+    "actor_id": "claude:subagent:tool-3",
+    "actor_type": "subagent",
+    "correlation_id": "tool-3",
+    "duration_ms": 0,
+    "event_id": "e10",
+    "kind": "agent.spawn",
+    "links": [
+      "e9"
+    ],
+    "parent_event_id": "e9",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "line": 10,
+      "parent_actor": "claude",
+      "parent_tool_use_id": "tool-3",
+      "provider": "claude",
+      "synthesized": true,
+      "synthesized_from": "parent_tool_use_id",
+      "tool": "Task"
+    },
+    "sequence": 10,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-3",
+    "status": "running"
+  },
+  {
+    "actor_id": "claude:subagent:tool-3",
+    "actor_type": "subagent",
+    "correlation_id": "tool-4",
+    "duration_ms": 0,
+    "event_id": "e11",
+    "kind": "tool.invocation",
+    "links": [],
+    "parent_event_id": "e10",
+    "parent_span_id": "tool-3",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture-small",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "id": "tool-4",
+              "input": {
+                "pattern": "fn round"
+              },
+              "name": "Grep",
+              "type": "tool_use"
+            }
+          ],
+          "id": "msg-5",
+          "model": "claude-fixture-small",
+          "role": "assistant",
+          "stop_reason": "tool_use",
+          "type": "message",
+          "usage": {
+            "input_tokens": 8,
+            "output_tokens": 3
+          }
+        },
+        "parent_tool_use_id": "tool-3",
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-08"
+      },
+      "native_type": "assistant",
+      "parent_actor": "claude",
+      "provider": "claude",
+      "tool": "Grep",
+      "usage": {
+        "input_tokens": 8,
+        "output_tokens": 3,
+        "total_tokens": 11
+      }
+    },
+    "sequence": 11,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-4",
+    "status": "running"
+  },
+  {
+    "actor_id": "claude:subagent:tool-3",
+    "actor_type": "subagent",
+    "correlation_id": "tool-4",
+    "duration_ms": 0,
+    "event_id": "e12",
+    "kind": "tool.result",
+    "links": [
+      "e11"
+    ],
+    "parent_event_id": "e11",
+    "parent_span_id": "tool-3",
+    "payload": {
+      "adapter_schema_version": 1,
+      "native": {
+        "message": {
+          "content": [
+            {
+              "content": "src/ledger.rs:41:fn round_credit",
+              "tool_use_id": "tool-4",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        },
+        "parent_tool_use_id": "tool-3",
+        "session_id": "claude-session",
+        "type": "user",
+        "uuid": "uuid-09"
+      },
+      "native_type": "user",
+      "parent_actor": "claude",
+      "provider": "claude",
+      "tool": "Grep"
+    },
+    "sequence": 12,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-4",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude:subagent:tool-3",
+    "actor_type": "subagent",
+    "correlation_id": "msg-6",
+    "duration_ms": 0,
+    "event_id": "e13",
+    "kind": "model.response",
+    "links": [],
+    "parent_event_id": "e10",
+    "parent_span_id": "tool-3",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture-small",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "text": "The helper is round_credit in src/ledger.rs.",
+              "type": "text"
+            }
+          ],
+          "id": "msg-6",
+          "model": "claude-fixture-small",
+          "role": "assistant",
+          "stop_reason": "end_turn",
+          "type": "message",
+          "usage": {
+            "input_tokens": 15,
+            "output_tokens": 11
+          }
+        },
+        "parent_tool_use_id": "tool-3",
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-10"
+      },
+      "native_type": "assistant",
+      "parent_actor": "claude",
+      "provider": "claude",
+      "usage": {
+        "input_tokens": 15,
+        "output_tokens": 11,
+        "total_tokens": 26
+      }
+    },
+    "sequence": 13,
+    "source": "adapter.claude.v1",
+    "span_id": "msg-6",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "tool-3",
+    "duration_ms": 0,
+    "event_id": "e14",
+    "kind": "tool.result",
+    "links": [
+      "e9"
+    ],
+    "parent_event_id": "e9",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "native": {
+        "message": {
+          "content": [
+            {
+              "content": [
+                {
+                  "text": "The helper is round_credit in src/ledger.rs.",
+                  "type": "text"
+                }
+              ],
+              "tool_use_id": "tool-3",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "user",
+        "uuid": "uuid-11"
+      },
+      "native_type": "user",
+      "provider": "claude",
+      "tool": "Task"
+    },
+    "sequence": 14,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-3",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude:subagent:tool-3",
+    "actor_type": "subagent",
+    "correlation_id": "tool-3",
+    "duration_ms": 0,
+    "event_id": "e15",
+    "kind": "agent.result",
+    "links": [
+      "e10",
+      "e14"
+    ],
+    "parent_event_id": "e10",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "line": 13,
+      "parent_tool_use_id": "tool-3",
+      "provider": "claude",
+      "synthesized": true,
+      "synthesized_from": "tool_result",
+      "tool": "Task"
+    },
+    "sequence": 15,
+    "source": "adapter.claude.v1",
+    "span_id": "tool-3",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "msg-7",
+    "duration_ms": 0,
+    "event_id": "e16",
+    "kind": "model.response",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "claude-session",
+    "payload": {
+      "adapter_schema_version": 1,
+      "model": "claude-fixture",
+      "native": {
+        "message": {
+          "content": [
+            {
+              "text": "The rounding test fails in round_credit.",
+              "type": "text"
+            }
+          ],
+          "id": "msg-7",
+          "model": "claude-fixture",
+          "role": "assistant",
+          "stop_reason": "end_turn",
+          "type": "message",
+          "usage": {
+            "input_tokens": 60,
+            "output_tokens": 10
+          }
+        },
+        "parent_tool_use_id": null,
+        "session_id": "claude-session",
+        "type": "assistant",
+        "uuid": "uuid-12"
+      },
+      "native_type": "assistant",
+      "provider": "claude",
+      "usage": {
+        "input_tokens": 60,
+        "output_tokens": 10,
+        "total_tokens": 70
+      }
+    },
+    "sequence": 16,
+    "source": "adapter.claude.v1",
+    "span_id": "msg-7",
+    "status": "ok"
+  },
+  {
+    "actor_id": "claude",
+    "actor_type": "agent",
+    "correlation_id": "claude-session",
+    "duration_ms": 4210,
+    "event_id": "e17",
+    "kind": "agent.result",
+    "links": [],
+    "parent_event_id": "e1",
+    "parent_span_id": "",
+    "payload": {
+      "adapter_schema_version": 1,
+      "lifecycle": "run_result",
+      "native": {
+        "duration_api_ms": 3890,
+        "duration_ms": 4210,
+        "is_error": false,
+        "num_turns": 5,
+        "permission_denials": [],
+        "result": "The rounding test fails in round_credit.",
+        "session_id": "claude-session",
+        "subtype": "success",
+        "total_cost_usd": 0.0123,
+        "type": "result",
+        "usage": {
+          "cache_creation_input_tokens": 20,
+          "cache_read_input_tokens": 10,
+          "input_tokens": 181,
+          "output_tokens": 55
+        },
+        "uuid": "uuid-13"
+      },
+      "native_type": "result",
+      "provider": "claude",
+      "session_id": "claude-session",
+      "usage": {
+        "cost_usd": 0.0123,
+        "input_tokens": 181,
+        "input_tokens_details": {
+          "cache_creation_tokens": 20,
+          "cached_tokens": 10
+        },
+        "output_tokens": 55,
+        "total_tokens": 266
+      }
+    },
+    "sequence": 17,
+    "source": "adapter.claude.v1",
+    "span_id": "claude-session",
+    "status": "ok"
+  }
+]

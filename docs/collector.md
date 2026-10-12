@@ -68,10 +68,10 @@ A JSON object. Unknown fields are ignored.
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `kind` | string | yes | | Must not be blank. Some kinds are reserved; see below. |
-| `source` | string | no | `"sdk"` | A label for the producer. Some sources are reserved. |
-| `actor_id` | string | no | `""` | Who did it. Empty is shown as `root`. |
-| `actor_type` | string | no | `""` | `agent`, `subagent`, `human`, `process`, or `system`. |
+| `kind` | string | yes | | A name; see [Field rules](#field-rules). Some kinds are reserved; see below. |
+| `source` | string | no | `"sdk"` | A name labelling the producer. The default applies only when the field is absent; an empty string is rejected. Some sources are reserved. |
+| `actor_id` | string | no | `""` | Who did it. An empty actor is unattributed: `premier query` prints it as `-`, and the viewer groups it under `root`. |
+| `actor_type` | string | no | `""` | A name: `agent`, `subagent`, `human`, `process`, or `system`. |
 | `status` | string | no | `""` | See [events.md](events.md#statuses). |
 | `span_id` | string | no | `""` | |
 | `parent_span_id` | string | no | `""` | |
@@ -79,19 +79,74 @@ A JSON object. Unknown fields are ignored.
 | `correlation_id` | string | no | `""` | |
 | `links` | array of strings | no | `[]` | Event ids or span ids. |
 | `duration_ms` | unsigned integer | no | `0` | A fractional or negative number is rejected with `400`. |
-| `payload` | any JSON value | no | `null` | Should be an object. |
-| `timestamp` | string or null | no | receipt time | RFC 3339. Stored verbatim when given and not blank; the collector does not parse or validate it. |
+| `payload` | any JSON value | no | `null` | Should be an object, and must be one (or absent) when `timestamp` is sent. |
+| `timestamp` | string or null | no | | The producer's own time, RFC 3339. It does not set the event's timestamp; see [Timestamps](#timestamps). |
 
-The recorder assigns `event_id`, `trace_id`, and `sequence`. A client cannot
-set them.
+The recorder assigns `event_id`, `trace_id`, `sequence`, `timestamp`, and
+`prev_hash`. A client cannot set them.
 
-Two things are accepted but flagged later. For the kinds listed under
+### Field rules
+
+Every field is validated before the event is stored. A violation is rejected
+with `400` and a message naming the field.
+
+| Fields | Rule | Limit |
+| --- | --- | --- |
+| `kind`, `source`, `actor_type` | Names. Only ASCII letters, digits, `.`, `_`, `:`, and `-`. No spaces and no other Unicode, so nothing can be made to look like a recorder-owned name. `kind` and `source` must not be empty; `actor_type` may be. | 128 bytes |
+| `actor_id`, `span_id`, `parent_span_id`, `correlation_id`, `status`, `parent_event_id`, and each entry of `links` | Free text. Any Unicode, but no control characters (newline, tab, escape, NUL, ...). May be empty. | 256 bytes each |
+| `timestamp` | Empty or all whitespace is ignored. Otherwise it must parse as an RFC 3339 date-time. | 64 bytes |
+| whole body | | 2 MiB; see [Size limit](#size-limit) |
+
+Request bodies and the collector's answers:
+
+```text
+{"kind":""}                              400 {"error":"event kind cannot be empty"}
+{"kind":"agent message"}                 400 {"error":"event kind may only contain ASCII letters, digits, and `.`, `_`, `:`, `-`"}
+{"kind":"a.b","source":""}               400 {"error":"event source cannot be empty"}
+{"kind":"a.b","actor_id":"a\u001bb"}     400 {"error":"event actor_id contains a control character"}
+{"kind":"a.b","status":"ok\nx"}          400 {"error":"event status contains a control character"}
+{"kind":"a.b","actor_id":"<257 bytes>"}  400 {"error":"event actor_id exceeds 256 bytes"}
+```
+
+The reserved-name check runs before these rules, so a reserved kind or source
+gets `422`, not `400`.
+
+### Timestamps
+
+The `timestamp` of a stored event is always the time the recorder received
+it. It is the only clock the recorder can vouch for, it keeps timestamps in
+journal order, and a producer cannot back-date or forward-date evidence.
+
+A `timestamp` in the request body is treated as a claim by the producer and
+kept as evidence:
+
+- It must be RFC 3339 (for example `2026-01-31T12:00:00Z`). Anything else is
+  rejected with `400`.
+- It is stored, trimmed but otherwise verbatim, as
+  `payload.producer_timestamp`. An absent or `null` payload becomes an object
+  to hold it.
+- If the payload is any other non-object value (an array, a string, a number)
+  the event is rejected with `400`, because there is nowhere to keep the
+  producer time.
+
+```text
+$ curl ... -d '{"kind":"agent.message","actor_id":"a","status":"ok","payload":{"x":1},"timestamp":"2020-01-01T00:00:00Z"}'
+{"event_id":"01a130a6-c342-78e3-9865-71d74e733256", ... "timestamp":"2026-10-12T15:06:37.762336+00:00", ... "payload_json":"{\"producer_timestamp\":\"2020-01-01T00:00:00Z\",\"x\":1}", ...}
+```
+
+Two things pass these rules but are flagged later. For the kinds listed under
 [lifecycle validation](events.md#lifecycle-validation), an event with no
 `status`, or with a `payload` that is not a JSON object, produces a diagnostic
 when the trace is finalized. Send `"payload": {}` rather than omitting it.
 
-The redaction rules of the recording are applied to `payload` before the event
-is stored; see [redaction.md](redaction.md).
+The redaction rules of the recording are applied before the event is stored.
+All of them apply to `payload`: secret field names (as object keys, in
+header-style pairs such as `{"name": "Authorization", "value": "..."}`, in
+argument lists, and in JSON held inside a string), the built-in value
+patterns, and the literal and regex rules. The literal and regex rules, and
+the collector token itself, are also replaced in `kind`, `source`,
+`actor_id`, `actor_type`, `span_id`, `parent_span_id`, `correlation_id`, and
+`status`. See [redaction.md](redaction.md).
 
 ## Response
 
@@ -114,12 +169,17 @@ is stored; see [redaction.md](redaction.md).
   "correlation_id": "",
   "status": "running",
   "duration_ms": 0,
-  "links": []
+  "links": [],
+  "prev_hash": "2575dce8d2afbb2f..."
 }
 ```
 
+`timestamp` is the recorder's receipt time. `prev_hash` is the hash of the
+previous event in the journal (64 hexadecimal characters, shortened here); see
+[trace-format.md](trace-format.md#event-hash-chain).
+
 `payload_json` is the payload as stored, serialized to a string, after
-redaction. Keep `event_id` if later events should name this one as their
+redaction; the other fields are also shown as stored. Keep `event_id` if later events should name this one as their
 parent.
 
 Errors have the body `{"error": "<message>"}`.
@@ -129,17 +189,24 @@ Errors have the body `{"error": "<message>"}`.
 | Status | When |
 | --- | --- |
 | `200` | The event was stored. |
-| `400` | The body is not valid JSON, `kind` is missing, a field has the wrong type, or the body is larger than the size limit. |
-| `401` | The bearer token is missing or wrong. |
+| `400` | The body is not valid JSON, `kind` is missing, a field has the wrong type, a field breaks the [field rules](#field-rules) (empty `kind` or `source`, a disallowed character, too long), or `timestamp` is not RFC 3339 or comes with a non-object payload. |
+| `401` | The bearer token is missing or wrong. Checked before the body is read. |
 | `405` | Any method other than `POST` on `/v1/events`. |
+| `408` | The body did not arrive within 10 seconds. `{"error":"event body was not received in time"}`. |
+| `413` | The body is larger than the size limit. |
 | `422` | The event claims a kind or source that only the recorder may write. |
-| `500` | The event could not be stored: `kind` is blank, or the journal write failed. |
+| `500` | The journal write failed. |
+
+The checks run in this order: token (`401`), declared size (`413`), body read
+(`408`, `413`), JSON (`400`), reserved names (`422`), field rules and
+timestamp (`400`).
 
 ### Size limit
 
 The request body may be at most 2 MiB (2,097,152 bytes). A larger body is
-rejected with **`400`** and `{"error":"length limit exceeded"}`. The collector
-does not use `413`.
+rejected with `413` and `{"error":"event body exceeds 2097152 bytes"}`. A
+request whose `Content-Length` already exceeds the limit is rejected before
+any of the body is read.
 
 ### Reserved kinds and sources
 
@@ -169,8 +236,13 @@ heard of.
 - The collector starts before the recorded command and is reachable for as
   long as the recorder is capturing.
 - It stops when the recorder finalizes the trace: after the recorded command
-  has exited and its output has been drained. Requests already in flight
-  complete.
+  has exited and its output has been drained.
+- **Shutdown deadline.** Requests in flight at that moment get 2 seconds to
+  finish. A request still open after that, such as a detached descendant that
+  sent half a body and went to sleep, is dropped with its connection, and its
+  event is not stored. Finalization does not wait for it.
+- At any time, a request whose body stalls is given up on after 10 seconds
+  (`408`).
 - After that the port is closed. A late event from a process that outlived the
   recorded command gets a connection error and is lost. Nothing is queued or
   retried by the collector, and the port and token are not reused.

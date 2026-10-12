@@ -8,7 +8,16 @@ export interface RedactionStats {
   masked: number;
 }
 
-const containsSensitive = ['password', 'passwd', 'secret', 'authorization', 'cookie', 'apikey', 'privatekey', 'accesskey', 'credential'];
+/**
+ * The recorder's secret field names: `DEFAULT_REDACTED_FIELDS` in crates/premier-trace/src/lib.rs. Both
+ * lists are tested against crates/premier-trace/tests/fixtures/redaction-cases.json, so change them together.
+ */
+export const SECRET_FIELD_NAMES = [
+  'password', 'passwd', 'secret', 'clientsecret', 'apikey', 'accesstoken', 'refreshtoken', 'token',
+  'authorization', 'proxyauthorization', 'cookie', 'setcookie', 'secretaccesskey', 'privatekey',
+  'credential', 'credentials', 'bearer', 'auth', 'jwt', 'passphrase', 'secretkey', 'signingkey',
+  'privatekeypem', 'accesskey', 'accesskeyid'
+];
 
 function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -21,22 +30,24 @@ function isTokenKey(normalized: string): boolean {
 
 /**
  * Credential-bearing field names, compared after dropping case and punctuation so `apiKey`, `api_key`,
- * and `X-API-Key` are one name. Mirrors the recorder's rule: usage counters such as `input_tokens`
- * are evidence, not secrets.
+ * and `X-API-Key` are one name. The recorder's rule: a key is secret when it equals or ends with one of
+ * `SECRET_FIELD_NAMES`, so `db_password` matches while `input_tokens`, `author`, and `authority` do not.
  */
 export function isSensitiveKey(key: string): boolean {
   const normalized = normalizeKey(key);
-  return normalized === 'auth'
-    || isTokenKey(normalized)
-    || containsSensitive.some((name) => normalized.includes(name));
+  return SECRET_FIELD_NAMES.some((name) => normalized === name || normalized.endsWith(name));
 }
 
+// Value shapes follow the recorder's built-in patterns (`builtin_pattern_table` in premier-trace); the
+// key/value and cookie rules below are extra, viewer-only heuristics for free text.
+const privateKeyBlock = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
 // Anchored on `://` (no scheme prefix) so long unbroken text cannot trigger quadratic backtracking.
-const urlPassword = /(:\/\/[^\s:/@]+:)[^\s@/]+@/g;
-const keyValue = /(api[_-]?key|access[_-]?key(?:[_-]?id)?|private[_-]?key|secret|password|passwd|token|authorization|credentials?)((?:\\?["'])?\s*[=:]\s*)((?:bearer|basic)\s+)?(\\"[^"\\]*\\"|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;&"'}\]\\]+)/gi;
+const urlPassword = /(:\/\/[^\s:/@?#"'<>]*:)([^\s/@?#"'<>]+)@/g;
+const urlQuery = /((?:[?&]|&amp;)(?:access_token|refresh_token|id_token|auth_token|token|api[_-]?key|client_secret|secret|password|passwd|signature|sig|x-amz-signature|x-amz-security-token|x-goog-signature)=)([^&#\s"'<>\\]+)/gi;
+const keyValue = /(api[_-]?key|access[_-]?key(?:[_-]?id)?|private[_-]?key(?:[_-]?pem)?|secret[_-]?key|signing[_-]?key|secret|password|passwd|passphrase|token|jwt|authorization|credentials?)((?:\\?["'])?\s*[=:]\s*)((?:bearer|basic)\s+)?(\\"[^"\\]*\\"|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;&"'}\]\\]+)/gi;
 const cookieHeader = /((?:set-)?cookie\s*:\s*)[^\r\n"\\]+/gi;
-const bearer = /(bearer\s+)[a-z0-9._~+/=-]+/gi;
-const knownSecretShapes = /\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b/g;
+const bearer = /(\bbearer\s+)([A-Za-z0-9._~+/=-]{20,})/gi;
+const knownSecretShapes = /\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}\b|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/g;
 
 function maskedLiteral(value: string): string {
   if (value.startsWith('\\"')) return `\\"${TEXT_MARKER}\\"`;
@@ -49,7 +60,17 @@ function maskedLiteral(value: string): string {
 export function redactString(value: string, stats: RedactionStats = { masked: 0 }): string {
   const count = () => { stats.masked += 1; };
   return value
-    .replace(urlPassword, (_match, prefix: string) => { count(); return `${prefix}${TEXT_MARKER}@`; })
+    .replace(privateKeyBlock, () => { count(); return TEXT_MARKER; })
+    .replace(urlPassword, (match, prefix: string, secret: string) => {
+      if (secret.startsWith('[REDACTED')) return match;
+      count();
+      return `${prefix}${TEXT_MARKER}@`;
+    })
+    .replace(urlQuery, (match, prefix: string, secret: string) => {
+      if (secret.startsWith('[REDACTED')) return match;
+      count();
+      return `${prefix}${TEXT_MARKER}`;
+    })
     .replace(keyValue, (match, key: string, separator: string, scheme: string | undefined, secret: string) => {
       const bare = secret.replace(/^\\?["']|\\?["']$/g, '');
       if (bare.startsWith('[REDACTED') || bare === '') return match;
@@ -63,7 +84,12 @@ export function redactString(value: string, stats: RedactionStats = { masked: 0 
       count();
       return `${prefix}${TEXT_MARKER}`;
     })
-    .replace(bearer, (_match, prefix: string) => { count(); return `${prefix}${TEXT_MARKER}`; })
+    .replace(bearer, (match, prefix: string, secret: string) => {
+      // Like the recorder, require a digit so prose such as "bearer authentication" is left alone.
+      if (!/\d/.test(secret)) return match;
+      count();
+      return `${prefix}${TEXT_MARKER}`;
+    })
     .replace(knownSecretShapes, () => { count(); return TEXT_MARKER; });
 }
 

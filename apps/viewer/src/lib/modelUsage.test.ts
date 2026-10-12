@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { modelCallUsage, modelUsage } from './modelUsage';
 import type { TraceEvent } from './types';
+// The Claude adapter fixture as the recorder stores it; premier-cli's tests keep this file current.
+import claudeEvents from '../../../../crates/premier-cli/tests/fixtures/adapters/claude.normalized.json';
 
 function event(sequence: number, actor = 'researcher', payload: Record<string, unknown> = {}): TraceEvent {
   return {
@@ -60,5 +62,25 @@ describe('model usage evidence', () => {
   it('does not mistake run metadata that names a model for a model call', () => {
     const metadata = { ...event(0, 'coordinator', { model: 'frontier-large', goal: 'Run the trace' }), kind: 'session.start' };
     expect(modelCallUsage(metadata)).toBeNull();
+  });
+
+  it('totals the Claude adapter fixture once per message, with cache tokens', () => {
+    const events: TraceEvent[] = claudeEvents.map(({ payload, ...event }) => ({
+      ...event, trace_id: 'trace-claude', timestamp: '2026-03-04T10:15:00Z', payload_json: JSON.stringify(payload)
+    }));
+    // msg-2 arrives as a text line and a tool_use line that both repeat its usage.
+    const repeated = events.filter((event) => JSON.parse(event.payload_json).native?.message?.id === 'msg-2');
+    expect(repeated.map((event) => event.kind)).toEqual(['model.response', 'tool.invocation']);
+    expect(modelCallUsage(repeated[0])?.tokens).toEqual({ input: 12, output: 4, cacheRead: 6, cacheWrite: 20, reasoning: null, total: 42 });
+    expect(modelCallUsage(repeated[1])).toBeNull();
+
+    const usage = modelUsage(events);
+    const byActor = Object.fromEntries(usage.rollups.map((row) => [row.actor, row]));
+    expect(Object.keys(byActor).sort()).toEqual(['claude', 'claude:subagent:tool-3']);
+    expect(byActor.claude).toMatchObject({ model: 'claude-fixture', calls: 5, input: 158, output: 41, cacheRead: 10, cacheWrite: 20, total: 229 });
+    expect(byActor['claude:subagent:tool-3']).toMatchObject({ model: 'claude-fixture-small', calls: 2, input: 23, output: 14, total: 37 });
+    // The run summary repeats the per-message usage and is not added on top.
+    expect(usage.rollups.reduce((sum, row) => sum + row.total, 0)).toBe(266);
+    expect(usage.calls.some((call) => call.event.kind === 'agent.result')).toBe(false);
   });
 });

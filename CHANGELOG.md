@@ -8,9 +8,103 @@ integrations may depend on.
 
 ### Added
 
+- **Trace format version 2: event hash chain, manifest seal, optional
+  signature.** Every event names the hash of the event before it, and the
+  manifest carries a seal over all of its fields and the chain head.
+  `premier verify` checks both. A trace can also be signed with a local
+  Ed25519 key. An unsigned trace is only self-consistent: whoever can write to
+  it can rebuild the chain and the seal. See
+  [docs/trace-format.md](docs/trace-format.md) and
+  [docs/security.md](docs/security.md#what-verification-proves).
+- `premier keygen <path>` writes an Ed25519 private key (mode `0600`) and
+  `<path>.pub`, and prints the public key and its fingerprint.
+- `premier sign <trace> --sign-key <path>` signs or re-signs a finalized
+  trace that verifies.
+- `premier record --sign-key <path>` and `PREMIER_SIGN_KEY_FILE` sign a trace
+  when it is finalized. `PREMIER_SIGN_KEY_FILE` also applies to
+  `premier recover`, `premier claim`, and `premier encrypt`.
+- `premier verify --public-key <path-or-hex>` requires a valid signature by
+  that key.
+- `premier encrypt --sign-key <path>` re-signs the re-sealed trace. Without a
+  signing key, `encrypt` and `claim` drop an existing signature and print a
+  warning.
+- `premier export` output has a `source` block with the source trace's
+  format version, protection level, journal digest, chain head, seal digest,
+  signature, and signer.
+- Viewer API: `integrity_protection` (`digest_only`, `sealed`, `signed`) and
+  `integrity_signer` on every verified trace. The viewer labels a verified
+  trace `signed by <fingerprint>`, `unsigned, self-consistent only`, or
+  `unsigned, v1 digest only`.
+- **Global `--key-file <path>` option** on every subcommand, the flag form of
+  `PREMIER_TRACE_KEY_FILE`. The flag wins when both are set.
+- `premier list` shows an encrypted trace it cannot open, as
+  `[encrypted: key required]` or `[encrypted: <reason>]`, instead of skipping
+  it. The viewer API reports such a trace as `integrity: "locked"`, and the
+  viewer shows it as locked rather than damaged.
+- `premier record --redact-regex-multiline <regex>`: a redaction regex that
+  may match across line breaks, matched over a 16 KiB sliding window in
+  terminal output. The manifest records the rule count as
+  `redaction.terminal_multiline_regex_count`.
+- `PREMIER_REDACTION_IDLE_FLUSH_MS` sets how long a stream must be quiet
+  before output held for a redaction rule is stored (default 1000).
+- Viewer API: the event stream ends with one terminal event,
+  `trace.complete` or the new `trace.abandoned`, and accepts
+  `?after_sequence=<n>` to resume after events the client already has.
+- Viewer: events load in pages of 5,000 with a progress indicator, the live
+  stream resumes after the last loaded sequence, an open trace is reloaded
+  when its state changes (recovered, finalized, recording again), and a run
+  whose command could not be started is named as such.
+- Adapters: `parent_event_id` and `links` resolved to stored event ids;
+  synthesized `agent.spawn` and `agent.result` events for subagents, marked
+  `payload.synthesized: true`; `payload.lifecycle`, `payload.session_id`, and
+  `payload.native_timestamp`. See [docs/adapters.md](docs/adapters.md).
+- **Record-time redaction of structured shapes.** Secret names are now
+  recognised before the journal write in header-style pairs
+  (`{"name": "Authorization", "value": ...}`, `["Cookie", ...]`), in argument
+  lists inside payloads, and in JSON held inside a string, including each
+  JSON-object line of a multi-line string. `premier export` previously did
+  this for the exported copy only; it now shares the recorder's code and
+  repeats the pass for older traces.
+- More secret field names: `auth`, `jwt`, `passphrase`, `secret_key`,
+  `signing_key`, `private_key_pem`, `access_key`, and `access_key_id`. Names
+  match as a suffix, so `basic_auth` and `x-auth` are redacted while `author`
+  and `auth_method` are not.
+- Built-in value pattern `url-query-credentials`: the value of a URL query
+  parameter named `token`, `access_token`, `api_key`, `client_secret`,
+  `password`, `signature`, `X-Amz-Signature`, and similar.
+- Command-line redaction of `curl -u user:<password>` / `--user` /
+  `--proxy-user` (the user name is kept) and of `-p<password>` after `mysql`,
+  `mysqldump`, `mysqladmin`, `mysqlimport`, `mysqlshow`, `mysqlcheck`,
+  `mariadb`, or `mariadb-dump`.
+- The recorder always redacts the run's own `PREMIER_COLLECTOR_TOKEN` value
+  from everything it stores. The manifest names the rule in the new
+  `redaction.implicit_rules` (`["collector-token"]`).
+- `--redact-literal`, `--redact-regex`, and `--redact-regex-multiline` also
+  apply to the event fields outside the payload (`kind`, `source`,
+  `actor_id`, `actor_type`, `span_id`, `parent_span_id`, `correlation_id`,
+  `status`).
+- `--adapter auto` finds the agent behind `env`, `npx`, `bunx`, `pnpx`,
+  `pnpm dlx`, `yarn dlx`, and `sh -c` with one simple command.
+- `premier record --pty` prints a one-line note on stderr when `--adapter
+  auto` would have activated an adapter, since PTY capture records terminal
+  output only.
+- Adapters: `usage.input_tokens_details.cache_creation_tokens`;
+  `payload.usage_reported_on`; `agent.message` events with `payload.role:
+  "user"` for user lines; Codex `file_change` and `web_search` items as tool
+  events with `payload.paths` / `payload.query`, and `reasoning` items as
+  `model.response` with `payload.reasoning: true`; an `approval.decision`
+  with status `denied` and `payload.synthesized: true` for each entry of
+  Claude Code's `permission_denials` (it has no `approval.request`, so the
+  trace reports `missing_lifecycle_start` for it).
+- Viewer: the masked export uses the recorder's secret field names and masks
+  every built-in value pattern shape.
+- [docs/trace-format.md](docs/trace-format.md), a
+  [documentation index](docs/README.md), and
+  [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Built-in secret value patterns.** Values shaped like well-known
-  credentials (API keys, bearer credentials, URL passwords, private key
-  blocks, JWTs, GitHub, AWS, and Slack tokens) are redacted from structured
+  credentials (API keys, bearer credentials, URL passwords, credentials in a
+  URL query string, private key blocks, JWTs, GitHub, AWS, and Slack tokens)
+  are redacted from structured
   event payloads and the recorded command line by default.
   `premier record --no-default-secret-patterns` turns them off;
   `--redact-known-secrets` also applies them to stored terminal output. The
@@ -50,6 +144,103 @@ integrations may depend on.
 
 ### Changed
 
+- **Breaking: new traces are written in format version 2.** The manifest has
+  `format_version: 2` and a `seal`, and every event has a `prev_hash`. This
+  version reads and verifies version 1 traces (reported as `v1: digest
+  only`) and does not upgrade them. An older `premier` cannot read a version
+  2 trace.
+- **Breaking: `premier verify` output wording.** The success line no longer
+  starts with `verified <trace id>`. It starts with `verified: chain and seal
+  valid, signed by the supplied key <fingerprint>:` only for a signature by
+  the key given with `--public-key`, and otherwise with `consistent: chain
+  and seal valid, signed by an unknown key <fingerprint>:`, `consistent:
+  chain and seal valid, unsigned:`, or `consistent (v1: digest only):`,
+  followed by a `note:` line. A failed check is now reported as `Error:
+  invalid: <trace> failed verification` with the reason under `Caused by:`.
+  Scripts that match the old text need updating; the exit status is
+  unchanged (`0` on success, `1` on failure). `verify` now also fails for a
+  broken event chain or a manifest field edited after finalization.
+- **Breaking: the collector validates every field.** `kind`, `source`, and
+  `actor_type` accept only ASCII letters, digits, `.`, `_`, `:`, and `-`, up
+  to 128 bytes. `actor_id`, `span_id`, `parent_span_id`, `correlation_id`,
+  `status`, `parent_event_id`, and each `links` entry accept up to 256 bytes
+  and no control characters. An empty `kind` or `source` is rejected. Events
+  that were stored before are now rejected with `400`. See
+  [docs/collector.md](docs/collector.md#field-rules).
+- **Breaking: collector status codes.** A body over 2 MiB is rejected with
+  `413` (was `400`). An empty or blank `kind` is rejected with `400` (was
+  `500`). A body that does not arrive within 10 seconds is rejected with the
+  new `408`.
+- **Breaking: collector event timestamps are always the recorder's receipt
+  time.** A `timestamp` sent by the producer no longer becomes the event's
+  timestamp. It is kept as `payload.producer_timestamp`, must be RFC 3339
+  (`400` otherwise), and requires the payload to be an object or absent
+  (`400` otherwise). The collector's response now includes `prev_hash`.
+- **Breaking: adapter event kinds.** Session start and turn start lines are
+  `agent.turn` with `payload.lifecycle` (`session_start`, `turn_start`). A
+  provider's final result line (`result`, `turn.completed`, `turn.failed`) is
+  `agent.result` with `payload.lifecycle: "run_result"` and the run's usage
+  and cost. Lines whose type names a `turn` are `agent.turn` /
+  `agent.result`; they were `model.request` / `model.response`, so a Codex
+  `turn.completed` moves from `model.response` to `agent.result`. OpenCode
+  `text` parts are `model.response`.
+  Classification matches whole words, so a type such as `pending` no longer
+  counts as completed because it contains `end`. Session-level events use the
+  session id as their `correlation_id`. Queries, diffs, and dashboards keyed
+  on the old kinds need updating.
+- **Breaking: adapter user lines and narrated tool calls.** A provider line
+  whose role is `user` is an `agent.message` (it was a `model.response`),
+  unless it carries tool results. An assistant message with both text and
+  tool calls is a `model.response` followed by one tool event per call; the
+  first call used to stand for the whole line.
+- **Breaking: adapter usage.** `usage.total_tokens`, when the provider does
+  not state a total, now also counts cache tokens the provider reports apart
+  from input (Claude `cache_read_input_tokens` and
+  `cache_creation_input_tokens`, OpenCode `cache.read` and `cache.write`).
+  When a provider repeats one message's usage on several lines, only the
+  first event carries `payload.usage`; the others carry
+  `payload.usage_reported_on`. Sums over `payload.usage` change accordingly.
+- **Breaking: a refused tool result has status `denied`.** An adapter
+  `tool.result` whose provider status is `denied` or `rejected` was `error`.
+  `declined` and `blocked` are now read as refusals too.
+- `--adapter auto` ignores arguments after the command's own `--`, so
+  `codex exec -- --json` is not treated as structured output.
+- **Breaking: `premier query` prints an event without an actor as `-`**, not
+  `root`.
+- **Breaking: text output escapes control characters.** `verify`, `query`,
+  `diff`, and `list` print control characters and invisible Unicode format
+  characters in recorded text as escapes. JSON output is unchanged.
+- **Breaking: `premier replay` caps a recorded gap at 10 seconds** (before
+  `--speed` is applied).
+- **Breaking: an encrypted trace without a key reports a different error:**
+  `encrypted trace requires --key-file or PREMIER_TRACE_KEY_FILE`.
+- **Breaking: the recorder lease format is `<pid> start=<n>`** (process id
+  and process start time) where the platform reports a start time. A lease
+  holding only a process id is still read. `premier recover` now refuses a
+  suspended recorder however stale its lease is, and treats a reused process
+  id as a dead recorder at once.
+- `verify`, `query`, `export`, `diff`, `replay`, and `list` end quietly when
+  their output pipe is closed (shell status `141`) instead of failing with a
+  broken-pipe error.
+- `premier export --output` creates the file with mode `0600`, and `export`
+  warns on stderr that the export of an encrypted trace is plaintext.
+- `premier record` no longer waits for collector clients when the command
+  has exited: requests in flight get 2 seconds, then their connections are
+  dropped.
+- `premier recover` refuses an active journal whose event chain is broken and
+  seals the recovered trace with `seal.recovered: true`. After a
+  `recover --force` underneath a running recorder, that recorder no longer
+  writes its lease back beside the finalized trace.
+- The local assistant marks Codex unavailable unless `codex features list`,
+  run with the assistant's overrides, reports `shell_tool` and
+  `unified_exec` as `false`.
+- Viewer API: the recover hint for an abandoned trace names the trace
+  directory only, not its path on the server. A lookup against a missing
+  trace directory answers `404`, and an unreadable one answers `500` with a
+  fixed message, instead of a `500` that named the path.
+- Adapter events take `duration_ms` from `stats.duration_ms` as well.
+- The adapter fixtures are fuller, and their README states that they are
+  hand-written, not captured from real runs.
 - **Breaking: `query`, `export`, `diff`, and `replay` refuse a finalized trace
   that fails verification.** They exit `1` and name the failure. Pass
   `--allow-unverified` to read it anyway. A trace that is still being
@@ -111,6 +302,17 @@ integrations may depend on.
 
 ### Fixed
 
+- A collector client that left a request half-sent could keep `premier
+  record` from finalizing its trace.
+- `premier replay` slept for the full length of any recorded gap, however
+  long.
+- `query`, `list`, and the other evidence commands failed with a broken-pipe
+  error when piped into a command that exits early, such as `head`.
+- A recorder that was suspended for more than 300 seconds was reported as
+  abandoned and could be recovered underneath itself.
+- The viewer's event stream for an abandoned trace never ended.
+- Viewer: opening a very large trace waited for the whole journal before
+  showing anything.
 - A terminal Ctrl-C was delivered to the recorded command twice.
 - Secrets split across output chunks, or straddling the read buffer, escaped
   `--redact-literal` and `--redact-regex`.
@@ -133,6 +335,20 @@ integrations may depend on.
 
 ### Security
 
+- An edit to a manifest field, or to the order or content of events, now
+  fails `premier verify`. Detecting a deliberate rewrite still requires a
+  signature checked against a key the verifier trusts.
+- The collector rejects look-alike names (Unicode inside `kind`, `source`, or
+  `actor_type`) and control characters in identity fields, and a producer can
+  no longer back-date or forward-date an event.
+- Recorded text can no longer send escape sequences to the terminal or forge
+  output lines through the CLI's text output.
+- Exports are created owner-only, and exporting an encrypted trace warns that
+  the result is plaintext.
+- The viewer API no longer reveals the server-side path of the trace
+  directory.
+- Codex is not offered as a local assistant when its command-execution
+  features cannot be confirmed off.
 - The viewer server refuses requests whose `Host` is not a loopback name when
   no credentials are configured (DNS rebinding), and refuses cross-origin
   requests to its API.
@@ -140,6 +356,11 @@ integrations may depend on.
   output, or adapter events through the collector.
 - Secret-named flags, assignments, and headers on the recorded command line
   are redacted in the manifest and in `session.start`.
+- A recorded command that prints its environment no longer leaves the
+  collector token in the trace.
+- Credentials in header-style pairs, argument lists, and JSON strings inside
+  event payloads, and in URL query strings, are redacted when recorded
+  rather than only when exported.
 - Assistant answers are sanitized before the viewer renders them as Markdown.
 - The local assistant is confined and capped, and can be disabled.
 - The collector token is not sent through an HTTP proxy for a loopback

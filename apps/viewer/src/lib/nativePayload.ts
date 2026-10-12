@@ -141,8 +141,18 @@ export function nativeUsage(payload: Fields, perCallOnly = false): Fields | null
   return null;
 }
 
+/**
+ * True when this event's usage is already attached to an earlier event of the same provider message
+ * (`payload.usage_reported_on` names that message). The copy the provider repeated under `native` is
+ * evidence, not a second call.
+ */
+export function usageReportedElsewhere(payload: Fields): boolean {
+  return text(payload.usage_reported_on) !== null && record(payload.usage) === null;
+}
+
 /** Usage block for this event: `payload.usage`, then the provider object. */
 export function payloadUsage(payload: Fields, perCallOnly = false): Fields | null {
+  if (usageReportedElsewhere(payload)) return null;
   return record(payload.usage) ?? nativeUsage(payload, perCallOnly);
 }
 

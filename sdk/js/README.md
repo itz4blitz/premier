@@ -63,15 +63,20 @@ The `isPremierActive()` guard is optional. Every call is a no-op that returns
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `kind` | `string` | Required. |
-| `source` | `string` | Defaults to `"premier-sdk"`. |
-| `actor_id`, `actor_type` | `string` | |
-| `status` | `string` | |
-| `parent_event_id`, `span_id`, `parent_span_id`, `correlation_id` | `string` | Causality. |
-| `links` | `string[]` | |
+| `kind` | `string` | Required. ASCII letters, digits, `.`, `_`, `:`, `-`; at most 128 bytes. |
+| `source` | `string` | Defaults to `"premier-sdk"`. Same character rule as `kind`. |
+| `actor_id`, `actor_type` | `string` | `actor_type` follows the `kind` rule. `actor_id` is free text: at most 256 bytes, no control characters. |
+| `status` | `string` | Free text, as `actor_id`. |
+| `parent_event_id`, `span_id`, `parent_span_id`, `correlation_id` | `string` | Causality. Free text, as `actor_id`. |
+| `links` | `string[]` | Each entry is free text, as `actor_id`. |
 | `duration_ms` | `number` | Rounded to the nearest integer and clamped to zero or above, because the collector stores an unsigned integer. A non-finite value is dropped. |
 | `payload` | `Record<string, unknown>` | |
-| `timestamp` | `string` | RFC 3339 producer time, stored verbatim. When omitted the collector records its own receipt time. |
+| `timestamp` | `string` | RFC 3339 producer time. It does not set the stored event's `timestamp`, which is always the recorder's receipt time; the local recorder keeps your value as `payload.producer_timestamp`. A value that is not RFC 3339 is rejected with `400`. |
+
+The character and length rules are enforced by the local collector, not by
+the SDK: an event that breaks one is rejected with `400`, which `emit` reports
+like any other delivery failure. The full rules are in
+[docs/collector.md](../../docs/collector.md#field-rules).
 
 The SDK adds `trace_id` (from `PREMIER_TRACE_ID`) and a `run` object (from
 `PREMIER_RUN_NAME`, `PREMIER_REPOSITORY`, `PREMIER_BRANCH`,
@@ -79,7 +84,8 @@ The SDK adds `trace_id` (from `PREMIER_TRACE_ID`) and a `run` object (from
 collector started by `premier record` ignores both.
 
 `emit` resolves to the event as the collector stored it, including the
-`event_id` and `sequence` it assigned, or to `null` when nothing was stored.
+`event_id`, `sequence`, and receipt `timestamp` it assigned, or to `null` when
+nothing was stored.
 
 ### Options
 
@@ -117,7 +123,8 @@ Close what you open: `spawn` with `result`, `delegation` with `join`, and
 `emit` directly for any other kind.
 
 `extra` is a partial event. It overrides the default `actor_type` and `status`
-and carries the causality fields, `source`, `duration_ms`, and `timestamp`.
+and carries the causality fields, `source`, `duration_ms`, and `timestamp`
+(the producer time, kept as `payload.producer_timestamp`).
 
 **Precedence.** A helper builds its event in this order, later entries
 winning:
@@ -184,8 +191,9 @@ Telemetry never crashes or stalls your agent. `emit` and every helper resolve
 to `null`, without throwing, when:
 
 - Premier is not recording (the collector env is absent);
-- the collector is unreachable or rejects the event (`400`, `401`, `422`,
-  `500`, …);
+- the collector is unreachable or rejects the event (`400` for an invalid
+  field, `401`, `408`, `413` for a body over 2 MiB, `422` for a reserved kind
+  or source, `500`, …);
 - the collector does not answer within `timeoutMs` (default 5000 ms);
 - `signal` is aborted.
 

@@ -16,7 +16,7 @@ the vocabulary the viewer and the validator understand.
 | `event_id` | recorder | Unique id of this event. |
 | `trace_id` | recorder | The trace it belongs to. |
 | `sequence` | recorder | Position in the journal, starting at 1 with no gaps. |
-| `timestamp` | producer or recorder | RFC 3339. The producer's value if it sent one, otherwise the time the recorder received the event. |
+| `timestamp` | recorder | RFC 3339. Always the time the recorder wrote the event: the receipt time for collector events, the time the line was read for adapter events. A producer's own time is kept in the payload instead, as `producer_timestamp` (collector) or `native_timestamp` (adapters). |
 | `kind` | producer | What happened, for example `tool.result`. |
 | `source` | producer | Which producer wrote it. |
 | `actor_id`, `actor_type` | producer | Who did it. |
@@ -24,6 +24,11 @@ the vocabulary the viewer and the validator understand.
 | `duration_ms` | producer | How long it took, when known. |
 | `parent_event_id`, `span_id`, `parent_span_id`, `correlation_id`, `links` | producer | [Causality](#causality-fields). |
 | `payload_json` | producer | The payload, stored as a JSON string. |
+| `prev_hash` | recorder | Format version 2: the hash of the previous event, which chains the journal. See [trace-format.md](trace-format.md#event-hash-chain). |
+
+Events that arrive through the collector are validated field by field
+(allowed characters and lengths); see
+[collector.md](collector.md#field-rules).
 
 ## Kinds the recorder writes
 
@@ -74,10 +79,14 @@ Native adapters (see [adapters.md](adapters.md)) write these with source
 
 | Kind | Meaning |
 | --- | --- |
-| `agent.turn` / `agent.result` | A session, thread, agent, or step event; `agent.result` when the provider marks it complete. |
-| `model.request` / `model.response` | A model or turn event; `model.response` for assistant messages and completed turns. |
-| `tool.invocation` / `tool.result` | A tool call and its outcome. |
+| `agent.turn` | The start of a session (`payload.lifecycle: "session_start"`) or of a turn (`"turn_start"`), and any other session, thread, agent, step, or turn line that is not complete. |
+| `agent.result` | The final result of a run or turn (`payload.lifecycle: "run_result"`), with `payload.usage` and cost when the provider prints them, and any other session, thread, agent, step, or turn line the provider marks complete. |
+| `agent.spawn` / `agent.result` with `payload.synthesized: true` | The start and end of a subagent. No provider line states them; the adapter infers them and marks them. See [adapters.md](adapters.md#spans-and-subagents). |
+| `model.request` / `model.response` | A model event; `model.response` for assistant and message lines, OpenCode `text` parts, Codex `reasoning` items (`payload.reasoning: true`), completed model events, and an assistant message that has both text and tool calls (its tool calls follow as events of their own). `payload.usage` is attached to the first event of a provider message; later events of that message carry `payload.usage_reported_on` instead. |
+| `agent.message` | A line spoken by the user rather than the model (`role`, or `message.role`, is `user`), with status `ok` and `payload.role: "user"`. A user line that carries tool results is a `tool.result` instead. |
+| `tool.invocation` / `tool.result` | A tool call and its outcome, including Codex `file_change` and `web_search` items. A result the provider marks `denied`, `rejected`, `declined`, or `blocked` has status `denied`; other failures have status `error`. |
 | `approval.request` / `approval.decision` | A permission or approval event and its outcome. |
+| `approval.decision` with `payload.synthesized: true` | One per entry of Claude Code's `permission_denials`, status `denied`. No `approval.request` precedes it, so the trace gets a `missing_lifecycle_start` diagnostic for it. See [adapters.md](adapters.md#approvals). |
 | `provider.event` | A provider line that fits none of the above. |
 | `adapter.diagnostic` | A line the adapter could not use (malformed, not an object, or too large). Status `warning`. Payload: `provider`, `adapter_schema_version`, `line`, `message`, and `line_bytes` for oversized lines. |
 
@@ -114,13 +123,18 @@ approval if it should be counted and surfaced as a failure.
 
 When `actor_type` is empty or anything else, the viewer treats the actor as a
 process if its `actor_id` is empty or `root`, or the kind starts with
-`process.`, and as an agent otherwise. An empty `actor_id` is shown as `root`.
+`process.`, and as an agent otherwise. The viewer groups an empty `actor_id`
+under `root`. `premier query` prints it as `-`, because an event without an
+actor is unattributed, not the root process.
 
 ## Causality fields
 
 All five are optional strings (or, for `links`, a list of strings) chosen by
 the producer. Premier does not generate them, apart from the recorder's own
-`session` and `command` spans and the ids adapters take from the provider.
+`session` and `command` spans and what the native adapters derive: spans and
+correlation ids taken from the provider, and `parent_event_id` and `links`
+resolved to the ids of events the adapter stored earlier (see
+[adapters.md](adapters.md#parents-and-links)).
 
 | Field | Meaning | How the viewer uses it |
 | --- | --- | --- |
@@ -135,8 +149,9 @@ Notes:
 - A `parent_event_id` must name an event that was recorded earlier. A
   reference to a later or unknown event is reported as `unknown_parent_event`.
 - If you only track spans, set `span_id` and `parent_span_id` and leave
-  `parent_event_id` empty. `premier emit --span/--parent-span` and the native
-  adapters work this way.
+  `parent_event_id` empty. `premier emit --span/--parent-span` works this
+  way. The native adapters set spans and, where an earlier stored event is
+  the cause, `parent_event_id` as well.
 - The viewer's search box matches `event_id`, `span_id`, `parent_span_id`, and
   `correlation_id` as well as kind, source, actor, status, and payload text.
 - `premier diff` ignores all of these fields.
@@ -150,7 +165,8 @@ the viewer lists them under missing evidence. Every diagnostic has severity
 refers to.
 
 Diagnostics describe gaps in what producers recorded. They never make a trace
-fail verification.
+fail verification. They are part of the manifest, so in a format version 2
+trace they are covered by the manifest seal.
 
 ### What is checked
 
@@ -184,7 +200,9 @@ fail verification.
 `model.response` and `tool.result` may stand alone because producers also
 record them as self-contained calls, and an agent's `spawn` or `turn` may stay
 open or be closed by an `agent.join`. `tool.execution`, `tool.error`, and
-`agent.message` are single events with no pair.
+`agent.message` are single events with no pair. `agent.message` is used both
+for a message between agents (the SDK's `premier.message`) and, by the native
+adapters, for a provider line spoken by the user (`payload.role: "user"`).
 
 A finish is matched to a start like this:
 

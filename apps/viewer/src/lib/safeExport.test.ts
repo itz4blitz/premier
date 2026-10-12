@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { buildSafeExport, isSensitiveKey, redactString, safeExportValue } from './safeExport';
+import { buildSafeExport, isSensitiveKey, redactString, safeExportValue, SECRET_FIELD_NAMES } from './safeExport';
 import type { TraceEvent, TraceManifest } from './types';
+// The same file the recorder's rules are tested against (crates/premier-trace/tests/redaction_fixture.rs).
+import redactionCases from '../../../../crates/premier-trace/tests/fixtures/redaction-cases.json';
 
 const manifest: TraceManifest = {
   format_version: 1, trace_id: 'trace-1', name: 'Export', command: ['agent'],
@@ -148,5 +150,26 @@ describe('buildSafeExport', () => {
       expect(label).toMatch(/no known secret patterns found/i);
     }
     expect(buildSafeExport(manifest, []).label).toMatch(/verified source/i);
+  });
+});
+
+describe('shared redaction fixture', () => {
+  it('uses the recorder secret field names', () => {
+    expect(SECRET_FIELD_NAMES).toEqual(redactionCases.default_redacted_fields);
+    for (const name of redactionCases.secret_field_names) expect(isSensitiveKey(name), name).toBe(true);
+    for (const name of redactionCases.ordinary_field_names) expect(isSensitiveKey(name), name).toBe(false);
+  });
+
+  it('masks every secret value shape the recorder redacts and nothing else around it', () => {
+    for (const { pattern, before, secret, after } of redactionCases.secret_values) {
+      // Joined here so the fixture never holds a credential-shaped string.
+      const text = `${before}${secret.join('')}${after}`;
+      expect(redactString(text), `${pattern}: ${before}`).toBe(`${before}[REDACTED]${after}`);
+      expect(safeExportValue({ note: text }), pattern).toEqual({ note: `${before}[REDACTED]${after}` });
+    }
+  });
+
+  it('leaves the ordinary values the recorder leaves alone', () => {
+    for (const text of redactionCases.ordinary_values) expect(redactString(text), text).toBe(text);
   });
 });

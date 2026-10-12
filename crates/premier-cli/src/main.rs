@@ -1534,6 +1534,15 @@ async fn record(options: RecordOptions) -> Result<()> {
         )
     }
     let native_provider = adapter.resolve(executable, &command[1..], pty);
+    if pty
+        && adapter == AdapterChoice::Auto
+        && let Some(provider) = adapter.detect(executable, &command[1..])
+    {
+        eprintln!(
+            "premier: structured capture for {} is unavailable in PTY mode; recording terminal output only (omit --pty for model and tool events)",
+            provider.id()
+        );
+    }
     let output = output.unwrap_or_else(|| {
         let id = uuid_like_timestamp();
         PathBuf::from(format!(".premier/traces/{id}.atrace"))
@@ -1542,12 +1551,15 @@ async fn record(options: RecordOptions) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // The child receives this token in its environment and may print it
+    // (`env`), so the recorder redacts it from everything it stores.
+    let collector_token = uuid::Uuid::now_v7().to_string();
     let mut trace_writer = TraceWriter::create_named_for_tenant_with_redaction(
         &output,
         command.clone(),
         name,
         &tenant,
-        redaction,
+        redaction.implicit_literal("collector-token", &collector_token),
     )?;
     if let Some(key) = sign_key {
         trace_writer.set_signing_key(key);
@@ -1567,7 +1579,6 @@ async fn record(options: RecordOptions) -> Result<()> {
     let writer = Arc::new(Mutex::new(trace_writer));
     let recorder_lease = RecorderLease::start(&output)?;
     let trace_id = writer.lock().unwrap().trace_id().to_owned();
-    let collector_token = uuid::Uuid::now_v7().to_string();
     let collector_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     collector_listener.set_nonblocking(true)?;
     let collector_address = collector_listener.local_addr()?;

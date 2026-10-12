@@ -17,7 +17,7 @@ A trace is a directory, conventionally named `<name>.atrace`:
 | `manifest.json` | always | Trace metadata, journal digest, seal. Replaced atomically. |
 | `events/active.events.pb` | while recording | Uncompressed frame stream, appended to. |
 | `events/000001.events.pb.zst` | once finalized | The same frame stream, zstd-compressed. |
-| `recorder.lease` | while recording | Recorder process id, rewritten as a heartbeat. |
+| `recorder.lease` | while recording | `<pid> start=<n>`: the recorder's process id and process start time (the id alone where the platform cannot report a start time), rewritten every 2 seconds as a heartbeat. See [cli.md](cli.md#abandoned-traces-and-recover). |
 | `blobs/sha256/`, `indexes/` | always | Reserved, empty. |
 
 Directories are created `0700` and files `0600`. A trace is *finalized* when
@@ -99,7 +99,7 @@ first event whose `prev_hash` is not the hash of its predecessor.
 | `started_at`, `ended_at` | RFC 3339, UTC |
 | `exit_code`, `termination` | |
 | `journal` | `{ path, sha256, event_count }`; `sha256` is of the compressed journal file |
-| `diagnostics`, `capabilities`, `redaction`, `adapter` | |
+| `diagnostics`, `capabilities`, `redaction`, `adapter` | `redaction` records which rules were active, including `implicit_rules` (the recorder's own, such as `collector-token`) and `builtin_patterns`; see [redaction.md](redaction.md#redaction-provenance-in-the-manifest). |
 | `seal` | see below; present once finalized |
 | `encryption` | `{ algorithm, key_id, private_manifest }`, encrypted traces only |
 
@@ -147,8 +147,10 @@ The digest is computed over the manifest as parsed, so formatting of
 not covered. Parsing normalizes a few fields before they are hashed: a missing
 `tenant_id` is `"local"`, a missing `capabilities` is `[]`, missing
 `redaction.terminal_literal_count` and `terminal_regex_count` are `0`; and
-`diagnostics` and `redaction.custom_fields` are omitted when empty, as is
-`seal.recovered` when false. Every other field is hashed as stored.
+`diagnostics`, `redaction.custom_fields`, `redaction.implicit_rules`, and
+`redaction.builtin_patterns` are omitted when empty, as are
+`redaction.terminal_multiline_regex_count` when zero and `seal.recovered`
+when false. Every other field is hashed as stored.
 
 ### Signature
 
@@ -191,7 +193,7 @@ signature names the signer.
 The chain, seal and signature are computed exactly as for a plaintext trace,
 over the decrypted events and the decrypted manifest. Verifying, signing or
 checking a signature on an encrypted trace therefore needs the encryption key
-(`PREMIER_TRACE_KEY_FILE`).
+(`--key-file` or `PREMIER_TRACE_KEY_FILE`).
 
 ## Verification
 
@@ -207,7 +209,8 @@ checking a signature on an encrypted trace therefore needs the encryption key
 7. the signature, when present;
 8. with `--public-key`, that the signer is that key.
 
-It exits non-zero with `invalid` and the failed check, or zero with one of:
+It exits non-zero with `Error: invalid: <trace> failed verification` and the
+failed check, or zero with a first line that begins with one of:
 
 | Output | Meaning |
 | --- | --- |
@@ -216,13 +219,18 @@ It exits non-zero with `invalid` and the failed check, or zero with one of:
 | `consistent: ... unsigned` | Checks 1 to 6 pass. |
 | `consistent (v1: digest only)` | Version 1: checks 1 to 4 only. |
 
-With `--public-key`, an unsigned trace, a version 1 trace and a trace signed by
-any other key are all failures.
+Every outcome except the first is followed by a `note:` line stating its
+limit. With `--public-key`, an unsigned trace, a version 1 trace and a trace
+signed by any other key are all failures. The full output is shown in
+[cli.md](cli.md#verify).
 
 The viewer API reports the same thing per trace as `integrity`
-(`live`, `verified`, `invalid`), `integrity_protection` (`digest_only`,
-`sealed`, `signed`) and `integrity_signer` (the fingerprint). The server has no
-list of trusted keys, so `signed` there means "signed by the key in the trace".
+(`live`, `abandoned`, `verified`, `invalid`, `locked`), `integrity_protection`
+(`digest_only`, `sealed`, `signed`; present only for `verified`) and
+`integrity_signer` (the fingerprint). `locked` is an encrypted trace the
+server has no usable key for. The server has no list of trusted keys, so
+`signed` there means "signed by the key in the trace". See
+[cli.md](cli.md#the-viewer-api).
 
 ## Operations that rewrite a trace
 

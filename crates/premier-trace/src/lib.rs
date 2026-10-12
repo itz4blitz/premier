@@ -2,6 +2,7 @@ mod crypto;
 mod integrity;
 mod output;
 mod seal;
+mod structured;
 mod utf8;
 
 pub use crypto::{EncryptionKey, KEY_FILE_ENV, key_file_configured, set_key_file};
@@ -11,6 +12,7 @@ pub use seal::{
     ManifestSeal, ManifestSignature, Protection, PublicKey, SIGN_KEY_FILE_ENV, SealStatus,
     SigningKey, verify_tamper_evidence,
 };
+pub use structured::{RedactionCounts, SecretRedactor};
 pub use utf8::{decode_utf8_chunk, finish_utf8};
 
 use anyhow::{Context, Result, bail};
@@ -308,6 +310,11 @@ pub struct RedactionProvenance {
     /// Rules given with `--redact-regex-multiline`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub terminal_multiline_regex_count: usize,
+    /// Names of literal rules the recorder added by itself, such as
+    /// `collector-token`. They are not counted in `terminal_literal_count`,
+    /// and their values are never stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implicit_rules: Vec<String>,
     /// Names of the built-in secret value patterns that were active (see
     /// [`builtin_secret_pattern_names`]). Empty when they were switched off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -389,6 +396,21 @@ fn builtin_pattern_table() -> Vec<SecretPatternSource> {
         (
             "url-credentials",
             r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@?#"'<>]*:([^\s/@?#"'<>]+)@"#.into(),
+            1,
+            any_candidate,
+        ),
+        (
+            // A credential in a URL query string. The name must directly
+            // follow `?` or `&` and be followed by `=`, so prose and other
+            // parameters (`max_tokens=`, `token_count=`) are left alone.
+            "url-query-credentials",
+            concat!(
+                r"(?i)(?:[?&]|&amp;)(?:access_token|refresh_token|id_token|auth_token|token",
+                r"|api[_-]?key|client_secret|secret|password|passwd|signature|sig",
+                r"|x-amz-signature|x-amz-security-token|x-goog-signature)",
+                r#"=([^&#\s"'<>\\]+)"#
+            )
+            .into(),
             1,
             any_candidate,
         ),
@@ -534,13 +556,24 @@ pub const DEFAULT_REDACTED_FIELDS: &[&str] = &[
     "credential",
     "credentials",
     "bearer",
+    "auth",
+    "jwt",
+    "passphrase",
+    "secretkey",
+    "signingkey",
+    "privatekeypem",
+    "accesskey",
+    "accesskeyid",
 ];
 
 #[derive(Clone, Debug)]
 pub struct RedactionConfig {
     fields: HashSet<String>,
     custom_fields: Vec<String>,
+    /// Literal rules: the user's, then the recorder's implicit ones.
     terminal_literals: Vec<String>,
+    /// Names of the implicit literal rules at the end of `terminal_literals`.
+    implicit_rules: Vec<String>,
     terminal_regexes: Vec<regex::Regex>,
     /// Regex rules that may match across line breaks (opt-in).
     terminal_multiline_regexes: Vec<regex::Regex>,
@@ -603,6 +636,7 @@ impl RedactionConfig {
             fields,
             custom_fields,
             terminal_literals,
+            implicit_rules: Vec::new(),
             terminal_regexes,
             terminal_multiline_regexes: Vec::new(),
             structured_patterns: true,
@@ -629,6 +663,19 @@ impl RedactionConfig {
         Ok(self)
     }
 
+    /// Add a literal the recorder itself knows to be secret for this run,
+    /// such as the collector token it injects into the child's environment.
+    /// It is redacted everywhere a `--redact-literal` value is, but it is not
+    /// a user rule: provenance lists it by `name` only, and it does not by
+    /// itself mark the trace as having terminal redaction configured.
+    pub fn implicit_literal(mut self, name: &str, value: &str) -> Self {
+        if !value.is_empty() {
+            self.terminal_literals.push(value.to_owned());
+            self.implicit_rules.push(name.to_owned());
+        }
+        self
+    }
+
     /// Whether the built-in secret value patterns (see
     /// [`builtin_secret_pattern_names`]) apply to structured payload strings
     /// and the recorded command line. On by default.
@@ -650,9 +697,10 @@ impl RedactionConfig {
         RedactionProvenance {
             structured_defaults: true,
             custom_fields: self.custom_fields.clone(),
-            terminal_literal_count: self.terminal_literals.len(),
+            terminal_literal_count: self.terminal_literals.len() - self.implicit_rules.len(),
             terminal_regex_count: self.terminal_regexes.len(),
             terminal_multiline_regex_count: self.terminal_multiline_regexes.len(),
+            implicit_rules: self.implicit_rules.clone(),
             builtin_patterns: if builtin {
                 builtin_secret_pattern_names()
                     .into_iter()
@@ -672,9 +720,13 @@ impl RedactionConfig {
             || !self.terminal_multiline_regexes.is_empty()
     }
 
-    /// Whether any rule can rewrite captured terminal text.
+    /// Whether a rule the user configured can rewrite captured terminal text.
+    /// The recorder's implicit literals do not count.
     fn redacts_terminal(&self) -> bool {
-        self.has_text_rules() || self.terminal_patterns
+        self.terminal_literals.len() > self.implicit_rules.len()
+            || !self.terminal_regexes.is_empty()
+            || !self.terminal_multiline_regexes.is_empty()
+            || self.terminal_patterns
     }
 
     fn redact_text(&self, text: &str) -> String {
@@ -748,18 +800,27 @@ impl RedactionConfig {
     /// `native_stdout` marks a trace whose stdout is also normalized by a
     /// native adapter, so its raw JSON lines carry the same structured fields.
     fn redact_event(&self, kind: &str, payload: &mut serde_json::Value, native_stdout: bool) {
-        redact_structured_fields(payload, &self.fields);
+        // Captured terminal text is raw unless the user opted in, so it is
+        // not read as structured data here.
+        let terminal_text = is_terminal_kind(kind)
+            .then(|| payload.as_object_mut()?.remove("text"))
+            .flatten();
+        SecretRedactor::with_fields(&self.fields).redact(payload);
         if kind == "session.start"
             && let Some(command) = payload.get("command").and_then(string_items)
         {
             payload["command"] = serde_json::json!(self.redact_command(&command));
         }
-        if native_stdout
-            && kind == "process.stdout"
-            && let Some(text) = payload.get("text").and_then(serde_json::Value::as_str)
-            && let Some(redacted) = self.redact_structured_lines(text)
-        {
-            payload["text"] = serde_json::Value::String(redacted);
+        if let Some(mut text) = terminal_text {
+            if native_stdout
+                && kind == "process.stdout"
+                && let Some(redacted) = text
+                    .as_str()
+                    .and_then(|text| self.redact_structured_lines(text))
+            {
+                text = serde_json::Value::String(redacted);
+            }
+            payload["text"] = text;
         }
         // Captured terminal text is raw unless the user opted in.
         let patterns = if is_terminal_kind(kind) {
@@ -773,8 +834,31 @@ impl RedactionConfig {
         }
     }
 
+    /// Apply the literal and regex rules to the event fields outside the
+    /// payload. Fields no rule matches are stored as given.
+    fn redact_envelope(&self, input: &mut EventInput) {
+        if !self.has_text_rules() {
+            return;
+        }
+        for field in [
+            &mut input.kind,
+            &mut input.source,
+            &mut input.actor_id,
+            &mut input.actor_type,
+            &mut input.span_id,
+            &mut input.parent_span_id,
+            &mut input.correlation_id,
+            &mut input.status,
+        ] {
+            if !field.is_empty() {
+                *field = self.redact_text(field);
+            }
+        }
+    }
+
     /// Redact the JSON-object lines of raw terminal text the way the same
-    /// objects are redacted as structured payloads: secret fields, plus the
+    /// objects are redacted as structured payloads: secret fields (including
+    /// header pairs, argument lists and nested JSON strings), plus the
     /// built-in secret value patterns. Lines that are not JSON objects, or
     /// need no redaction, keep their exact bytes; `None` means nothing changed.
     fn redact_structured_lines(&self, text: &str) -> Option<String> {
@@ -789,7 +873,7 @@ impl RedactionConfig {
                 .flatten()
                 .and_then(|original| {
                     let mut value = original.clone();
-                    redact_structured_fields(&mut value, &self.fields);
+                    SecretRedactor::with_fields(&self.fields).redact(&mut value);
                     self.redact_strings(&mut value, false, self.structured_patterns);
                     (value != original).then(|| value.to_string())
                 });
@@ -838,15 +922,71 @@ pub fn redact_command_secrets(command: &[String]) -> Vec<String> {
     redact_command_fields(command, &is_secret_field_name)
 }
 
+/// Lowercase file name of a command word, without directories or `.exe`.
+fn program_name(argument: &str) -> String {
+    let name = argument.rsplit(['/', '\\']).next().unwrap_or(argument);
+    let name = name.to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_owned()
+}
+
+/// Client programs whose `-p<value>` is a password glued to the flag. For
+/// most other tools `-p` means a port, a pid, a path or a flag cluster, so
+/// the form is only recognised after one of these names.
+const GLUED_PASSWORD_PROGRAMS: [&str; 8] = [
+    "mysql",
+    "mysqldump",
+    "mysqladmin",
+    "mysqlimport",
+    "mysqlshow",
+    "mysqlcheck",
+    "mariadb",
+    "mariadb-dump",
+];
+
+/// `user:password` with the password replaced; a bare user name is kept.
+fn redact_user_password(value: &str) -> String {
+    match value.split_once(':') {
+        Some((user, password)) if !password.is_empty() => format!("{user}:{REDACTED}"),
+        _ => value.to_owned(),
+    }
+}
+
 fn redact_command_fields(command: &[String], is_secret: &dyn Fn(&str) -> bool) -> Vec<String> {
     let is_name = |name: &str| !name.contains(char::is_whitespace) && is_secret(name);
     let mut value_follows = false;
+    // curl's `-u user:password` and its relatives, only after a `curl` word.
+    let (mut curl, mut user_follows) = (false, false);
+    let mut glued_password = false;
     command
         .iter()
         .map(|argument| {
+            if std::mem::take(&mut user_follows) {
+                return redact_user_password(argument);
+            }
             // `--token VALUE`: the value is the next argument unless that is a flag.
             if std::mem::take(&mut value_follows) && !argument.starts_with('-') {
                 return REDACTED.to_owned();
+            }
+            if curl {
+                if matches!(argument.as_str(), "-u" | "-U" | "--user" | "--proxy-user") {
+                    user_follows = true;
+                    return argument.clone();
+                }
+                for flag in ["--user=", "--proxy-user="] {
+                    if let Some(value) = argument.strip_prefix(flag) {
+                        return format!("{flag}{}", redact_user_password(value));
+                    }
+                }
+                if !argument.starts_with("--")
+                    && let Some(flag) = ["-u", "-U"]
+                        .into_iter()
+                        .find(|flag| argument.starts_with(flag))
+                {
+                    return format!("{flag}{}", redact_user_password(&argument[2..]));
+                }
+            }
+            if glued_password && argument.len() > 2 && argument.starts_with("-p") {
+                return format!("-p{REDACTED}");
             }
             for separator in ['=', ':'] {
                 if let Some((name, value)) = argument.split_once(separator)
@@ -858,6 +998,9 @@ fn redact_command_fields(command: &[String], is_secret: &dyn Fn(&str) -> bool) -
                 }
             }
             value_follows = argument.starts_with('-') && is_name(argument);
+            let program = program_name(argument);
+            curl |= program == "curl";
+            glued_password |= GLUED_PASSWORD_PROGRAMS.contains(&program.as_str());
             argument.clone()
         })
         .collect()
@@ -1117,26 +1260,6 @@ fn literal_spans(text: &str, literals: &[String]) -> Vec<(usize, usize)> {
     spans
 }
 
-fn redact_structured_fields(value: &mut serde_json::Value, fields: &HashSet<String>) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, child) in object {
-                if field_is_secret(key, fields) {
-                    *child = serde_json::Value::String(REDACTED.into());
-                } else {
-                    redact_structured_fields(child, fields);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_structured_fields(item, fields);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub struct TraceWriter {
     root: PathBuf,
     manifest: TraceManifest,
@@ -1359,6 +1482,7 @@ impl TraceWriter {
             &mut input.payload,
             self.manifest.adapter.is_some(),
         );
+        self.redaction.redact_envelope(&mut input);
         let timestamp = input
             .timestamp
             .as_deref()
@@ -4277,6 +4401,11 @@ mod tests {
                 "postgres://:[REDACTED]@db:5432/app".to_owned(),
             ),
             (
+                "url-query-credentials",
+                "GET https://api.example.test/items?page=2&access_token=abc.def-1&x=1".to_owned(),
+                "GET https://api.example.test/items?page=2&access_token=[REDACTED]&x=1".to_owned(),
+            ),
+            (
                 "pem-private-key",
                 // Split so the repository secret scan does not flag this fixture.
                 format!("-----BEGIN {}-----\nMIIEvQ truncated", "PRIVATE KEY"),
@@ -4295,6 +4424,7 @@ mod tests {
                 "authorization-header",
                 "bearer-token",
                 "url-credentials",
+                "url-query-credentials",
                 "sk-api-key",
                 "github-token",
                 "github-fine-grained-pat",

@@ -1,5 +1,5 @@
 import { actorId } from './analysis';
-import { isRunSummary, nativeCost, nativeText, nativeUsage, payloadModel, payloadProvider } from './nativePayload';
+import { isRunSummary, nativeCost, nativeText, nativeUsage, payloadModel, payloadProvider, usageReportedElsewhere } from './nativePayload';
 import { eventPayload, type TraceEvent } from './types';
 
 export type PromptRole = 'system' | 'developer' | 'user' | 'tool' | 'assistant';
@@ -168,6 +168,9 @@ function isModelKind(event: TraceEvent): boolean {
  * provider object under `payload.native`. Anything no producer reported stays null (shown as unknown).
  */
 function callUsage(event: TraceEvent, payload: Record<string, unknown>, summary: boolean): ModelCallUsage | null {
+  // An adapter attaches one message's usage to the first event cut from it; later events of the same
+  // message only name it, and the provider's repeated copy under `native` must not be counted again.
+  if (usageReportedElsewhere(payload)) return null;
   const isModelEvent = isModelKind(event);
   const direct = record(payload.usage);
   // On an event that is not a model call, only usage attached to a single provider message is one call's usage.

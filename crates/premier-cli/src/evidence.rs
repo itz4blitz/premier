@@ -89,23 +89,8 @@ fn normalized_key(key: &str) -> String {
         .collect()
 }
 
-/// Export shares the recorder's secret field list instead of keeping its own.
-fn secret_key(key: &str) -> bool {
-    premier_trace::is_secret_field_name(key)
-}
-
-/// What one redaction pass removed, by rule type.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct RedactionCounts {
-    /// Values this pass replaced: `field_names` plus every `value_patterns` count.
-    pub total: usize,
-    /// Values replaced because their field, flag or header name is secret.
-    pub field_names: usize,
-    /// Values replaced per built-in secret value pattern.
-    pub value_patterns: BTreeMap<&'static str, usize>,
-    /// Redaction markers that were already present, written at record time.
-    pub already_redacted: usize,
-}
+pub use premier_trace::RedactionCounts;
+use premier_trace::SecretRedactor;
 
 /// Which optional rules a redaction pass applies on top of secret field names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,132 +110,23 @@ impl Default for RedactionOptions {
     }
 }
 
-struct Redactor {
-    value_patterns: bool,
-    counts: RedactionCounts,
-}
-
-impl Redactor {
-    fn replace_named(&mut self, value: &mut Value) {
-        match value {
-            Value::String(text) if text == REDACTED => self.counts.already_redacted += 1,
-            Value::Null => {}
-            Value::String(text) if text.is_empty() => {}
-            _ => {
-                self.counts.field_names += 1;
-                self.counts.total += 1;
-            }
-        }
-        *value = Value::String(REDACTED.into());
-    }
-
-    fn redact(&mut self, value: &mut Value) {
-        match value {
-            Value::Object(object) => {
-                let named_secret = ["name", "key", "header"]
-                    .iter()
-                    .filter_map(|field| object.get(*field)?.as_str())
-                    .any(secret_key);
-                for (key, value) in object {
-                    if secret_key(key)
-                        || (named_secret && matches!(key.as_str(), "value" | "values"))
-                    {
-                        self.replace_named(value);
-                    } else {
-                        self.redact(value);
-                    }
-                }
-            }
-            Value::Array(items) => {
-                let strings = items
-                    .iter()
-                    .map(|item| item.as_str().map(str::to_owned))
-                    .collect::<Option<Vec<_>>>();
-                if let Some(mut strings) = strings {
-                    // A bare header name followed by its value: `["Cookie", VALUE]`.
-                    let bare_name = |name: &str| {
-                        !name.contains(|character: char| {
-                            character.is_whitespace() || matches!(character, ':' | '=')
-                        })
-                    };
-                    if strings.len() == 2 && bare_name(&strings[0]) && secret_key(&strings[0]) {
-                        strings[1] = REDACTED.into();
-                    }
-                    for (item, mut redacted) in items
-                        .iter_mut()
-                        .zip(premier_trace::redact_command_secrets(&strings))
-                    {
-                        if item.as_str() == Some(redacted.as_str()) {
-                            self.redact(item);
-                        } else {
-                            self.counts.field_names += 1;
-                            self.counts.total += 1;
-                            // The marker just written is not a recorded one.
-                            self.redact_text(&mut redacted, false);
-                            *item = Value::String(redacted);
-                        }
-                    }
-                } else {
-                    for item in items {
-                        self.redact(item);
-                    }
-                }
-            }
-            Value::String(text) => {
-                if text.trim_start().starts_with(['{', '['])
-                    && let Ok(original) = serde_json::from_str::<Value>(text)
-                {
-                    let mut nested = original.clone();
-                    self.redact(&mut nested);
-                    // Untouched documents keep their exact original text.
-                    if nested != original {
-                        *text = nested.to_string();
-                    }
-                } else {
-                    self.redact_text(text, true);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Apply the built-in secret value patterns to one plain string.
-    fn redact_text(&mut self, text: &mut String, count_markers: bool) {
-        if count_markers {
-            self.counts.already_redacted += text.matches(REDACTED).count();
-        }
-        if !self.value_patterns {
-            return;
-        }
-        let counts = &mut self.counts;
-        let mut on_match = |name: &'static str| {
-            *counts.value_patterns.entry(name).or_default() += 1;
-            counts.total += 1;
-        };
-        if let Some(redacted) = premier_trace::redact_builtin_secrets(text, &mut on_match) {
-            *text = redacted;
-        }
-    }
-}
-
 /// Recursively replace the values of secret-named fields. Besides plain
 /// object keys this covers header-style pairs (`{"name": "Authorization",
 /// "value": ...}` and `["Authorization", ...]`), argument and header lists
 /// (`--token VALUE`, `API_KEY=VALUE`, `Cookie: VALUE`), and JSON documents
 /// stored inside string values. String values are also checked against the
-/// built-in secret value patterns. Returns what was removed.
+/// built-in secret value patterns. Returns what was removed. The rules are
+/// the recorder's own ([`SecretRedactor`]), which applies them before the
+/// journal write; export repeats them for traces recorded earlier.
 pub fn redact_secrets(value: &mut Value) -> RedactionCounts {
     redact_secrets_with(value, true)
 }
 
 /// [`redact_secrets`], with the built-in secret value patterns optional.
 pub fn redact_secrets_with(value: &mut Value, value_patterns: bool) -> RedactionCounts {
-    let mut redactor = Redactor {
-        value_patterns,
-        counts: RedactionCounts::default(),
-    };
+    let mut redactor = SecretRedactor::new(value_patterns);
     redactor.redact(value);
-    redactor.counts
+    redactor.into_counts()
 }
 
 #[derive(Debug, Serialize)]
@@ -346,15 +222,9 @@ pub fn portable_evidence_with(
     events: &[TraceEvent],
     options: RedactionOptions,
 ) -> PortableEvidence {
-    let mut structured = Redactor {
-        value_patterns: options.default_secret_patterns,
-        counts: RedactionCounts::default(),
-    };
+    let mut structured = SecretRedactor::new(options.default_secret_patterns);
     // Captured terminal text is only pattern-matched when asked for.
-    let mut terminal = Redactor {
-        value_patterns: options.known_secrets_in_terminal,
-        counts: RedactionCounts::default(),
-    };
+    let mut terminal = SecretRedactor::new(options.known_secrets_in_terminal);
     let source = portable_source(manifest);
     let mut manifest = serde_json::to_value(manifest).unwrap_or(Value::Null);
     structured.redact(&mut manifest);
@@ -383,11 +253,12 @@ pub fn portable_evidence_with(
             event
         })
         .collect();
-    let mut redacted = structured.counts;
-    redacted.total += terminal.counts.total;
-    redacted.field_names += terminal.counts.field_names;
-    redacted.already_redacted += terminal.counts.already_redacted;
-    for (name, count) in terminal.counts.value_patterns {
+    let mut redacted = structured.into_counts();
+    let terminal = terminal.into_counts();
+    redacted.total += terminal.total;
+    redacted.field_names += terminal.field_names;
+    redacted.already_redacted += terminal.already_redacted;
+    for (name, count) in terminal.value_patterns {
         *redacted.value_patterns.entry(name).or_default() += count;
     }
     let builtin = options.default_secret_patterns || options.known_secrets_in_terminal;
