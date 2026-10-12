@@ -97,7 +97,7 @@ for (const [directory, expected] of Object.entries(PLATFORMS)) {
 
   if (!flag('--skip-pack')) {
     const files = packedFiles(base);
-    const wanted = ['LICENSE', 'README.md', 'bin/premier', 'package.json'];
+    const wanted = ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'bin/premier', 'package.json'];
     if (files.join() !== wanted.join()) fail(`would publish [${files.join(', ')}], expected [${wanted.join(', ')}]`);
   }
 
@@ -125,7 +125,7 @@ const launcherManifest = JSON.parse(readFileSync(join(launcher, 'package.json'),
 if (launcherManifest.version !== version) problems.push(`launcher: version is ${launcherManifest.version}, expected ${version}`);
 if (!flag('--skip-pack')) {
   const files = packedFiles(launcher);
-  const wanted = ['LICENSE', 'README.md', 'bin/premier.js', 'package.json'];
+  const wanted = ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'bin/premier.js', 'package.json'];
   if (files.join() !== wanted.join()) problems.push(`launcher: would publish [${files.join(', ')}], expected [${wanted.join(', ')}]`);
 }
 if (!ranHost && !flag('--skip-host-run')) {

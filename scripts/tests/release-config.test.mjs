@@ -129,3 +129,54 @@ test('the version gate passes on the repository and names every mismatch', () =>
     rmSync(work, { recursive: true, force: true });
   }
 });
+
+test('third-party notices ship in every package and CI fails on a stale file', () => {
+  assert.match(ci, /^ {6}- name: Require current third-party notices\n {8}run: node scripts\/third-party-notices\.mjs --check$/m);
+  const packaging = read('scripts/package-release.sh');
+  assert.match(packaging, /for path in LICENSE README\.md RELEASE-METADATA THIRD_PARTY_NOTICES\.md bin\/premier share\/premier\/premier-emit\.sh; do/);
+  assert.match(read('scripts/stage-npm-packages.sh'), /THIRD_PARTY_NOTICES\.md" "\$PACKAGES\/packages\/premier-cli\/THIRD_PARTY_NOTICES\.md"/);
+  assert.ok(JSON.parse(read('packages/premier-cli/package.json')).files.includes('THIRD_PARTY_NOTICES.md'));
+  for (const directory of readdirSync(join(root, 'npm', 'platforms'))) {
+    const manifest = JSON.parse(read(`npm/platforms/${directory}/package.json`));
+    assert.deepEqual(manifest.files, ['bin/premier', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md'], directory);
+  }
+  // The checked-in file covers every target the release builds.
+  const notices = read('THIRD_PARTY_NOTICES.md');
+  assert.doesNotMatch(notices, /\*\*Incomplete\.\*\*/);
+  for (const [, target] of release.matchAll(/^ {12}target: (\S+)$/gm)) {
+    assert.ok(notices.includes(`\`${target}\``), `notices cover ${target}`);
+  }
+
+  // The check needs only the lockfiles: in a tree with no crates to resolve it still passes on
+  // the current file and fails once a lockfile pins something else.
+  const work = mkdtempSync(join(tmpdir(), 'premier-notices-'));
+  try {
+    mkdirSync(join(work, 'scripts'));
+    cpSync(join(root, 'scripts', 'third-party-notices.mjs'), join(work, 'scripts', 'third-party-notices.mjs'));
+    mkdirSync(join(work, 'sdk', 'js'), { recursive: true });
+    for (const path of ['Cargo.lock', 'package-lock.json', 'THIRD_PARTY_NOTICES.md', 'sdk/js/package.json']) cpSync(join(root, path), join(work, path));
+    const check = () => spawnSync(process.execPath, [join(work, 'scripts', 'third-party-notices.mjs'), '--check'], { encoding: 'utf8' });
+    const current = check();
+    assert.equal(current.status, 0, current.stderr);
+    assert.match(current.stdout, /match the lockfiles/);
+
+    const cargoLock = readFileSync(join(work, 'Cargo.lock'), 'utf8');
+    const bumped = cargoLock.replace(/(name = "serde"\nversion = ")[^"]+/, '$19.9.9');
+    assert.notEqual(bumped, cargoLock);
+    writeFileSync(join(work, 'Cargo.lock'), bumped);
+    const staleRust = check();
+    assert.equal(staleRust.status, 1);
+    assert.match(staleRust.stderr, /out of date/);
+    writeFileSync(join(work, 'Cargo.lock'), cargoLock);
+
+    const lock = JSON.parse(readFileSync(join(work, 'package-lock.json'), 'utf8'));
+    const bundled = Object.keys(lock.packages).find((path) => path.includes('node_modules/') && !lock.packages[path].dev && !lock.packages[path].link);
+    lock.packages[bundled].version = '99.0.0';
+    writeFileSync(join(work, 'package-lock.json'), JSON.stringify(lock));
+    const staleJavaScript = check();
+    assert.equal(staleJavaScript.status, 1);
+    assert.match(staleJavaScript.stderr, /out of date/);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+});

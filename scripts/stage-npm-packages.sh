@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Stage the script-free npm platform packages from release archives: copy each
 # archive's executable into npm/platforms/<platform>/bin/premier, record the
-# glibc it requires for the launcher to check, and copy LICENSE into every
-# package. Run scripts/verify-staged-npm.mjs afterwards, before publishing.
+# glibc it requires for the launcher to check, and copy LICENSE and
+# THIRD_PARTY_NOTICES.md into every package. Run scripts/verify-staged-npm.mjs afterwards, before publishing.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,11 +57,14 @@ stage_platform() {
     ' "$PACKAGES/npm/platforms/$directory/package.json" "$glibc"
   fi
   cp "$ROOT/LICENSE" "$PACKAGES/npm/platforms/$directory/LICENSE"
+  cp "$ROOT/THIRD_PARTY_NOTICES.md" "$PACKAGES/npm/platforms/$directory/THIRD_PARTY_NOTICES.md"
   echo "staged $directory from $(basename "$archive")${glibc:+ (glibc $glibc)}"
 }
 
+[[ -f "$ROOT/THIRD_PARTY_NOTICES.md" ]] || { echo "THIRD_PARTY_NOTICES.md is missing" >&2; exit 1; }
 stage_platform aarch64-apple-darwin darwin-arm64
 stage_platform x86_64-apple-darwin darwin-x64
 stage_platform aarch64-unknown-linux-gnu linux-arm64-gnu
 stage_platform x86_64-unknown-linux-gnu linux-x64-gnu
 cp "$ROOT/LICENSE" "$PACKAGES/packages/premier-cli/LICENSE"
+cp "$ROOT/THIRD_PARTY_NOTICES.md" "$PACKAGES/packages/premier-cli/THIRD_PARTY_NOTICES.md"

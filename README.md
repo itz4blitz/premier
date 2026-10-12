@@ -83,9 +83,9 @@ Unknown harness? Premier can record any process immediately, then accept typed e
 
 ## Ask a local assistant
 
-The viewer can put questions about a trace to an agent CLI already installed on your machine (Claude, Codex, Grok, or Gemini), run in an empty directory with its tools disabled or restricted to read-only.
+The viewer can put questions about a trace to an agent CLI already installed on your machine: Claude, Codex, Grok, Gemini, or OpenCode. Each runs in an empty directory under the strongest containment that CLI supports: with its tools switched off where it has a way to do that, otherwise in its read-only sandbox, otherwise with its own defaults. The panel says which applies, and what the CLI can do while it answers, before you agree to send anything.
 
-Asking a question sends redacted trace content to the model provider behind the CLI you pick; turn the assistant off with `premier open --no-assistant` or `PREMIER_DISABLE_ASSISTANT=1`. [What is sent and how it is confined →](docs/security.md#the-local-assistant)
+Asking a question sends redacted trace content to the model provider behind the CLI you pick. `--assistant-containment no_tools` offers only CLIs that run without tools; `premier open --no-assistant` or `PREMIER_DISABLE_ASSISTANT=1` turns the assistant off. [What is sent and how it is contained →](docs/security.md#the-local-assistant)
 
 ## Instrument your own harness
 

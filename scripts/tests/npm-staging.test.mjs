@@ -67,7 +67,16 @@ test('staging copies each binary, records glibc for Linux, and verification acce
     const manifest = JSON.parse(readFileSync(join(tree.work, 'npm', 'platforms', directory, 'package.json'), 'utf8'));
     assert.deepEqual(manifest.premier, target.includes('linux') ? { glibc: '2.34' } : undefined, directory);
     assert.equal(manifest.version, version);
+    assert.equal(
+      readFileSync(join(tree.work, 'npm', 'platforms', directory, 'THIRD_PARTY_NOTICES.md'), 'utf8'),
+      readFileSync(join(root, 'THIRD_PARTY_NOTICES.md'), 'utf8'),
+      `${directory} carries the third-party notices`
+    );
   }
+  assert.equal(
+    readFileSync(join(tree.work, 'packages', 'premier-cli', 'THIRD_PARTY_NOTICES.md'), 'utf8'),
+    readFileSync(join(root, 'THIRD_PARTY_NOTICES.md'), 'utf8')
+  );
   // The stand-in binaries cannot run, so the host run is the one step skipped.
   const verified = verify(tree, '--min-bytes', '1024', '--skip-host-run');
   assert.equal(verified.status, 0, verified.stderr);
@@ -117,8 +126,14 @@ test('verification names every problem with what was staged', (t) => {
   edit('linux-x64-gnu', (manifest) => { delete manifest.premier; manifest.files.push('extra.txt'); });
   writeFileSync(join(platforms, 'linux-x64-gnu', 'extra.txt'), 'not for publication');
 
+  // A package staged without the third-party notices.
+  rmSync(join(platforms, 'darwin-arm64', 'THIRD_PARTY_NOTICES.md'));
+  rmSync(join(tree.work, 'packages', 'premier-cli', 'THIRD_PARTY_NOTICES.md'));
+
   const result = verify(tree, '--min-bytes', '1024', '--skip-host-run');
   assert.equal(result.status, 1);
+  assert.match(result.stderr, /darwin-arm64: would publish \[LICENSE, README\.md, bin\/premier, package\.json\], expected \[LICENSE, README\.md, THIRD_PARTY_NOTICES\.md, bin\/premier, package\.json\]/);
+  assert.match(result.stderr, /launcher: would publish \[LICENSE, README\.md, bin\/premier\.js, package\.json\]/);
   assert.match(result.stderr, /darwin-arm64: bin\/premier is only 0 bytes/);
   assert.match(result.stderr, /darwin-x64: bin\/premier is a x86_64-unknown-linux executable, expected x86_64-apple-darwin/);
   assert.match(result.stderr, /linux-arm64-gnu: version is 0\.0\.1/);

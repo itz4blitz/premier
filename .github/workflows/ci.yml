@@ -40,6 +40,8 @@ jobs:
         run: npm run security:secrets
       - name: Require every release manifest to carry one version
         run: node scripts/check-release-versions.mjs
+      - name: Require current third-party notices
+        run: node scripts/third-party-notices.mjs --check
       - run: npm run test:all
         env:
           # The SDK tests run every documented example under the binary that

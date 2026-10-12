@@ -43,6 +43,8 @@ try {
   cpSync(join(root, 'packages', 'premier-cli'), stagedLauncher, { recursive: true });
   cpSync(join(root, 'LICENSE'), join(stagedPlatform, 'LICENSE'));
   cpSync(join(root, 'LICENSE'), join(stagedLauncher, 'LICENSE'));
+  cpSync(join(root, 'THIRD_PARTY_NOTICES.md'), join(stagedPlatform, 'THIRD_PARTY_NOTICES.md'));
+  cpSync(join(root, 'THIRD_PARTY_NOTICES.md'), join(stagedLauncher, 'THIRD_PARTY_NOTICES.md'));
   mkdirSync(join(stagedPlatform, 'bin'), { recursive: true });
   cpSync(binary, join(stagedPlatform, 'bin', 'premier'));
   chmodSync(join(stagedPlatform, 'bin', 'premier'), 0o755);
@@ -63,8 +65,10 @@ try {
   const launcherPack = pack(stagedLauncher, work);
   assert.ok(platformPack.files.some((file) => file.path === 'bin/premier'));
   assert.ok(platformPack.files.some((file) => file.path === 'LICENSE'));
+  assert.ok(platformPack.files.some((file) => file.path === 'THIRD_PARTY_NOTICES.md'));
   assert.ok(launcherPack.files.some((file) => file.path === 'bin/premier.js'));
   assert.ok(launcherPack.files.some((file) => file.path === 'LICENSE'));
+  assert.ok(launcherPack.files.some((file) => file.path === 'THIRD_PARTY_NOTICES.md'));
 
   const consumer = join(work, 'consumer');
   mkdirSync(consumer);

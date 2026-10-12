@@ -103,6 +103,11 @@ PACKAGE="$EXTRACTED/premier-0.1.0-$TARGET"
 assert_file "$PACKAGE/bin/premier"
 assert_file "$PACKAGE/README.md"
 assert_file "$PACKAGE/LICENSE"
+# The third-party notices ship beside the licence, unchanged and checksummed.
+cmp "$PACKAGE/THIRD_PARTY_NOTICES.md" "$ROOT/THIRD_PARTY_NOTICES.md" >/dev/null || fail "packaged third-party notices differ from THIRD_PARTY_NOTICES.md"
+grep -q '  THIRD_PARTY_NOTICES.md$' "$PACKAGE/SHA256SUMS" || fail "third-party notices are not in the archive's checksums"
+[[ "$(find "$PACKAGE" -type f | sed "s|^$PACKAGE/||" | LC_ALL=C sort | tr '\n' ' ')" == "LICENSE README.md RELEASE-METADATA SHA256SUMS THIRD_PARTY_NOTICES.md bin/premier share/premier/premier-emit.sh " ]] ||
+  fail "archive does not hold exactly the expected files: $(find "$PACKAGE" -type f)"
 assert_file "$PACKAGE/RELEASE-METADATA"
 assert_file "$PACKAGE/SHA256SUMS"
 # The shell helper ships in the archive, executable and checksummed.
@@ -326,6 +331,9 @@ with tarfile.open(source, "r:gz") as archive, tarfile.open(output, "w:gz") as re
         if mode == "inner-checksum" and member.name.endswith("/README.md"):
             data += b"\nedited after checksums were written\n"
             member.size = len(data)
+        if mode == "notices" and member.name.endswith("/THIRD_PARTY_NOTICES.md"):
+            data += b"\nedited after checksums were written\n"
+            member.size = len(data)
         if mode == "no-metadata" and member.name.endswith("/RELEASE-METADATA"):
             continue
         result.addfile(member, io.BytesIO(data) if data is not None else None)
@@ -344,6 +352,9 @@ PY
 BROKEN="$WORK/broken.tar.gz"
 repack inner-checksum "$BROKEN"
 refuses "installer accepted a file that disagrees with the archive's SHA256SUMS" "checksum mismatch: README.md" \
+  "$ROOT/scripts/install.sh" --archive "$BROKEN" --allow-unsigned --prefix "$REJECTED"
+repack notices "$BROKEN"
+refuses "installer accepted third-party notices that disagree with the archive's SHA256SUMS" "checksum mismatch: THIRD_PARTY_NOTICES.md" \
   "$ROOT/scripts/install.sh" --archive "$BROKEN" --allow-unsigned --prefix "$REJECTED"
 repack no-metadata "$BROKEN"
 refuses "installer accepted an archive without release metadata" "exactly one release metadata file" \

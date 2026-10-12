@@ -116,8 +116,8 @@ test('the launcher exits 1 with the reason when a stale platform package is inst
   }
 });
 
-test('the launcher package ships only the launcher, its README and the licence', () => {
-  assert.deepEqual(launcherManifest.files, ['bin', 'README.md', 'LICENSE']);
+test('the launcher package ships only the launcher, its README, the licence and the third-party notices', () => {
+  assert.deepEqual(launcherManifest.files, ['bin', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md']);
   for (const hook of ['preinstall', 'install', 'postinstall', 'prepare']) {
     assert.equal(launcherManifest.scripts?.[hook], undefined, `${hook} script`);
   }

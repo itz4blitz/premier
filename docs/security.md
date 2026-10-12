@@ -20,6 +20,7 @@ This page states what each control does and where it stops.
 | A trace is deliberately rewritten after recording | Optional Ed25519 signature, checked with `premier verify --public-key` | Only as good as the secrecy of the signing key, and only when the verifier supplies the key it expects |
 | Recorded text drives the terminal that displays it | Control characters are escaped in the CLI's text output | JSON output is exact and not escaped |
 | Trace content is sent to a model provider | Only through the local assistant, only when you ask it a question, after redaction; can be disabled | Redaction is best effort |
+| Text recorded in a trace steers the assistant CLI that reads it | The CLI runs in an empty directory under the strongest containment it supports, stated before you consent; a minimum can be required | Only a CLI run without tools cannot act on it. See [Containment tiers](#containment-tiers) |
 
 Premier does not defend against a hostile process running as your own user.
 Such a process can read your trace files, read the collector token from the
@@ -275,48 +276,109 @@ running an agent CLI that is already installed on the machine running
 
 The first time the assistant panel is opened or asked (`GET /api/assistants`
 or a question), unless the assistant is disabled, the server looks on `PATH`
-for `claude`, `codex`, `grok`, and `gemini`, and runs `<cli> --help` (and
-`codex exec --help`) to check that each one supports the flags below. Nothing
-is run when the server starts, and a server whose assistant is never used
-runs no CLI at all. Each probe has standard input closed and 5 seconds to
-finish; a CLI that does not answer in that time is stopped and listed as
-unavailable. The result is kept for the life of the process. A CLI
-that is missing any required flag is listed as unavailable. `opencode` is
-listed but never available, because it has no documented non-interactive
-read-only mode.
+for `claude`, `codex`, `grok`, `gemini`, and `opencode`, and reads the help
+text of each one it finds (`<cli> --help`; for Codex also `codex exec
+--help`; for OpenCode `opencode run --help`). Nothing is run when the server
+starts, and a server whose assistant is never used runs no CLI at all. Each
+probe has standard input closed and 5 seconds to finish; a CLI that does not
+answer in that time is stopped and listed as unavailable. The result is kept
+for the life of the process. No probe sends a prompt.
+
+From that help text the server picks, for each CLI, the strongest way of
+running it that the installed version supports. **A provider is not refused
+because it cannot be made tool-less**: it is run under the best containment
+it has, and the panel says what that is before you consent. A provider is
+unavailable only when its CLI is not installed, when its help text names no
+non-interactive mode the server knows, or when it falls below a minimum you
+set (see [Requiring a minimum](#requiring-a-minimum)).
+
+`kimi` and `droid` are not offered. Premier records both (see
+[adapters.md](adapters.md)), but this build does not know a one-shot
+invocation for either that it could check against their help text.
+
+### Containment tiers
+
+| Tier | What the model can do while it answers | What this prevents | What it does not prevent |
+| --- | --- | --- | --- |
+| `no_tools` | Read the prompt and write an answer. | Reading files, running commands, writing anything, and network access by the model: there is nothing for text in the trace to set off. | The prompt itself still goes to the provider. The CLI process still runs as you, and is trusted to honour its flags. |
+| `read_only_sandbox` | Run shell commands inside the CLI's own read-only sandbox, with network access off and no approval ever granted. | Writing or deleting files, network access from those commands, and any action that would need approval. | **Reading.** The commands start in an empty directory but can read any file your user can read, and what they print goes to the model, and so to the provider. A trace whose text instructs the model to read a file can cause that file's content to leave the machine. |
+| `provider_default` | Whatever the CLI allows without asking, given its defaults and your configuration for it (allow rules, MCP servers, plugins). Premier found no flag set that takes this away. | Only what applies to every tier (below), and whatever the CLI itself refuses when nobody is there to approve. | Reading files, running commands, writing files, and network access, as far as the CLI's configuration permits them unattended. |
+
+**Trace content is untrusted input to the provider CLI.** A trace holds
+whatever the recorded agent, its tools, and the pages and files it read
+produced, and the model reads it as part of the prompt. The prompt opens
+with an instruction to treat trace content as data, but an instruction is
+not a control: text in a trace can still persuade a model to use whatever
+abilities its tier leaves it. Under `no_tools` there are none. Under the
+other two tiers, treat asking about a trace you did not produce the way you
+would treat running an agent on a repository you did not write.
+
+Every tier keeps the protections listed under [Confinement](#confinement):
+an empty private working directory, a scrubbed environment, closed standard
+input, the process group killed at the deadline, bounded output, one run at a
+time, and the same-origin and consent requirements.
+
+`GET /api/assistants` reports the tier as `containment`, with
+`containment_summary`: one sentence saying what that CLI can do while it
+answers. The panel shows that sentence, for the selected provider, above the
+consent checkbox; for any tier but `no_tools` it adds that trace content is
+untrusted input to the CLI.
+
+### How each CLI is run
+
+The tiers are tried in the order listed; the first one whose flags all appear
+in the installed CLI's help text is used.
+
+| CLI | Tier | Invocation | Chosen when |
+| --- | --- | --- | --- |
+| `claude` | `no_tools` | `--print --output-format text --permission-mode dontAsk --tools "" --no-session-persistence --safe-mode <prompt>` | The help text names every one of these flags. |
+| `claude` | `provider_default` | `--print --output-format text <prompt>` | Otherwise, when it names `--print`. |
+| `codex` | `no_tools` | `--ask-for-approval never exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --color never --config features.shell_tool=false --config features.unified_exec=false --config web_search="disabled" <prompt>` | The flags are named **and** the feature check below passes. |
+| `codex` | `read_only_sandbox` | `--ask-for-approval never exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --color never --config web_search="disabled" <prompt>` | The same flags are named and the feature check does not pass. |
+| `codex` | `provider_default` | `exec --skip-git-repo-check <prompt>` | Otherwise, when `exec` and `--skip-git-repo-check` are named. |
+| `grok` | `no_tools` | `--single <prompt> --permission-mode dontAsk --tools "" --no-subagents --no-memory --disable-web-search --max-turns 1 --verbatim` | The help text names every one of these flags. |
+| `grok` | `no_tools` | The same without `--no-memory`: cross-session memory stays on, and the summary says so. | The installed CLI has no `--no-memory` (Grok 1.0). |
+| `grok` | `provider_default` | `--single <prompt>` | Otherwise, when it names `--single`. |
+| `gemini` | `provider_default` | `--prompt <prompt> --approval-mode plan --sandbox --output-format text --extensions none --allowed-mcp-server-names premier-none` | The help text names every one of these flags. Plan mode is read-only and user extensions and MCP servers are off, but Gemini's built-in file-reading and web tools remain, so this is not counted as a sandbox without network access. |
+| `gemini` | `provider_default` | `--prompt <prompt>` | Otherwise, when it names `--prompt`. |
+| `opencode` | `provider_default` | `run --standalone <prompt>` | `opencode run --help` names `--standalone`, which keeps the run in a process of its own instead of handing it to OpenCode's background service, where the working directory and environment below would not apply. OpenCode has no flag that takes its tools away. |
+| `opencode` | `provider_default` | `run <prompt>` | Otherwise, when `opencode run` exists. |
 
 **Codex gets a second check.** Accepting a flag is not the same as honouring
-it, so for `codex` the server also asks the installed CLI for its effective
-feature state under the same overrides the assistant invocation passes:
+it, so before calling Codex tool-less the server asks the installed CLI for
+its effective feature state under the overrides that tier passes:
 
 ```sh
 codex --config features.shell_tool=false --config features.unified_exec=false features list
 ```
 
 with standard input closed. The output is read as one feature per line, the
-first field being the feature name and the last its state. Codex is marked
-unavailable unless:
+first field being the feature name and the last its state. Codex is run
+under `no_tools` only when the command exits successfully and both
+`shell_tool` and `unified_exec` are reported `false`. Those two are the
+features that give the model command execution. Codex 0.162 accepts the
+`unified_exec` override and reports the feature still on; it is therefore
+run under `read_only_sandbox`, where its shell is confined by the sandbox
+instead of removed.
 
-- the command runs and exits successfully;
-- a line for `shell_tool` exists and its last field is `false`;
-- a line for `unified_exec` exists and its last field is `false`.
+For every other CLI and tier the evidence is the help text alone: the flags
+exist, and the CLI is trusted to honour them.
 
-Those two are the features that give the model command execution. A feature
-that is reported `true` with its override applied, or is not reported at all,
-makes Codex unavailable, with a reason such as `installed Codex CLI does not
-confirm that command execution is disabled (unified_exec is true with it
-switched off)`. The probe checks nothing else: not other features, and not
-the sandbox or approval settings beyond the presence of their flags in
-`--help`.
+### Requiring a minimum
 
-When you submit a question, the server starts the chosen CLI once:
+```sh
+premier open --assistant-containment no_tools
+premier serve --assistant-containment read_only_sandbox
+PREMIER_ASSISTANT_CONTAINMENT=no_tools premier record --open -- ./agent
+```
 
-| CLI | Invocation |
-| --- | --- |
-| `claude` | `--print --output-format text --permission-mode dontAsk --tools "" --no-session-persistence --safe-mode <prompt>` |
-| `codex` | `--ask-for-approval never exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --color never --config features.shell_tool=false --config features.unified_exec=false --config web_search="disabled" <prompt>` |
-| `grok` | `--single <prompt> --permission-mode dontAsk --tools "" --no-subagents --no-memory --disable-web-search --max-turns 1 --verbatim` |
-| `gemini` | `--prompt <prompt> --approval-mode plan --sandbox --output-format text --extensions none --allowed-mcp-server-names premier-none` |
+The default is `provider_default`: every installed CLI is offered. With a
+stricter minimum, a provider whose installed CLI supports only a weaker tier
+is listed as unavailable with that as its reason (`this server requires
+no_tools containment or stronger (--assistant-containment), and the installed
+Codex CLI supports only read_only_sandbox`), and a request for it is answered
+`503` without running anything. `no_tools` is the behaviour of earlier
+builds, which refused such providers outright.
 
 ### What leaves the machine
 
@@ -326,8 +388,10 @@ submit a question.
 
 The panel says so where the question is typed: it names the provider's vendor
 ("sends to Anthropic"), states what is sent, and keeps the Ask button disabled
-until the box "Send redacted trace content to <vendor>" is ticked. The
-agreement is per provider and lasts until the panel is closed. The text and
+until the box "Send redacted trace content to <vendor>" is ticked. Above the
+box it states what the selected CLI can do while it answers (its
+[containment tier](#containment-tiers)). The agreement is per provider and
+lasts until the panel is closed. The text and
 the box stay visible at every window size.
 
 The prompt contains:
@@ -368,8 +432,8 @@ window.
 - `PREMIER_PASSWORD`, `PREMIER_AUTH_CONFIG`, `PREMIER_TLS_KEY`,
   `PREMIER_TRACE_KEY_FILE`, `PREMIER_SIGN_KEY_FILE`, `PREMIER_COLLECTOR_URL`,
   and `PREMIER_COLLECTOR_TOKEN` are removed from its environment.
-- The flags above turn off tools, or restrict the CLI to read-only operation,
-  and turn off session persistence where the CLI supports it.
+- The flags of the CLI's [tier](#how-each-cli-is-run) are passed, and session
+  persistence is turned off where the CLI has a flag for it.
 - One request runs at a time; a second gets `429`. The CLI runs in its own
   process group, and the whole group is killed after 45 seconds or when the
   browser disconnects, so a wrapper's helper processes do not outlive the
@@ -404,9 +468,11 @@ Limits of that confinement:
 - It relies on each CLI honouring its own flags. Premier does not sandbox the
   process. It runs as your user, with your home directory and the rest of
   your environment.
-- For `gemini`, plan mode is read-only and user extensions and MCP servers are
-  disabled, but the CLI's built-in file and web tools remain available to the
-  model.
+- The empty working directory is where the CLI starts, not a boundary: a
+  tier that leaves the model a shell or a file-reading tool leaves it the
+  files your user can read.
+- A CLI that hands its work to a background service of its own may run it
+  outside this process group, working directory, and environment.
 - The prompt is passed as a command-line argument, so other local users can
   see it in the process list while the CLI runs.
 

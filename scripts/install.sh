@@ -193,10 +193,12 @@ if [[ "$SIGNER" == "publisher signature verified" ]]; then
     exit 1
   }
 fi
-# Files the archive must carry, and the shell helper newer archives add.
+# Files the archive must carry, and the shell helper and third-party notices
+# newer archives add.
 PAYLOAD=(LICENSE README.md RELEASE-METADATA bin/premier)
 HELPER="share/premier/premier-emit.sh"
 [[ ! -f "$PACKAGE/$HELPER" ]] || PAYLOAD+=("$HELPER")
+[[ ! -f "$PACKAGE/THIRD_PARTY_NOTICES.md" ]] || PAYLOAD+=(THIRD_PARTY_NOTICES.md)
 (
   cd "$PACKAGE"
   for path in "${PAYLOAD[@]}"; do

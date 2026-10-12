@@ -168,8 +168,14 @@ export interface AssistantAvailability {
   label: string;
   installed: boolean;
   available: boolean;
+  /** How far the installed CLI is held back while it answers; strongest is `no_tools`. */
+  containment?: AssistantContainment;
+  /** One sentence saying what the CLI can do while it answers. */
+  containment_summary?: string;
   reason?: string;
 }
+
+export type AssistantContainment = 'no_tools' | 'read_only_sandbox' | 'provider_default';
 
 export type AssistantMessageRole = 'user' | 'assistant';
 

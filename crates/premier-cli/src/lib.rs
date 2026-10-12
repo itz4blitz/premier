@@ -35,6 +35,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub mod evidence;
 pub mod issues;
 pub mod liveness;
+pub mod retention;
 
 /// Viewer static assets compiled into the `premier` binary.
 #[derive(RustEmbed)]
@@ -198,6 +199,9 @@ fn decode_sha256(value: &str) -> Result<[u8; 32]> {
 pub struct ServerOptions {
     /// Remove the local assistant: no CLI discovery, no provider list, no spawning.
     pub disable_assistant: bool,
+    /// The weakest containment an assistant CLI may run under. Providers whose
+    /// installed CLI supports only less are listed as unavailable.
+    pub assistant_containment: AssistantContainment,
     /// Serve only this entry of the trace directory (`premier open <trace>`).
     pub only_artifact: Option<OsString>,
 }
@@ -207,6 +211,7 @@ struct AppState {
     only_artifact: Option<OsString>,
     assistants: AssistantRegistry,
     assistant_enabled: bool,
+    assistant_minimum: AssistantContainment,
     /// One local agent CLI at a time; a second request is refused, not queued.
     assistant_slot: tokio::sync::Semaphore,
     /// Decoded/verified trace snapshots memoized by artifact freshness stamp.
@@ -348,13 +353,391 @@ const MAX_HISTORY_CHARS: usize = 12_000;
 const MAX_ASSISTANT_OUTPUT: usize = 64 * 1024;
 const ASSISTANT_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// How far an assistant CLI is held back while it answers. Declared weakest
+/// first, so comparing two values compares their strength.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantContainment {
+    /// The CLI's own defaults: Premier found no flag set that takes its tools
+    /// away or confines them to a read-only sandbox without network access.
+    #[default]
+    ProviderDefault,
+    /// The model can run commands, but only inside the CLI's read-only
+    /// sandbox: no writes, no network, and nothing is approved.
+    ReadOnlySandbox,
+    /// The model has no tools: it reads the prompt and writes an answer.
+    NoTools,
+}
+
+impl AssistantContainment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderDefault => "provider_default",
+            Self::ReadOnlySandbox => "read_only_sandbox",
+            Self::NoTools => "no_tools",
+        }
+    }
+}
+
+impl std::fmt::Display for AssistantContainment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AssistantContainment {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().replace('-', "_").as_str() {
+            "provider_default" => Ok(Self::ProviderDefault),
+            "read_only_sandbox" => Ok(Self::ReadOnlySandbox),
+            "no_tools" => Ok(Self::NoTools),
+            _ => Err(format!(
+                "assistant containment must be provider_default, read_only_sandbox, or no_tools (got '{value}')"
+            )),
+        }
+    }
+}
+
+/// Asks the installed CLI whether it honours a tier's arguments.
+type AssistantConfirmation = fn(&Path) -> std::result::Result<(), String>;
+
+/// One way of running an assistant CLI for a single answer.
+#[derive(Debug)]
+struct AssistantTier {
+    containment: AssistantContainment,
+    /// What the CLI can do while it answers, in one sentence for the person
+    /// about to send it trace content.
+    summary: &'static str,
+    /// Strings the CLI's help text must contain for this invocation to exist.
+    required: &'static [&'static str],
+    /// The arguments, without the prompt.
+    args: &'static [&'static str],
+    /// Where the prompt goes among `args`; `None` appends it.
+    prompt_at: Option<usize>,
+    /// A further check that the installed CLI honours `args`, not only accepts them.
+    confirm: Option<AssistantConfirmation>,
+}
+
+impl AssistantTier {
+    fn command_line(&self, prompt: &str) -> Vec<String> {
+        let mut args = self
+            .args
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect::<Vec<_>>();
+        args.insert(self.prompt_at.unwrap_or(args.len()), prompt.to_owned());
+        args
+    }
+}
+
+/// An assistant CLI and the ways Premier can run it, strongest containment first.
+#[derive(Debug)]
+struct AssistantDefinition {
+    id: &'static str,
+    label: &'static str,
+    /// Invocations whose output, taken together, is the help text that is searched.
+    help: &'static [&'static [&'static str]],
+    tiers: &'static [AssistantTier],
+}
+
+static ASSISTANT_DEFINITIONS: [AssistantDefinition; 5] = [
+    AssistantDefinition {
+        id: "claude",
+        label: "Claude",
+        help: &[&["--help"]],
+        tiers: &[
+            AssistantTier {
+                containment: AssistantContainment::NoTools,
+                summary: "Claude Code runs with every tool switched off and your customizations not loaded: it can only read the prompt and write an answer.",
+                required: &[
+                    "--print",
+                    "--permission-mode",
+                    "--tools",
+                    "--no-session-persistence",
+                    "--safe-mode",
+                ],
+                args: &[
+                    "--print",
+                    "--output-format",
+                    "text",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--tools",
+                    "",
+                    "--no-session-persistence",
+                    "--safe-mode",
+                ],
+                prompt_at: None,
+                confirm: None,
+            },
+            AssistantTier {
+                containment: AssistantContainment::ProviderDefault,
+                summary: "Claude Code runs with its own defaults and your configuration for it: Premier switches nothing off, so it can read files, run commands, and use the network as far as that configuration allows without asking.",
+                required: &["--print", "--output-format"],
+                args: &["--print", "--output-format", "text"],
+                prompt_at: None,
+                confirm: None,
+            },
+        ],
+    },
+    AssistantDefinition {
+        id: "codex",
+        label: "Codex",
+        help: &[&["--help"], &["exec", "--help"]],
+        tiers: &[
+            AssistantTier {
+                containment: AssistantContainment::NoTools,
+                summary: "Codex runs with command execution and web search switched off, in its read-only sandbox: it can only read the prompt and write an answer.",
+                required: &[
+                    "--ask-for-approval",
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "--config",
+                ],
+                args: &[
+                    "--ask-for-approval",
+                    "never",
+                    "exec",
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    // `--sandbox read-only` still lets the model read any file through
+                    // its shell; answering a trace question needs no tools at all.
+                    "--config",
+                    "features.shell_tool=false",
+                    "--config",
+                    "features.unified_exec=false",
+                    "--config",
+                    "web_search=\"disabled\"",
+                ],
+                prompt_at: None,
+                confirm: Some(verify_codex_lockdown),
+            },
+            AssistantTier {
+                containment: AssistantContainment::ReadOnlySandbox,
+                summary: "Codex can run shell commands in its read-only sandbox, starting in an empty directory: they can read any file your user can read, but cannot write files or use the network, and nothing is approved.",
+                required: &[
+                    "--ask-for-approval",
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "--config",
+                ],
+                args: &[
+                    "--ask-for-approval",
+                    "never",
+                    "exec",
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    "--config",
+                    "web_search=\"disabled\"",
+                ],
+                prompt_at: None,
+                confirm: None,
+            },
+            AssistantTier {
+                containment: AssistantContainment::ProviderDefault,
+                summary: "Codex runs non-interactively with its own defaults and your configuration for it: Premier switches nothing off, so it can read files, run commands, and use the network as far as that configuration allows without asking.",
+                required: &["exec", "--skip-git-repo-check"],
+                args: &["exec", "--skip-git-repo-check"],
+                prompt_at: None,
+                confirm: None,
+            },
+        ],
+    },
+    AssistantDefinition {
+        id: "grok",
+        label: "Grok",
+        help: &[&["--help"]],
+        tiers: &[
+            AssistantTier {
+                containment: AssistantContainment::NoTools,
+                summary: "Grok runs for one turn with its built-in tools, subagents, memory, and web search switched off: it can only read the prompt and write an answer.",
+                required: &[
+                    "--single",
+                    "--permission-mode",
+                    "--tools",
+                    "--no-subagents",
+                    "--no-memory",
+                    "--disable-web-search",
+                    "--max-turns",
+                ],
+                args: &[
+                    "--single",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--tools",
+                    "",
+                    "--no-subagents",
+                    "--no-memory",
+                    "--disable-web-search",
+                    "--max-turns",
+                    "1",
+                    "--verbatim",
+                ],
+                prompt_at: Some(1),
+                confirm: None,
+            },
+            // Grok 1.0 has no `--no-memory`.
+            AssistantTier {
+                containment: AssistantContainment::NoTools,
+                summary: "Grok runs for one turn with its built-in tools, subagents, and web search switched off, though its cross-session memory stays on: it can only read the prompt and write an answer.",
+                required: &[
+                    "--single",
+                    "--permission-mode",
+                    "--tools",
+                    "--no-subagents",
+                    "--disable-web-search",
+                    "--max-turns",
+                ],
+                args: &[
+                    "--single",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--tools",
+                    "",
+                    "--no-subagents",
+                    "--disable-web-search",
+                    "--max-turns",
+                    "1",
+                    "--verbatim",
+                ],
+                prompt_at: Some(1),
+                confirm: None,
+            },
+            AssistantTier {
+                containment: AssistantContainment::ProviderDefault,
+                summary: "Grok runs with its own defaults and your configuration for it: Premier switches nothing off, so it can read files, run commands, and use the network as far as that configuration allows without asking.",
+                required: &["--single"],
+                args: &["--single"],
+                prompt_at: Some(1),
+                confirm: None,
+            },
+        ],
+    },
+    AssistantDefinition {
+        id: "gemini",
+        label: "Gemini",
+        help: &[&["--help"]],
+        tiers: &[
+            // Plan mode is read-only and runs in Gemini's sandbox, but its
+            // built-in web tools keep network access, so this is not the
+            // read-only sandbox tier.
+            AssistantTier {
+                containment: AssistantContainment::ProviderDefault,
+                summary: "Gemini runs in its read-only plan mode and sandbox with extensions and MCP servers off: it cannot change files, but its built-in file-reading and web tools remain available.",
+                required: &[
+                    "--prompt",
+                    "--approval-mode",
+                    "--sandbox",
+                    "--output-format",
+                    "--extensions",
+                    "--allowed-mcp-server-names",
+                ],
+                args: &[
+                    "--prompt",
+                    "--approval-mode",
+                    "plan",
+                    "--sandbox",
+                    "--output-format",
+                    "text",
+                    "--extensions",
+                    "none",
+                    "--allowed-mcp-server-names",
+                    "premier-none",
+                ],
+                prompt_at: Some(1),
+                confirm: None,
+            },
+            AssistantTier {
+                containment: AssistantContainment::ProviderDefault,
+                summary: "Gemini runs with its own defaults and your configuration for it: Premier switches nothing off, so it can read files, run commands, and use the network as far as that configuration allows without asking.",
+                required: &["--prompt"],
+                args: &["--prompt"],
+                prompt_at: Some(1),
+                confirm: None,
+            },
+        ],
+    },
+    AssistantDefinition {
+        id: "opencode",
+        label: "OpenCode",
+        help: &[&["run", "--help"]],
+        tiers: &[
+            // `--standalone` keeps the run in this process tree instead of
+            // handing it to OpenCode's background service, which would have
+            // neither the scratch directory nor the scrubbed environment.
+            AssistantTier {
+                containment: AssistantContainment::ProviderDefault,
+                summary: "OpenCode runs with its own defaults and your configuration for it: it has no flag that takes its tools away, so it can read files, run commands, and use the network as far as that configuration allows without asking.",
+                required: &["opencode run", "--standalone"],
+                args: &["run", "--standalone"],
+                prompt_at: None,
+                confirm: None,
+            },
+            AssistantTier {
+                containment: AssistantContainment::ProviderDefault,
+                summary: "OpenCode runs with its own defaults and your configuration for it: it has no flag that takes its tools away, so it can read files, run commands, and use the network as far as that configuration allows without asking.",
+                required: &["opencode run"],
+                args: &["run"],
+                prompt_at: None,
+                confirm: None,
+            },
+        ],
+    },
+];
+
 #[derive(Clone, Debug)]
 struct AssistantProvider {
     id: &'static str,
     label: &'static str,
     executable: Option<PathBuf>,
-    safe_invocation: bool,
+    /// How the installed CLI will be run: the strongest tier it supports.
+    invocation: Option<&'static AssistantTier>,
     unavailable_reason: Option<String>,
+}
+
+impl AssistantProvider {
+    /// Why this provider cannot be asked on a server that requires at least
+    /// `minimum`, if it cannot.
+    fn refusal(&self, minimum: AssistantContainment) -> Option<String> {
+        if self.executable.is_none() {
+            return Some("CLI executable was not found on PATH".to_owned());
+        }
+        let Some(tier) = self.invocation else {
+            return Some(self.unavailable_reason.clone().unwrap_or_else(|| {
+                "installed CLI has no non-interactive mode Premier can run".to_owned()
+            }));
+        };
+        (tier.containment < minimum).then(|| {
+            format!(
+                "this server requires {minimum} containment or stronger (--assistant-containment), and the installed {} CLI supports only {}",
+                self.label, tier.containment
+            )
+        })
+    }
 }
 
 /// The assistant CLIs this server may run. Discovery executes each CLI found
@@ -371,6 +754,13 @@ struct AssistantAvailability {
     label: &'static str,
     installed: bool,
     available: bool,
+    /// The tier the installed CLI would run under, also when the server's
+    /// minimum hides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containment: Option<AssistantContainment>,
+    /// What the CLI can do while answering, for the consent step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containment_summary: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -579,6 +969,7 @@ fn app_with_registry(
         only_artifact: options.only_artifact,
         assistants,
         assistant_enabled: !options.disable_assistant,
+        assistant_minimum: options.assistant_containment,
         assistant_slot: tokio::sync::Semaphore::new(1),
         snapshots: Mutex::new(HashMap::new()),
     });
@@ -1269,47 +1660,29 @@ impl AssistantRegistry {
     fn discover_with(
         find: impl Fn(&str) -> Option<PathBuf>,
     ) -> HashMap<&'static str, AssistantProvider> {
-        let definitions = [
-            ("claude", "Claude", true, None),
-            ("codex", "Codex", true, None),
-            ("grok", "Grok", true, None),
-            ("gemini", "Gemini", true, None),
-            (
-                "opencode",
-                "OpenCode",
-                false,
-                Some(
-                    "OpenCode CLI does not document a non-interactive read-only or tool-deny mode",
-                ),
-            ),
-        ];
-        definitions
-            .into_iter()
-            .map(
-                |(id, label, supports_safe_invocation, unavailable_reason)| {
-                    let executable = find(id);
-                    let probe = executable
-                        .as_ref()
-                        .filter(|_| supports_safe_invocation)
-                        .map(|path| probe_assistant_capabilities(id, path));
-                    let safe_invocation = matches!(probe, Some(Ok(())));
-                    let unavailable_reason = if !supports_safe_invocation {
-                        unavailable_reason.map(str::to_owned)
-                    } else {
-                        probe.and_then(|result| result.err())
-                    };
-                    (
-                        id,
-                        AssistantProvider {
-                            id,
-                            label,
-                            executable,
-                            safe_invocation,
-                            unavailable_reason,
-                        },
-                    )
-                },
-            )
+        ASSISTANT_DEFINITIONS
+            .iter()
+            .map(|definition| {
+                let executable = find(definition.id);
+                let probe = executable
+                    .as_ref()
+                    .map(|path| probe_assistant_tier(definition, path));
+                let (invocation, unavailable_reason) = match probe {
+                    Some(Ok(tier)) => (Some(tier), None),
+                    Some(Err(reason)) => (None, Some(reason)),
+                    None => (None, None),
+                };
+                (
+                    definition.id,
+                    AssistantProvider {
+                        id: definition.id,
+                        label: definition.label,
+                        executable,
+                        invocation,
+                        unavailable_reason,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -1319,11 +1692,17 @@ impl AssistantRegistry {
 
     #[cfg(test)]
     fn with_provider(id: &'static str, executable: PathBuf) -> Self {
+        Self::with_tier(id, executable, AssistantContainment::NoTools)
+    }
+
+    /// One installed provider that would run under its `containment` tier.
+    #[cfg(test)]
+    fn with_tier(id: &'static str, executable: PathBuf, containment: AssistantContainment) -> Self {
         let provider = AssistantProvider {
             id,
             label: "Test assistant",
             executable: Some(executable),
-            safe_invocation: true,
+            invocation: Some(assistant_tier(id, containment)),
             unavailable_reason: None,
         };
         Self::known(HashMap::from([(id, provider)]))
@@ -1401,85 +1780,70 @@ fn probe_output_within(
     })
 }
 
-fn probe_assistant_capabilities(
-    provider: &str,
+/// The first tier of `provider` with this containment.
+#[cfg(test)]
+fn assistant_tier(provider: &str, containment: AssistantContainment) -> &'static AssistantTier {
+    ASSISTANT_DEFINITIONS
+        .iter()
+        .find(|definition| definition.id == provider)
+        .and_then(|definition| {
+            definition
+                .tiers
+                .iter()
+                .find(|tier| tier.containment == containment)
+        })
+        .expect("the provider has a tier with this containment")
+}
+
+/// The strongest way the installed CLI can be run: the first tier whose flags
+/// its help text names and whose further check, if it has one, passes. A CLI
+/// is refused only when no tier fits, which means it has no non-interactive
+/// mode this server knows how to use.
+fn probe_assistant_tier(
+    definition: &'static AssistantDefinition,
     executable: &Path,
-) -> std::result::Result<(), String> {
-    let mut commands = vec![vec!["--help"]];
-    if provider == "codex" {
-        commands.push(vec!["exec", "--help"]);
-    }
+) -> std::result::Result<&'static AssistantTier, String> {
     let mut help = String::new();
-    for args in commands {
+    for args in definition.help {
         let mut command = std::process::Command::new(executable);
-        command.args(args);
+        command.args(*args);
         let output = probe_output(command)
             .map_err(|error| format!("could not inspect CLI capabilities: {error}"))?;
         help.push_str(&String::from_utf8_lossy(&output.stdout));
         help.push_str(&String::from_utf8_lossy(&output.stderr));
     }
-    let required: &[&str] = match provider {
-        "claude" => &[
-            "--print",
-            "--permission-mode",
-            "--tools",
-            "--no-session-persistence",
-            "--safe-mode",
-        ],
-        "codex" => &[
-            "--ask-for-approval",
-            "--sandbox",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--config",
-        ],
-        "grok" => &[
-            "--single",
-            "--permission-mode",
-            "--tools",
-            "--no-subagents",
-            "--no-memory",
-            "--disable-web-search",
-            "--max-turns",
-        ],
-        "gemini" => &[
-            "--prompt",
-            "--approval-mode",
-            "--sandbox",
-            "--output-format",
-            "--extensions",
-            "--allowed-mcp-server-names",
-        ],
-        _ => return Err("unsupported assistant provider".into()),
-    };
-    let missing = required
-        .iter()
-        .filter(|flag| !help.contains(**flag))
-        .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "installed CLI is missing required safe flags: {}",
-            missing.join(", ")
-        ));
+    let mut missing = Vec::new();
+    for tier in definition.tiers {
+        missing = tier
+            .required
+            .iter()
+            .filter(|flag| !help.contains(**flag))
+            .copied()
+            .collect::<Vec<_>>();
+        if missing.is_empty()
+            && tier
+                .confirm
+                .is_none_or(|confirm| confirm(executable).is_ok())
+        {
+            return Ok(tier);
+        }
     }
-    if provider == "codex" {
-        verify_codex_lockdown(executable)?;
-    }
-    Ok(())
+    Err(format!(
+        "installed {} CLI has no non-interactive mode Premier can run (its help does not mention {})",
+        definition.label,
+        missing.join(", ")
+    ))
 }
 
-/// Codex features that give the model command execution. `assistant_args`
+/// Codex features that give the model command execution. The tool-less tier
 /// turns each off with `--config features.<name>=false`.
 const CODEX_DISABLED_FEATURES: [&str; 2] = ["shell_tool", "unified_exec"];
 
 /// Accepting a flag is not the same as honouring it: Codex 0.162 takes
 /// `--config features.unified_exec=false` and keeps the feature on. Ask the
-/// installed CLI for the effective state under the exact overrides
-/// `assistant_args` passes, and refuse the provider unless every
-/// command-execution feature is reported off.
+/// installed CLI for the effective state under the exact overrides the
+/// tool-less tier passes; unless every command-execution feature is reported
+/// off, Codex is run in its read-only sandbox instead and described as such.
 fn verify_codex_lockdown(executable: &Path) -> std::result::Result<(), String> {
     let mut command = std::process::Command::new(executable);
     for feature in CODEX_DISABLED_FEATURES {
@@ -1554,23 +1918,21 @@ async fn list_assistants(
         .assistants
         .providers()
         .values()
-        .map(|provider| AssistantAvailability {
-            provider: provider.id,
-            label: provider.label,
-            installed: provider.executable.is_some(),
-            available: permitted && provider.executable.is_some() && provider.safe_invocation,
-            reason: if !permitted {
-                Some("these credentials lack the assistant:use scope".to_owned())
-            } else if provider.safe_invocation {
-                None
-            } else {
-                // An intrinsic blocker (e.g. no tool-deny mode) outranks installation
-                // state: installing the CLI would not make the provider available.
-                provider
-                    .unavailable_reason
-                    .clone()
-                    .or_else(|| Some("CLI executable was not found on PATH".to_owned()))
-            },
+        .map(|provider| {
+            let refusal = provider.refusal(state.assistant_minimum);
+            AssistantAvailability {
+                provider: provider.id,
+                label: provider.label,
+                installed: provider.executable.is_some(),
+                available: permitted && refusal.is_none(),
+                containment: provider.invocation.map(|tier| tier.containment),
+                containment_summary: provider.invocation.map(|tier| tier.summary),
+                reason: if permitted {
+                    refusal
+                } else {
+                    Some("these credentials lack the assistant:use scope".to_owned())
+                },
+            }
         })
         .collect::<Vec<_>>();
     providers.sort_by_key(|provider| provider.provider);
@@ -1596,17 +1958,15 @@ async fn ask_assistant(
         .providers()
         .get(request.provider.as_str())
         .ok_or_else(|| ApiResponseError::bad_request("unknown assistant provider"))?;
-    let executable = provider.executable.as_ref().ok_or_else(|| {
-        ApiResponseError::service_unavailable("assistant CLI is not installed or not on PATH")
-    })?;
-    if !provider.safe_invocation {
-        return Err(ApiResponseError::service_unavailable(
-            provider
-                .unavailable_reason
-                .as_deref()
-                .unwrap_or("assistant has no verified safe invocation"),
-        ));
+    if let Some(reason) = provider.refusal(state.assistant_minimum) {
+        return Err(ApiResponseError::service_unavailable(&reason));
     }
+    let (Some(executable), Some(invocation)) = (provider.executable.as_ref(), provider.invocation)
+    else {
+        return Err(ApiResponseError::internal(
+            "assistant provider has no invocation",
+        ));
+    };
 
     // Held until the response is produced. A disconnecting client drops this
     // future, which releases the slot and kills the child (`kill_on_drop`).
@@ -1630,6 +1990,7 @@ async fn ask_assistant(
     let scratch = AssistantScratchDir::create()?;
     let answer = run_assistant(
         provider.id,
+        invocation,
         executable,
         &scratch.path,
         &prompt,
@@ -1870,87 +2231,18 @@ fn redact_sensitive_fields(value: &mut serde_json::Value) {
     evidence::redact_secrets(value);
 }
 
-fn assistant_args(provider: &str, prompt: &str) -> Option<Vec<String>> {
-    let args: Vec<&str> = match provider {
-        "claude" => vec![
-            "--print",
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "dontAsk",
-            "--tools",
-            "",
-            "--no-session-persistence",
-            "--safe-mode",
-        ],
-        "codex" => vec![
-            "--ask-for-approval",
-            "never",
-            "exec",
-            "--sandbox",
-            "read-only",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--color",
-            "never",
-            // `--sandbox read-only` still lets the model read any file through
-            // its shell; answering a trace question needs no tools at all.
-            "--config",
-            "features.shell_tool=false",
-            "--config",
-            "features.unified_exec=false",
-            "--config",
-            "web_search=\"disabled\"",
-        ],
-        "grok" => vec![
-            "--single",
-            "--permission-mode",
-            "dontAsk",
-            "--tools",
-            "",
-            "--no-subagents",
-            "--no-memory",
-            "--disable-web-search",
-            "--max-turns",
-            "1",
-            "--verbatim",
-        ],
-        "gemini" => vec![
-            "--prompt",
-            "--approval-mode",
-            "plan",
-            "--sandbox",
-            "--output-format",
-            "text",
-            // Plan mode is read-only but keeps built-in file and web tools; at
-            // least drop every user extension and MCP server.
-            "--extensions",
-            "none",
-            "--allowed-mcp-server-names",
-            "premier-none",
-        ],
-        _ => return None,
-    };
-    let mut args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
-    match provider {
-        "grok" => args.insert(1, prompt.to_owned()),
-        "gemini" => args.insert(1, prompt.to_owned()),
-        _ => args.push(prompt.to_owned()),
-    }
-    Some(args)
-}
-
+/// Run one assistant CLI for one answer. Whatever the tier, the CLI gets an
+/// empty working directory, an environment without Premier's secrets, closed
+/// standard input, its own process group, a deadline, and bounded output.
 async fn run_assistant(
     provider: &str,
+    invocation: &AssistantTier,
     executable: &Path,
     working_directory: &Path,
     prompt: &str,
     timeout: Duration,
 ) -> Result<String, ApiResponseError> {
-    let args = assistant_args(provider, prompt)
-        .ok_or_else(|| ApiResponseError::bad_request("unsupported assistant provider"))?;
+    let args = invocation.command_line(prompt);
     let mut command = Command::new(executable);
     for name in ASSISTANT_SCRUBBED_ENV {
         command.env_remove(name);
@@ -3979,12 +4271,19 @@ mod tests {
 
     #[test]
     fn assistant_invocations_are_noninteractive_and_provider_specific() {
-        let claude = assistant_args("claude", "question").unwrap();
+        use AssistantContainment::{NoTools, ProviderDefault, ReadOnlySandbox};
+        let args =
+            |provider, containment| assistant_tier(provider, containment).command_line("question");
+        let claude = args("claude", NoTools);
         assert!(claude.windows(2).any(|args| args == ["--tools", ""]));
         assert!(claude.contains(&"--safe-mode".into()));
         assert_eq!(claude.last().unwrap(), "question");
+        assert_eq!(
+            args("claude", ProviderDefault),
+            ["--print", "--output-format", "text", "question"]
+        );
 
-        let codex = assistant_args("codex", "question").unwrap();
+        let codex = args("codex", NoTools);
         assert!(
             codex
                 .windows(2)
@@ -4004,11 +4303,33 @@ mod tests {
         }
         assert_eq!(codex.last().unwrap(), "question");
 
-        let grok = assistant_args("grok", "question").unwrap();
+        // The sandbox tier: read-only, nothing approved, no user configuration
+        // (and so no MCP servers), no web search; the shell stays.
+        let sandboxed = args("codex", ReadOnlySandbox);
+        assert_eq!(sandboxed[..3], ["--ask-for-approval", "never", "exec"]);
+        for pair in [
+            ["--sandbox", "read-only"],
+            ["--config", "web_search=\"disabled\""],
+        ] {
+            assert!(sandboxed.windows(2).any(|args| args == pair), "{pair:?}");
+        }
+        for flag in ["--ephemeral", "--ignore-user-config", "--ignore-rules"] {
+            assert!(sandboxed.contains(&flag.to_owned()), "{flag}");
+        }
+        assert!(!sandboxed.iter().any(|arg| arg.starts_with("features.")));
+        assert_eq!(sandboxed.last().unwrap(), "question");
+        assert_eq!(
+            args("codex", ProviderDefault),
+            ["exec", "--skip-git-repo-check", "question"]
+        );
+
+        let grok = args("grok", NoTools);
         assert!(grok.windows(2).any(|args| args == ["--tools", ""]));
         assert!(grok.contains(&"--no-subagents".into()));
+        assert_eq!(grok[..2], ["--single", "question"]);
+        assert_eq!(args("grok", ProviderDefault), ["--single", "question"]);
 
-        let gemini = assistant_args("gemini", "question").unwrap();
+        let gemini = args("gemini", ProviderDefault);
         assert!(
             gemini
                 .windows(2)
@@ -4021,13 +4342,58 @@ mod tests {
                 .any(|args| args == ["--extensions", "none"])
         );
         assert!(gemini.contains(&"--allowed-mcp-server-names".into()));
-        assert!(assistant_args("opencode", "question").is_none());
+        assert_eq!(
+            args("opencode", ProviderDefault),
+            ["run", "--standalone", "question"]
+        );
     }
 
     #[test]
-    fn codex_is_only_trusted_when_its_feature_list_confirms_the_lockdown() {
+    fn every_provider_ends_in_a_tier_and_tiers_never_get_stronger_down_the_list() {
+        for definition in &ASSISTANT_DEFINITIONS {
+            assert!(!definition.tiers.is_empty(), "{}", definition.id);
+            assert!(
+                definition
+                    .tiers
+                    .windows(2)
+                    .all(|pair| pair[0].containment >= pair[1].containment),
+                "{}: a weaker tier is preferred over a stronger one",
+                definition.id
+            );
+            for tier in definition.tiers {
+                assert!(tier.summary.ends_with('.'), "{}", tier.summary);
+                assert_eq!(tier.summary.matches(". ").count(), 0, "{}", tier.summary);
+                assert!(tier.prompt_at.unwrap_or(0) <= tier.args.len());
+            }
+        }
+        // Only a tier that takes the tools away, or confines them, may claim more
+        // than the provider's defaults.
+        assert!(
+            AssistantContainment::NoTools > AssistantContainment::ReadOnlySandbox
+                && AssistantContainment::ReadOnlySandbox > AssistantContainment::ProviderDefault
+        );
+        assert_eq!(
+            AssistantContainment::default(),
+            AssistantContainment::ProviderDefault
+        );
+        for (text, expected) in [
+            ("no_tools", AssistantContainment::NoTools),
+            ("read-only-sandbox", AssistantContainment::ReadOnlySandbox),
+            ("provider_default", AssistantContainment::ProviderDefault),
+        ] {
+            assert_eq!(text.parse::<AssistantContainment>(), Ok(expected));
+            assert_eq!(
+                expected.as_str().parse::<AssistantContainment>(),
+                Ok(expected)
+            );
+        }
+        assert!("strict".parse::<AssistantContainment>().is_err());
+    }
+
+    #[test]
+    fn codex_is_only_called_tool_less_when_its_feature_list_confirms_the_lockdown() {
         // Every feature the probe checks is one the invocation switches off.
-        let codex = assistant_args("codex", "question").unwrap();
+        let codex = assistant_tier("codex", AssistantContainment::NoTools).command_line("question");
         for feature in CODEX_DISABLED_FEATURES {
             let disabled = format!("features.{feature}=false");
             assert!(
@@ -4055,29 +4421,154 @@ mod tests {
         assert!(codex_lockdown_gap("").is_some());
     }
 
+    /// A stand-in CLI: prints `help` for anything but `features list`, for
+    /// which it prints `features`. It records nothing and answers no prompt.
+    #[cfg(unix)]
+    fn fake_cli(directory: &Path, name: &str, help: &str, features: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = directory.join(name);
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n*'features list') printf '%s\\n' {features};;\n*) printf '%s\\n' {help};;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
+
+    #[cfg(unix)]
+    fn definition(id: &str) -> &'static AssistantDefinition {
+        ASSISTANT_DEFINITIONS
+            .iter()
+            .find(|definition| definition.id == id)
+            .unwrap()
+    }
+
     #[cfg(unix)]
     #[test]
-    fn codex_probe_marks_the_provider_unavailable_when_a_disable_flag_is_ignored() {
-        use std::os::unix::fs::PermissionsExt;
+    fn codex_probe_falls_back_to_the_sandbox_when_a_disable_flag_is_ignored() {
         let temp = tempfile::tempdir().unwrap();
-        let fake = |name: &str, unified_exec: &str| {
-            let executable = temp.path().join(name);
-            fs::write(
-                &executable,
-                format!(
-                    "#!/bin/sh\ncase \"$*\" in\n*'features list') printf 'shell_tool stable false\\nunified_exec stable {unified_exec}\\n';;\n*) printf '%s\\n' --ask-for-approval --sandbox --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --config;;\nesac\n"
-                ),
+        let full = "--ask-for-approval --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --color --config exec";
+        let tier = |name: &str, help: &str, features: &str| {
+            probe_assistant_tier(
+                definition("codex"),
+                &fake_cli(temp.path(), name, help, features),
             )
-            .unwrap();
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-            executable
         };
-        assert_eq!(
-            probe_assistant_capabilities("codex", &fake("honours", "false")),
-            Ok(())
+        let honoured = tier(
+            "honours",
+            full,
+            "'shell_tool stable false' 'unified_exec stable false'",
+        )
+        .unwrap();
+        assert_eq!(honoured.containment, AssistantContainment::NoTools);
+
+        // Codex 0.162.1: the override is accepted and the feature stays on.
+        // The provider is not refused; it runs in the read-only sandbox and
+        // its description says what that leaves it able to do.
+        let ignored = tier(
+            "ignores",
+            full,
+            "'shell_tool stable false' 'unified_exec stable true'",
+        )
+        .unwrap();
+        assert_eq!(ignored.containment, AssistantContainment::ReadOnlySandbox);
+        assert!(ignored.summary.contains("can run shell commands"));
+        assert!(
+            ignored
+                .summary
+                .contains("cannot write files or use the network")
         );
-        let reason = probe_assistant_capabilities("codex", &fake("ignores", "true")).unwrap_err();
-        assert!(reason.contains("unified_exec is true"), "{reason}");
+        assert!(
+            !ignored
+                .command_line("question")
+                .iter()
+                .any(|arg| arg.starts_with("features."))
+        );
+
+        // An older CLI with a non-interactive mode and none of the flags.
+        let plain = tier("plain", "exec --skip-git-repo-check", "").unwrap();
+        assert_eq!(plain.containment, AssistantContainment::ProviderDefault);
+        assert!(plain.summary.contains("Premier switches nothing off"));
+
+        // No non-interactive mode at all is the one reason to refuse.
+        let reason = tier("interactive", "--model --profile", "").unwrap_err();
+        assert!(reason.contains("no non-interactive mode"), "{reason}");
+        assert!(reason.contains("--skip-git-repo-check"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_provider_is_run_under_the_strongest_tier_its_help_supports() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = |id: &str, name: &str, help: &str| {
+            probe_assistant_tier(definition(id), &fake_cli(temp.path(), name, help, "")).unwrap()
+        };
+        let claude = probe(
+            "claude",
+            "claude-full",
+            "--print --output-format --permission-mode --tools --no-session-persistence --safe-mode",
+        );
+        assert_eq!(claude.containment, AssistantContainment::NoTools);
+        let older = probe("claude", "claude-old", "--print --output-format");
+        assert_eq!(older.containment, AssistantContainment::ProviderDefault);
+        assert_eq!(older.args, ["--print", "--output-format", "text"]);
+
+        let grok = probe(
+            "grok",
+            "grok-full",
+            "--single --permission-mode --tools --no-subagents --no-memory --disable-web-search --max-turns",
+        );
+        assert_eq!(grok.containment, AssistantContainment::NoTools);
+        assert!(grok.args.contains(&"--no-memory"));
+        // Grok 1.0.50 has every flag but `--no-memory`: still tool-less, and
+        // the description says memory stays on.
+        let no_memory_flag = probe(
+            "grok",
+            "grok-one",
+            "--single --permission-mode --tools --no-subagents --disable-web-search --max-turns",
+        );
+        assert_eq!(no_memory_flag.containment, AssistantContainment::NoTools);
+        assert!(!no_memory_flag.args.contains(&"--no-memory"));
+        assert!(no_memory_flag.summary.contains("memory stays on"));
+        assert_eq!(
+            probe("grok", "grok-old", "--single").containment,
+            AssistantContainment::ProviderDefault
+        );
+
+        // Plan mode keeps Gemini's web tools, so it is not called a sandbox
+        // without network access.
+        let gemini = probe(
+            "gemini",
+            "gemini-full",
+            "--prompt --approval-mode --sandbox --output-format --extensions --allowed-mcp-server-names",
+        );
+        assert_eq!(gemini.containment, AssistantContainment::ProviderDefault);
+        assert!(gemini.args.contains(&"plan"));
+        assert!(gemini.summary.contains("web tools remain available"));
+
+        // OpenCode has a one-shot mode and no tool-deny flag: it is offered,
+        // under the weakest tier, in its own process tree when it can be.
+        let opencode = probe(
+            "opencode",
+            "opencode-two",
+            "'opencode run [flags] [<message...>]' --standalone",
+        );
+        assert_eq!(opencode.containment, AssistantContainment::ProviderDefault);
+        assert_eq!(opencode.args, ["run", "--standalone"]);
+        assert_eq!(
+            probe("opencode", "opencode-one", "'opencode run [message..]'").args,
+            ["run"]
+        );
+        assert!(
+            probe_assistant_tier(
+                definition("opencode"),
+                &fake_cli(temp.path(), "opencode-none", "serve", "")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4208,7 +4699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assistant_availability_distinguishes_installed_from_safe() {
+    async fn assistant_availability_reports_what_is_not_installed() {
         // Discovery over an empty PATH: the test must not run whatever agent
         // CLIs happen to be installed on this machine.
         let temp = tempfile::tempdir().unwrap().keep();
@@ -4232,15 +4723,110 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
         let providers: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let opencode = providers
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|provider| provider["provider"] == "opencode")
-            .unwrap();
-        assert!(opencode["installed"].is_boolean());
-        assert_eq!(opencode["available"], false);
-        assert!(opencode["reason"].as_str().unwrap().contains("tool-deny"));
+        let providers = providers.as_array().unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider["provider"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["claude", "codex", "gemini", "grok", "opencode"]
+        );
+        for provider in providers {
+            assert_eq!(provider["installed"], false, "{provider}");
+            assert_eq!(provider["available"], false, "{provider}");
+            assert!(provider.get("containment").is_none(), "{provider}");
+            assert_eq!(
+                provider["reason"], "CLI executable was not found on PATH",
+                "{provider}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assistant_list_reports_the_tier_and_a_minimum_hides_weaker_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("spawned");
+        let script = format!("touch '{}'\nprintf answer", marker.display());
+        let list = |app: Router| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/assistants")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let ask = |trace_id: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/traces/{trace_id}/assistant"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"provider":"codex","prompt":"help"}"#))
+                .unwrap()
+        };
+        let sandboxed = |directory: &Path, options: ServerOptions| {
+            let (_, trace_id, trace_dir) = assistant_fixture(directory, &script, options.clone());
+            let app = app_with_registry(
+                trace_dir,
+                Some(directory.join("viewer")),
+                AuthPolicy::default(),
+                options,
+                AssistantRegistry::with_tier(
+                    "codex",
+                    directory.join("fake-claude"),
+                    AssistantContainment::ReadOnlySandbox,
+                ),
+            );
+            (app, trace_id)
+        };
+
+        // By default every installed provider works, and the list says under what.
+        let open = temp.path().join("open");
+        fs::create_dir_all(&open).unwrap();
+        let (app, trace_id) = sandboxed(&open, ServerOptions::default());
+        let providers = list(app.clone()).await;
+        assert_eq!(providers[0]["available"], true, "{providers}");
+        assert_eq!(providers[0]["containment"], "read_only_sandbox");
+        assert!(
+            providers[0]["containment_summary"]
+                .as_str()
+                .unwrap()
+                .contains("cannot write files or use the network")
+        );
+        assert!(providers[0].get("reason").is_none());
+        let answered = app.oneshot(ask(&trace_id)).await.unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        assert!(marker.exists());
+        fs::remove_file(&marker).unwrap();
+
+        // A stricter minimum hides it, with the reason, and nothing is run.
+        let strict = temp.path().join("strict");
+        fs::create_dir_all(&strict).unwrap();
+        let (app, trace_id) = sandboxed(
+            &strict,
+            ServerOptions {
+                assistant_containment: AssistantContainment::NoTools,
+                ..ServerOptions::default()
+            },
+        );
+        let providers = list(app.clone()).await;
+        assert_eq!(providers[0]["available"], false, "{providers}");
+        assert_eq!(providers[0]["installed"], true);
+        assert_eq!(providers[0]["containment"], "read_only_sandbox");
+        let reason = providers[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("requires no_tools containment"), "{reason}");
+        assert!(
+            reason.contains("supports only read_only_sandbox"),
+            "{reason}"
+        );
+        let refused = app.oneshot(ask(&trace_id)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!marker.exists(), "a hidden provider must not be run");
     }
 
     #[cfg(unix)]
@@ -5115,6 +5701,7 @@ mod tests {
         let started = Instant::now();
         let error = run_assistant(
             "claude",
+            assistant_tier("claude", AssistantContainment::NoTools),
             &executable,
             temp.path(),
             "question",
@@ -5161,6 +5748,7 @@ mod tests {
             async move {
                 run_assistant(
                     "claude",
+                    assistant_tier("claude", AssistantContainment::NoTools),
                     &executable,
                     &directory,
                     "question",
@@ -5231,7 +5819,7 @@ mod tests {
             known
                 .providers()
                 .values()
-                .all(|provider| !provider.safe_invocation)
+                .all(|provider| provider.invocation.is_none())
         );
     }
 

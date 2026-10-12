@@ -25,8 +25,8 @@ Usage: ./scripts/package-release.sh [options]
   --expect-sigstore     Mark metadata for a Sigstore bundle added by release CI
 
 The output contains the single embedded-viewer binary, the premier-emit.sh
-shell helper, README, LICENSE, release metadata, internal checksums, and an
-archive checksum sidecar.
+shell helper, README, LICENSE, THIRD_PARTY_NOTICES.md, release metadata,
+internal checksums, and an archive checksum sidecar.
 
 Before anything is written the binary is checked against what the metadata
 will say about it: a binary for this host is run (`premier build-info`) and
@@ -82,6 +82,12 @@ fi
 [[ -f "$BINARY" && -x "$BINARY" ]] || { echo "binary is not an executable file: $BINARY" >&2; exit 1; }
 [[ -f "$ROOT/README.md" ]] || { echo "README.md is missing" >&2; exit 1; }
 [[ -f "$ROOT/LICENSE" ]] || { echo "LICENSE is missing" >&2; exit 1; }
+[[ -f "$ROOT/THIRD_PARTY_NOTICES.md" ]] || { echo "THIRD_PARTY_NOTICES.md is missing" >&2; exit 1; }
+# The notices must list every release target's crates, whichever target this archive is for.
+if grep -qF '**Incomplete.**' "$ROOT/THIRD_PARTY_NOTICES.md"; then
+  echo "THIRD_PARTY_NOTICES.md does not cover every release target; run \`cargo fetch --locked\` and \`node scripts/third-party-notices.mjs\`" >&2
+  exit 1
+fi
 HELPER_SOURCE="$ROOT/sdk/shell/premier-emit.sh"
 [[ -f "$HELPER_SOURCE" ]] || { echo "sdk/shell/premier-emit.sh is missing" >&2; exit 1; }
 
@@ -141,6 +147,7 @@ install -m 0755 "$BINARY" "$PACKAGE/bin/premier"
 install -m 0755 "$HELPER_SOURCE" "$PACKAGE/share/premier/premier-emit.sh"
 install -m 0644 "$ROOT/README.md" "$PACKAGE/README.md"
 install -m 0644 "$ROOT/LICENSE" "$PACKAGE/LICENSE"
+install -m 0644 "$ROOT/THIRD_PARTY_NOTICES.md" "$PACKAGE/THIRD_PARTY_NOTICES.md"
 SIGNATURE="none"
 [[ "$EXPECT_SIGSTORE" -eq 1 ]] && SIGNATURE="sigstore-keyless"
 cat >"$PACKAGE/RELEASE-METADATA" <<EOF
@@ -154,7 +161,7 @@ EOF
 
 (
   cd "$PACKAGE"
-  for path in LICENSE README.md RELEASE-METADATA bin/premier share/premier/premier-emit.sh; do
+  for path in LICENSE README.md RELEASE-METADATA THIRD_PARTY_NOTICES.md bin/premier share/premier/premier-emit.sh; do
     printf '%s  %s\n' "$(distribution_sha256 "$path")" "$path"
   done >SHA256SUMS
 )

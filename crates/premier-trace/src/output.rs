@@ -49,6 +49,41 @@ pub fn check_trace_output(output: &Path) -> Result<bool> {
     );
 }
 
+/// Fails unless `path` may be deleted as a trace: a directory itself, not a
+/// link to one, that is recognisably a Premier trace (the same test
+/// [`check_trace_output`] applies before replacing one) and is not the
+/// working directory or one of its ancestors.
+pub fn require_trace_directory(path: &Path) -> Result<()> {
+    // `symlink_metadata` so a link is refused rather than followed.
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        bail!("{} does not exist", path.display());
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{} is a symbolic link, not a trace directory",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!("{} is not a trace directory", path.display());
+    }
+    if let Ok(current) = std::env::current_dir()
+        && contains_directory(path, &current)?
+    {
+        bail!(
+            "{} is the current directory or one of its ancestors",
+            path.display()
+        );
+    }
+    if let Some(foreign) = first_foreign_entry(path)? {
+        bail!(
+            "{} is not a Premier trace directory ({foreign})",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// `remove_dir_all` on the working directory (or a parent of it) would empty
 /// the user's project before failing on the final `rmdir`.
 fn refuse_working_directory(output: &Path) -> Result<()> {
@@ -123,6 +158,41 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+
+    #[test]
+    fn only_a_recognisable_trace_directory_may_be_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("run.atrace");
+        crate::TraceWriter::create(&trace, vec!["agent".into()])
+            .unwrap()
+            .finish(0)
+            .unwrap();
+        require_trace_directory(&trace).unwrap();
+
+        let reason = |path: &Path| require_trace_directory(path).unwrap_err().to_string();
+        assert!(reason(&temp.path().join("missing")).contains("does not exist"));
+        let plain = temp.path().join("notes");
+        fs::create_dir(&plain).unwrap();
+        fs::write(plain.join("todo.txt"), "keep").unwrap();
+        assert!(reason(&plain).contains("not a Premier trace directory"));
+        let file = temp.path().join("file.atrace");
+        fs::write(&file, "x").unwrap();
+        assert!(reason(&file).contains("is not a trace directory"));
+        // A trace somebody put a file of their own into.
+        fs::write(trace.join("notes.txt"), "mine").unwrap();
+        assert!(reason(&trace).contains("unexpected entry `notes.txt`"));
+        fs::remove_file(trace.join("notes.txt")).unwrap();
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("link.atrace");
+            std::os::unix::fs::symlink(&trace, &link).unwrap();
+            assert!(reason(&link).contains("symbolic link"));
+            // A link inside the trace is not something a recorder wrote.
+            let _ = fs::remove_dir_all(trace.join("indexes"));
+            std::os::unix::fs::symlink(&plain, trace.join("indexes")).unwrap();
+            assert!(reason(&trace).contains("unexpected entry `indexes`"));
+        }
+    }
 
     #[test]
     fn creates_parent_when_missing() {

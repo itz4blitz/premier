@@ -3,6 +3,7 @@
 //
 //   node scripts/third-party-notices.mjs                  regenerate the file
 //   node scripts/third-party-notices.mjs --check          fail when the checked-in file is out of date
+//                                                         (works without the crates on disk, see below)
 //   node scripts/third-party-notices.mjs --targets a,b    cover only these Rust targets (see below)
 //
 // Nothing is downloaded. The Rust list is the dependency closure of the `premier` binary as pinned
@@ -12,9 +13,15 @@
 // only ever built for its own platform. Without that, `--targets` restricts the file to the targets
 // that do resolve, and the file says which release targets it leaves out.
 //
-// The JavaScript list is every package in package-lock.json that is not development-only: what the
-// viewer build bundles. package-lock.json records each package's licence.
+// The JavaScript list is every package in package-lock.json that is not development-only: the
+// dependencies of the viewer build and of the SDK. package-lock.json records each package's licence.
+//
+// The file also records a digest of the third-party packages each lockfile pins. `--check` always
+// compares those digests and the JavaScript list, which needs nothing but the two lockfiles, so it
+// fails on a stale file in CI without downloading anything. When every release target's crates are
+// in the local registry it also regenerates the whole file and compares it byte for byte.
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,6 +52,47 @@ if (targets.length === 0 || unknownTargets.length > 0) {
 }
 const uncovered = RELEASE_TARGETS.filter((target) => !targets.includes(target));
 
+const checking = process.argv.includes('--check');
+
+/** Thrown in `--check` mode when a target's crates are not in the local registry. */
+class UnresolvedTarget extends Error {
+  constructor(target, reason) {
+    super(`${target}: ${reason}`);
+    this.target = target;
+  }
+}
+
+function sha256(text) {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+/**
+ * Digest of the third-party crates Cargo.lock pins: name, version and checksum of every package
+ * that has a source. Workspace members are left out, so a Premier version bump does not change it.
+ */
+function cargoLockDigest() {
+  const lock = readFileSync(join(root, 'Cargo.lock'), 'utf8');
+  const lines = [];
+  for (const block of lock.split(/^\[\[package\]\]$/m).slice(1)) {
+    const field = (name) => block.match(new RegExp(`^${name} = "([^"]*)"$`, 'm'))?.[1];
+    if (!field('source')) continue;
+    lines.push(`${field('name')} ${field('version')} ${field('checksum') ?? field('source')}`);
+  }
+  if (lines.length === 0) fail('Cargo.lock lists no third-party package');
+  return sha256(`${lines.sort().join('\n')}\n`);
+}
+
+/** Digest of the packages package-lock.json pins, with whether each is development-only. */
+function packageLockDigest() {
+  const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
+  const lines = [];
+  for (const [path, entry] of Object.entries(lock.packages)) {
+    if (!path.includes('node_modules/') || entry.link) continue;
+    lines.push(`${path} ${entry.version} ${entry.integrity ?? ''} ${entry.dev ? 'dev' : 'bundled'} ${entry.license ?? ''}`);
+  }
+  return sha256(`${lines.sort().join('\n')}\n`);
+}
+
 /** Crates linked into the binary released for `target`: normal dependencies only. */
 function rustPackagesFor(target) {
   let metadata;
@@ -56,6 +104,7 @@ function rustPackagesFor(target) {
     ));
   } catch (error) {
     const reason = String(error.stderr ?? error.message).trim().split('\n')[0];
+    if (checking) throw new UnresolvedTarget(target, reason);
     fail(`the dependencies of ${target} could not be resolved offline (${reason}).\n`
       + 'Run `cargo fetch --locked` once so every release target\'s crates are in the local registry, then retry;\n'
       + 'or pass --targets with the targets that do resolve, and the file will say which ones it leaves out.');
@@ -91,7 +140,7 @@ function rustPackages() {
   return targets.flatMap(rustPackagesFor);
 }
 
-/** Packages the lockfile does not mark as development-only: the viewer's bundled dependencies. */
+/** Packages the lockfile does not mark as development-only: what the viewer and the SDK depend on. */
 function javascriptPackages() {
   const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
   if (lock.lockfileVersion < 2) fail('package-lock.json must be lockfileVersion 2 or later (it records licences)');
@@ -134,14 +183,39 @@ function licenceSummary(packages) {
     .join('\n');
 }
 
-const rust = sorted(rustPackages());
 const javascript = sorted(javascriptPackages());
-const undeclared = [...rust, ...javascript].filter((item) => !item.license);
-if (undeclared.length > 0) {
-  fail(`no declared licence for: ${undeclared.map((item) => `${item.name}@${item.version}`).join(', ')}. Record it before releasing.`);
+const digestLine = `Lockfile digests: \`Cargo.lock\` third-party packages \`sha256:${cargoLockDigest()}\`; \`package-lock.json\` packages \`sha256:${packageLockDigest()}\`.`;
+
+function requireLicences(packages) {
+  const undeclared = packages.filter((item) => !item.license);
+  if (undeclared.length > 0) {
+    fail(`no declared licence for: ${undeclared.map((item) => `${item.name}@${item.version}`).join(', ')}. Record it before releasing.`);
+  }
 }
 
-const document = `# Third-party notices
+/** What the published SDK adds: its own runtime dependencies are in the same lockfile. */
+function sdkSentence() {
+  const sdk = JSON.parse(readFileSync(join(root, 'sdk', 'js', 'package.json'), 'utf8'));
+  const names = Object.keys(sdk.dependencies ?? {});
+  return names.length === 0
+    ? `\`${sdk.name}\` declares no runtime dependencies and includes no third-party code.`
+    : `The runtime dependencies of \`${sdk.name}\` (${names.join(', ')}) are in this list too.`;
+}
+
+function javascriptSection() {
+  return `## JavaScript packages bundled into the viewer
+
+${javascript.length} packages: every package in \`package-lock.json\` that is not development-only. They
+are the dependencies of the viewer embedded in the binary. ${sdkSentence()}
+
+${licenceSummary(javascript)}
+
+${table(javascript)}
+`;
+}
+
+function render(rust) {
+  return `# Third-party notices
 
 The \`premier\` binary and the viewer embedded in it include the third-party software listed
 below. Each package is distributed under the licence its authors declare, shown as an SPDX
@@ -149,11 +223,13 @@ expression; where an expression offers a choice (\`MIT OR Apache-2.0\`), Premier
 under either. The full licence text and copyright notices of a package are published with it at
 the listed source.
 
-Premier itself is licensed under the terms in [LICENSE](LICENSE).
+Premier itself is licensed under the terms in the \`LICENSE\` file distributed beside this one.
 
 This file is generated by \`node scripts/third-party-notices.mjs\` from \`Cargo.lock\` and
-\`package-lock.json\`. Do not edit it by hand: change a dependency, then regenerate it.
-[docs/releasing.md](docs/releasing.md#third-party-notices) says what is and is not listed.
+\`package-lock.json\` in the Premier repository. Do not edit it by hand: change a dependency, then
+regenerate it. \`docs/releasing.md\` there says what is and is not listed.
+
+${digestLine}
 
 ## Rust crates in the \`premier\` binary
 
@@ -169,25 +245,44 @@ ${licenceSummary(rust)}
 
 ${table(rust)}
 
-## JavaScript packages bundled into the viewer
+${javascriptSection()}`;
+}
 
-${javascript.length} packages: every package in \`package-lock.json\` that is not development-only.
+requireLicences(javascript);
+const regenerate = 'Run `cargo fetch --locked`, then `node scripts/third-party-notices.mjs`, and commit the result.';
 
-${licenceSummary(javascript)}
-
-${table(javascript)}
-`;
-
-if (process.argv.includes('--check')) {
+if (checking) {
   let current = '';
   try {
     current = readFileSync(output, 'utf8');
   } catch {
     fail('THIRD_PARTY_NOTICES.md is missing. Run `node scripts/third-party-notices.mjs`.');
   }
-  if (current !== document) fail(`THIRD_PARTY_NOTICES.md is out of date${uncovered.length ? ' for the targets given' : ''}. Run \`node scripts/third-party-notices.mjs\` and commit the result.`);
+  // These three need only the lockfiles.
+  if (!current.includes(`\n${digestLine}\n`)) {
+    fail(`THIRD_PARTY_NOTICES.md is out of date: Cargo.lock or package-lock.json pins different packages than the file was generated from. ${regenerate}`);
+  }
+  if (!current.endsWith(`\n${javascriptSection()}`)) {
+    fail(`THIRD_PARTY_NOTICES.md is out of date: its JavaScript list differs from package-lock.json. ${regenerate}`);
+  }
+  if (uncovered.length === 0 && current.includes('**Incomplete.**')) {
+    fail(`THIRD_PARTY_NOTICES.md does not cover every release target. ${regenerate}`);
+  }
+  let rust;
+  try {
+    rust = sorted(rustPackages());
+  } catch (error) {
+    if (!(error instanceof UnresolvedTarget)) throw error;
+    console.log(`Third-party notices match the lockfiles (${javascript.length} JavaScript packages; lockfile digests agree). `
+      + `The Rust table was not regenerated: the crates of ${error.target} are not in the local registry.`);
+    process.exit(0);
+  }
+  requireLicences(rust);
+  if (current !== render(rust)) fail(`THIRD_PARTY_NOTICES.md is out of date${uncovered.length ? ' for the targets given' : ''}. ${regenerate}`);
   console.log(`Third-party notices are current (${rust.length} crates, ${javascript.length} JavaScript packages).`);
 } else {
-  writeFileSync(output, document);
+  const rust = sorted(rustPackages());
+  requireLicences(rust);
+  writeFileSync(output, render(rust));
   console.log(`Wrote THIRD_PARTY_NOTICES.md (${rust.length} crates, ${javascript.length} JavaScript packages).`);
 }

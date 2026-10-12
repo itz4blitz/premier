@@ -11,7 +11,7 @@ pub use crypto::{
 };
 pub use integrity::{IntegrityReport, IntegrityStatus, assess_integrity};
 pub use journal::{ActiveCursor, EventStream, JournalEnd, JournalIndex};
-pub use output::{check_trace_output, prepare_trace_output};
+pub use output::{check_trace_output, prepare_trace_output, require_trace_directory};
 pub use seal::{
     ManifestSeal, ManifestSignature, Protection, PublicKey, SIGN_KEY_FILE_ENV, SealStatus,
     SigningKey, verify_tamper_evidence,

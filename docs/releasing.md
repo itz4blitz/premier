@@ -2,8 +2,9 @@
 
 Premier release archives are reproducible wrappers around a single executable
 that already embeds the production viewer. Packaging adds `README.md`, the
-Apache-2.0 `LICENSE`, the `premier-emit.sh` shell helper, machine-readable
-`RELEASE-METADATA`, internal `SHA256SUMS`, and an archive checksum sidecar.
+Apache-2.0 `LICENSE`, `THIRD_PARTY_NOTICES.md`, the `premier-emit.sh` shell
+helper, machine-readable `RELEASE-METADATA`, internal `SHA256SUMS`, and an
+archive checksum sidecar.
 Official GitHub releases also include keyless Sigstore bundles, an
 authenticated aggregate checksum manifest, SPDX SBOMs, a standalone installer
 (`premier-install.sh`), and GitHub build-provenance attestations.
@@ -159,8 +160,10 @@ release build, on every pull request.
 
 `THIRD_PARTY_NOTICES.md` at the repository root lists the third-party code
 inside a release with the licence each package declares: the Rust crates
-linked into the `premier` binary, and the JavaScript packages bundled into
-the embedded viewer. It is generated, not written:
+linked into the `premier` binary for all four release targets, and the
+JavaScript packages bundled into the embedded viewer. `@premierstudio/trace`
+has no runtime dependencies, and the file says so. It is generated, not
+written:
 
 ```sh
 cargo fetch --locked                        # once per machine; the only step that uses the network
@@ -168,31 +171,42 @@ node scripts/third-party-notices.mjs        # rewrite THIRD_PARTY_NOTICES.md
 node scripts/third-party-notices.mjs --check  # exit 1 when the checked-in file is out of date
 ```
 
-Regenerate it whenever `Cargo.lock` or `package-lock.json` changes.
+Regenerate it whenever a third-party package in `Cargo.lock` or
+`package-lock.json` changes.
 
 - **Rust.** `Cargo.lock` pins versions but records no licences, so the script
   asks `cargo metadata --locked --offline` for the normal (not build-time,
   not test-only) dependency closure of `premier-cli`, once per release
   target, and reads each crate's declared licence from the local registry.
   That needs the crates of all four targets on disk, which a machine that has
-  only built for itself does not have: hence `cargo fetch --locked`. Without
-  it, `--targets aarch64-apple-darwin,aarch64-unknown-linux-gnu` (any subset)
-  writes a file for the targets that do resolve, and the file says in its own
-  text which release targets it does not cover.
+  only built for itself does not have: hence `cargo fetch --locked`.
+  `--targets` with a subset writes a file that says in its own text which
+  release targets it leaves out; `package-release.sh` refuses to package such
+  a file.
 - **JavaScript.** Every package in `package-lock.json` that is not
   development-only, with the licence the lockfile records.
 - The script stops if any listed package declares no licence.
 - The file lists declared licences and where each package is published. It
   does not reproduce licence texts or copyright lines.
 
-The checked-in file currently covers the two `aarch64` targets only and says
-so; regenerate it after `cargo fetch --locked` before relying on it for an
-`x86_64` release. It is not yet copied into release archives or npm packages:
-doing that means adding it beside `LICENSE` in `scripts/package-release.sh`
-(the copy and the `SHA256SUMS` list), `scripts/stage-npm-packages.sh`, the
-`files` arrays of `packages/premier-cli/package.json` and
-`npm/platforms/*/package.json`, and the exact file lists in
-`scripts/verify-staged-npm.mjs` and `scripts/test-npm-distribution.mjs`.
+**Where it ships.** Beside `LICENSE` in every release archive (listed in the
+archive's `SHA256SUMS`, and checked by the installer like the other payload
+files), and in the npm launcher and each platform package:
+`stage-npm-packages.sh` copies it in, the packages' `files` name it, and
+`verify-staged-npm.mjs` refuses a package that would be published without
+it. The copies inside `npm/platforms/*` and `packages/premier-cli` are
+written at staging time and ignored by git. The `@premierstudio/trace`
+tarball does not carry it, because it contains no third-party code.
+
+**The staleness check.** The file records a digest of the third-party
+packages each lockfile pins (name, version and checksum; Premier's own
+version is not part of it). `--check` always compares those digests and the
+JavaScript list, which needs only the two lockfiles, and CI runs it on every
+pull request (`Require current third-party notices`), so a dependency change
+without a regenerated file fails there without downloading anything. When
+the crates of every release target are in the local registry, `--check` also
+regenerates the whole file and compares it byte for byte; when they are not,
+as in CI, it says that the Rust table itself was not regenerated.
 
 ### Before enabling the public channel
 

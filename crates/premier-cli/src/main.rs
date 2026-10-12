@@ -10,8 +10,8 @@ use premier_cli::liveness::{
     RecorderLiveness, UnfinalizedState, recorder_liveness, unfinalized_state,
 };
 use premier_cli::{
-    AuthPolicy, ServerOptions, app_with_options, embedded_viewer_ready, instrumentation_app,
-    validate_bind, validate_remote_trace_store,
+    AssistantContainment, AuthPolicy, ServerOptions, app_with_options, embedded_viewer_ready,
+    instrumentation_app, validate_bind, validate_remote_trace_store,
 };
 use premier_trace::{
     EventInput, ProcessTermination, RECORDER_LEASE, RecoveryOptions, RedactionConfig,
@@ -404,6 +404,36 @@ enum Commands {
         #[arg(long, default_value = ".premier/traces")]
         trace_dir: PathBuf,
     },
+    /// Delete trace directories.
+    Delete {
+        /// The trace directories to delete.
+        #[arg(required = true)]
+        traces: Vec<PathBuf>,
+        /// Also delete a trace whose recorder is gone without having finalized it.
+        #[arg(long)]
+        include_abandoned: bool,
+        /// Print what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete finalized traces that ended longer ago than a duration.
+    Prune {
+        /// Delete traces that ended at least this long ago: a whole number and
+        /// a unit (s, m, h, d, w), such as 30d or 12h.
+        #[arg(long, value_name = "DURATION", value_parser = premier_cli::retention::parse_age)]
+        older_than: Duration,
+        #[arg(long, default_value = ".premier/traces")]
+        trace_dir: PathBuf,
+        /// Print what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep traces of runs that failed or recorded an issue event.
+        #[arg(long)]
+        keep_issues: bool,
+        /// Also delete traces whose recorder is gone without having finalized them.
+        #[arg(long)]
+        include_abandoned: bool,
+    },
     /// Open the local viewer, optionally focused on one trace.
     Open {
         trace: Option<PathBuf>,
@@ -417,6 +447,11 @@ enum Commands {
         /// Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1).
         #[arg(long)]
         no_assistant: bool,
+        /// Weakest containment an assistant CLI may run under: provider_default
+        /// (every installed CLI works), read_only_sandbox, or no_tools. Providers
+        /// below it are listed as unavailable (also: PREMIER_ASSISTANT_CONTAINMENT).
+        #[arg(long, value_name = "TIER")]
+        assistant_containment: Option<AssistantContainment>,
     },
     /// Serve the viewer locally or to an authenticated team.
     Serve {
@@ -441,6 +476,11 @@ enum Commands {
         /// Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1).
         #[arg(long)]
         no_assistant: bool,
+        /// Weakest containment an assistant CLI may run under: provider_default
+        /// (every installed CLI works), read_only_sandbox, or no_tools. Providers
+        /// below it are listed as unavailable (also: PREMIER_ASSISTANT_CONTAINMENT).
+        #[arg(long, value_name = "TIER")]
+        assistant_containment: Option<AssistantContainment>,
     },
 }
 
@@ -851,14 +891,33 @@ async fn main() -> Result<()> {
             replay_trace(trace, speed, no_sleep)
         }
         Commands::List { trace_dir } => list(trace_dir),
+        Commands::Delete {
+            traces,
+            include_abandoned,
+            dry_run,
+        } => premier_cli::retention::delete(traces, include_abandoned, dry_run),
+        Commands::Prune {
+            older_than,
+            trace_dir,
+            dry_run,
+            keep_issues,
+            include_abandoned,
+        } => premier_cli::retention::prune(premier_cli::retention::PruneOptions {
+            trace_dir,
+            older_than,
+            dry_run,
+            keep_issues,
+            include_abandoned,
+        }),
         Commands::Open {
             trace,
             trace_dir,
             viewer_dir,
             bind,
             no_assistant,
+            assistant_containment,
         } => {
-            let mut options = server_options(no_assistant);
+            let mut options = server_options(no_assistant, assistant_containment)?;
             let (trace_dir, focus) = if let Some(trace) = trace {
                 let manifest = read_manifest(&trace)
                     .with_context(|| format!("cannot open trace {}", trace.display()))?;
@@ -902,6 +961,7 @@ async fn main() -> Result<()> {
             tls_cert,
             tls_key,
             no_assistant,
+            assistant_containment,
         } => {
             if !bind.ip().is_loopback()
                 && password.as_deref().is_some_and(|password| {
@@ -914,7 +974,7 @@ async fn main() -> Result<()> {
             }
             let auth = AuthPolicy::from_sources(password, auth_config.as_deref())?;
             let tls = TlsFiles::from_options(tls_cert, tls_key)?;
-            let options = server_options(no_assistant);
+            let options = server_options(no_assistant, assistant_containment)?;
             serve_viewer(trace_dir, viewer_dir, bind, auth, options, None, false, tls).await
         }
     }
@@ -930,13 +990,26 @@ const TENANT_TRACE_HINT: &str = "A tenant's traces are readable through the HTTP
 
 /// Viewer options shared by every command that serves; the environment switch
 /// also covers `record --open`.
-fn server_options(no_assistant: bool) -> ServerOptions {
+fn server_options(
+    no_assistant: bool,
+    assistant_containment: Option<AssistantContainment>,
+) -> Result<ServerOptions> {
     let disabled_by_env = std::env::var("PREMIER_DISABLE_ASSISTANT")
         .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false" | "no" | "off"));
-    ServerOptions {
+    let assistant_containment = match assistant_containment {
+        Some(containment) => containment,
+        None => match std::env::var("PREMIER_ASSISTANT_CONTAINMENT") {
+            Ok(value) if !value.trim().is_empty() => value.parse().map_err(|error: String| {
+                anyhow::anyhow!("PREMIER_ASSISTANT_CONTAINMENT: {error}")
+            })?,
+            _ => AssistantContainment::default(),
+        },
+    };
+    Ok(ServerOptions {
         disable_assistant: no_assistant || disabled_by_env,
+        assistant_containment,
         ..ServerOptions::default()
-    }
+    })
 }
 
 /// The directory to serve and the one entry in it to publish when the viewer
@@ -2109,11 +2182,13 @@ fn demo(output: PathBuf, force: bool) -> Result<()> {
             .context("the demo output path has no file name")?,
         std::process::id()
     ));
+    let new_premier_directory = premier_directory_to_create(&output);
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
+    ignore_new_premier_directory(new_premier_directory);
     let _ = fs::remove_dir_all(&staging);
     let written = write_demo(&staging).and_then(|manifest| {
         prepare_trace_output(&output)?;
@@ -2466,6 +2541,11 @@ async fn record(options: RecordOptions) -> Result<()> {
     // with the (time-ordered, public) event ids.
     let collector_token = premier_trace::random_secret_hex()?;
     let redaction = redaction.implicit_literal("collector-token", &collector_token);
+    let new_premier_directory = premier_directory_to_create(
+        output
+            .as_deref()
+            .unwrap_or(std::path::Path::new(".premier/traces/trace.atrace")),
+    );
     let (output, mut trace_writer) = match output {
         Some(output) => {
             let writer = TraceWriter::create_named_for_tenant_with_redaction(
@@ -2505,6 +2585,7 @@ async fn record(options: RecordOptions) -> Result<()> {
             }
         }
     };
+    ignore_new_premier_directory(new_premier_directory);
     if let Some(key) = sign_key {
         trace_writer.set_signing_key(key);
     }
@@ -2802,7 +2883,7 @@ async fn record(options: RecordOptions) -> Result<()> {
             // every other trace that happens to share its directory.
             let (trace_dir, only_artifact) = single_trace_scope(&output)?;
             let only_artifact_name = only_artifact.to_string_lossy().into_owned();
-            let mut options = server_options(false);
+            let mut options = server_options(false, None)?;
             options.only_artifact = Some(only_artifact);
             // The recorder's forwarding handlers are still installed and now
             // do nothing. The viewer handles SIGINT and SIGTERM itself; a
@@ -4125,6 +4206,34 @@ fn trace_parent_dir(trace: &std::path::Path) -> PathBuf {
     match trace.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
+    }
+}
+
+/// The `.premier` directory `output` lies in, when recording there would
+/// create it. Asked before anything is written.
+fn premier_directory_to_create(output: &std::path::Path) -> Option<PathBuf> {
+    output
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == ".premier"))
+        .filter(|directory| fs::symlink_metadata(directory).is_err())
+        .map(std::path::Path::to_path_buf)
+}
+
+/// Traces hold command lines and captured output, so a `.premier` directory
+/// this command has just created ignores everything in it, itself included.
+/// An existing directory is left as it is, and so is an existing `.gitignore`.
+fn ignore_new_premier_directory(created: Option<PathBuf>) {
+    let Some(directory) = created.filter(|directory| directory.is_dir()) else {
+        return;
+    };
+    // Best effort: a recording is not failed over a missing ignore file.
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(".gitignore"))
+    {
+        let _ = file.write_all(b"*\n");
     }
 }
 

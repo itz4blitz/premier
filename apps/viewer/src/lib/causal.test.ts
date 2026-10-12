@@ -96,6 +96,29 @@ describe('span, correlation, and link navigation', () => {
     expect(childEvents(journal, 'not-recorded')).toEqual([]);
   });
 
+  it('names the lowest-sequence event of a span as its opener even when the journal is out of order', () => {
+    const later = event({ event_id: 'work-2', sequence: 5, span_id: 'work' });
+    const opener = event({ event_id: 'work-1', sequence: 2, span_id: 'work' });
+    const child = event({ event_id: 'step', sequence: 6, span_id: 'step', parent_span_id: 'work' });
+    const shuffled = [later, child, opener];
+    expect(parentOf(child, shuffled)).toEqual({ found: opener, missing: false, via: 'span', reference: 'work' });
+    // A producer that put the span id in parent_event_id gets the same opener.
+    const bySpanId = event({ event_id: 'by-span-id', sequence: 7, span_id: 'other', parent_event_id: 'work' });
+    expect(parentOf(bySpanId, [...shuffled, bySpanId])).toEqual({ found: opener, missing: false, via: 'event', reference: 'work' });
+    expect(childEvents(shuffled, 'work-1')).toEqual([child]);
+    expect(childEvents(shuffled, 'work-2')).toEqual([]);
+  });
+
+  it('resolves a repeated event id to the first event recorded with it', () => {
+    const original = event({ event_id: 'dup', sequence: 1, span_id: 'first' });
+    const repeat = event({ event_id: 'dup', sequence: 2, span_id: 'second' });
+    const child = event({ event_id: 'child', sequence: 3, span_id: 'c', parent_event_id: 'dup' });
+    const resolved = parentOf(child, [original, repeat, child]);
+    expect(resolved).toEqual({ found: original, missing: false, via: 'event', reference: 'dup' });
+    expect(resolved.found).toBe(original);
+    expect(resolved.found).not.toBe(repeat);
+  });
+
   it('reports a missing parent only when neither reference resolves', () => {
     const orphan = event({ event_id: 'orphan', sequence: 6, parent_span_id: 'never-recorded', span_id: 'o' });
     expect(parentOf(orphan, [...journal, orphan])).toEqual({ found: null, missing: true, via: 'span', reference: 'never-recorded' });

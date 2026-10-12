@@ -49,6 +49,39 @@ describe('LocalAssistant', () => {
     expect(screen.getByText('No verified tool-deny mode.')).toBeInTheDocument();
   });
 
+  it('states what the selected CLI can do while answering before consent is given', async () => {
+    const user = userEvent.setup();
+    mocks.assistants.mockResolvedValue([
+      { provider: 'claude', label: 'Claude', installed: true, available: true, containment: 'no_tools', containment_summary: 'Claude Code runs with every tool switched off.' },
+      { provider: 'codex', label: 'Codex', installed: true, available: true, containment: 'read_only_sandbox', containment_summary: 'Codex can run shell commands in its read-only sandbox.' },
+      { provider: 'opencode', label: 'OpenCode', installed: true, available: false, containment: 'provider_default', reason: 'this server requires read_only_sandbox containment or stronger' }
+    ]);
+    render(LocalAssistant, { props: { traceId: 'trace-1' } });
+
+    // The strongest tier: stated, with no warning about what trace text could set off.
+    const strongest = await screen.findByTestId('assistant-containment');
+    expect(strongest).toHaveTextContent('What the CLI can do while it answers: Claude Code runs with every tool switched off.');
+    expect(strongest).toHaveAttribute('data-containment', 'no_tools');
+    expect(strongest).not.toHaveTextContent('untrusted input');
+    expect(screen.getByRole('checkbox', { name: 'Send redacted trace content to Anthropic' })).not.toBeChecked();
+
+    // A weaker tier is disclosed where consent is asked, before the box is ticked.
+    await user.click(screen.getByRole('button', { name: 'Provider CLI' }));
+    await user.click(screen.getByRole('option', { name: /Codex/ }));
+    const weaker = screen.getByTestId('assistant-containment');
+    expect(weaker).toHaveTextContent('Codex can run shell commands in its read-only sandbox.');
+    expect(weaker).toHaveTextContent('Trace content is untrusted input to it');
+    expect(weaker).toHaveAttribute('data-containment', 'read_only_sandbox');
+    const box = screen.getByRole('checkbox', { name: 'Send redacted trace content to OpenAI' });
+    expect(box).not.toBeChecked();
+    expect(weaker.compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Ask Codex/ })).toBeDisabled();
+
+    // A provider below the server's minimum is listed with the reason.
+    await user.click(screen.getByText('1 unavailable provider'));
+    expect(screen.getByText('this server requires read_only_sandbox containment or stronger')).toBeInTheDocument();
+  });
+
   it('uses starters to fill the composer without submitting', async () => {
     const user = userEvent.setup();
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
@@ -161,7 +194,7 @@ describe('LocalAssistant', () => {
     render(LocalAssistant, { props: { traceId: 'trace-1' } });
 
     const provider = await screen.findByRole('button', { name: 'Provider CLI' });
-    expect(provider).toHaveTextContent('No safe provider available');
+    expect(provider).toHaveTextContent('No provider available');
     expect(provider).toBeDisabled();
     expect(screen.getByLabelText('Question for the provider')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Ask assistant' })).toBeDisabled();

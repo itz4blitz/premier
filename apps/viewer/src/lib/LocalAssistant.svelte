@@ -330,7 +330,7 @@
                 label: item.label,
                 description: `Sends to ${VENDORS[item.provider] ?? 'the provider'} · CLI runs on this machine`
               }))
-            : [{ value: '', label: providers.length ? 'No safe provider available' : 'No provider available', disabled: true }]}
+            : [{ value: '', label: 'No provider available', disabled: true }]}
           disabled={!availableProviders.length || waiting}
           onchange={changeProvider}
         />
@@ -353,6 +353,12 @@
     <div class="context-disclosure">
       <p>Asking sends trace content off this machine: the run's manifest and its most recent events (or the selected event), redacted by Premier's secret rules, go with your question to {vendor}'s model service through the {selectedProvider?.label ?? 'selected'} CLI and the account it is signed in to. Captured output is sent as recorded. Nothing is sent until you ask.</p>
       {#if provider}
+        {#if selectedProvider?.containment_summary}
+          <p class="containment" class:weaker={selectedProvider.containment !== 'no_tools'} data-testid="assistant-containment" data-containment={selectedProvider.containment}>
+            <strong>What the CLI can do while it answers:</strong> {selectedProvider.containment_summary}
+            {#if selectedProvider.containment !== 'no_tools'}<em>Trace content is untrusted input to it: text recorded in the trace could steer what it does with those abilities.</em>{/if}
+          </p>
+        {/if}
         <label class="consent">
           <input type="checkbox" checked={hasConsent} disabled={waiting} onchange={(event) => { consented = { ...consented, [provider]: event.currentTarget.checked }; }} />
           <span>Send redacted trace content to {vendor}</span>
@@ -387,7 +393,7 @@
       <summary>{unavailableProviders.length} unavailable provider{unavailableProviders.length === 1 ? '' : 's'}</summary>
       <ul>
         {#each unavailableProviders as item (item.provider)}
-          <li><strong>{item.label}</strong><span>{item.reason ?? (item.installed ? 'Safe invocation is unavailable.' : 'CLI is not installed.')}</span></li>
+          <li><strong>{item.label}</strong><span>{item.reason ?? (item.installed ? 'The CLI cannot be run for a single answer.' : 'CLI is not installed.')}</span></li>
         {/each}
       </ul>
     </details>
@@ -451,7 +457,7 @@
         onkeydown={submitShortcut}
         maxlength="6000"
         rows="3"
-        placeholder={availableProviders.length ? 'Ask what happened, why it happened, or what to inspect next…' : 'Install or enable a safe local provider to ask about this trace.'}
+        placeholder={availableProviders.length ? 'Ask what happened, why it happened, or what to inspect next…' : 'Install a supported provider CLI to ask about this trace.'}
         disabled={waiting || !availableProviders.length}
       ></textarea>
       <div class="composer-footer">
@@ -499,6 +505,9 @@
   .scope-options small { margin-top: 2px; color: #7f8da1; font-size: 9px; font-weight: 500; }
   .context-disclosure { grid-column: 1 / -1; display: grid; gap: 6px; margin: -2px 0 0; padding: 8px 10px; border: 1px solid rgba(241,190,115,.28); border-radius: 6px; background: rgba(241,190,115,.06); }
   .context-disclosure p { margin: 0; color: #c9d3e1; font-size: 12px; line-height: 1.45; }
+  .context-disclosure .containment strong { color: #f0f4fa; }
+  .context-disclosure .containment em { display: block; color: #f1be73; font-style: normal; }
+  .context-disclosure .containment.weaker { padding-left: 8px; border-left: 2px solid #f1be73; }
   .context-disclosure .consent { display: flex; align-items: center; gap: 8px; color: #f0f4fa; font-size: 12px; font-weight: 650; text-transform: none; letter-spacing: 0; cursor: pointer; }
   .context-disclosure .consent input { width: 15px; height: 15px; accent-color: #f1be73; }
   .coverage { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; color: #c9d3e1; font-size: 12px; line-height: 1.45; }

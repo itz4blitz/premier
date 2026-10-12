@@ -8,6 +8,25 @@ integrations may depend on.
 
 ### Added
 
+- `premier delete <trace>...` removes trace directories, and `premier prune
+  --older-than <DURATION>` removes the finalized traces in a trace directory
+  that ended at least that long ago (`30d`, `12h`; `--dry-run`,
+  `--keep-issues`, `--trace-dir`). Both print what was removed with its size,
+  refuse a trace that is still being recorded and anything that is not
+  recognisably a trace directory, never follow symbolic links, remove an
+  abandoned trace only with `--include-abandoned`, and exit `1` when
+  something could not be removed. See [docs/cli.md](docs/cli.md#delete).
+- `record` and `demo` write `.premier/.gitignore` containing `*` when they
+  create a `.premier` directory, so traces are not committed by accident. An
+  existing directory or `.gitignore` is left alone.
+- The local assistant offers OpenCode, and reports for every provider the
+  containment it runs under: `GET /api/assistants` carries `containment`
+  (`no_tools`, `read_only_sandbox`, or `provider_default`) and
+  `containment_summary`, and the viewer shows that sentence above the consent
+  checkbox. `--assistant-containment <TIER>` on `open` and `serve`
+  (`PREMIER_ASSISTANT_CONTAINMENT`, also read by `record --open`) sets the
+  weakest tier allowed. See
+  [docs/security.md](docs/security.md#containment-tiers).
 - Viewer: the assistant panel shows what a question will send before it is
   asked: the event range, how many earlier events are left out, the number of
   earlier messages and the prompt size, and on request the exact text. Each
@@ -36,8 +55,10 @@ integrations may depend on.
 - `THIRD_PARTY_NOTICES.md` and `scripts/third-party-notices.mjs`, which
   generates it from `Cargo.lock` and `package-lock.json`: the Rust crates in
   the binary and the JavaScript packages in the viewer, with their declared
-  licences. See [docs/releasing.md](docs/releasing.md#third-party-notices)
-  for how to regenerate it and what it does not yet cover.
+  licences, for all four release targets. It ships beside `LICENSE` in every
+  release archive and in the npm launcher and platform packages, and CI
+  fails when it is out of date with either lockfile. See
+  [docs/releasing.md](docs/releasing.md#third-party-notices).
 - `premier diff` aligns events in order. An event present in only one trace
   is reported as `added` or `removed` where it occurs and the events after it
   stay paired with their counterparts; an event at a different place is
@@ -365,6 +386,19 @@ integrations may depend on.
 
 ### Changed
 
+- **Breaking: the local assistant no longer refuses a CLI that cannot be run
+  without tools.** Each installed CLI is run under the strongest containment
+  it supports, and the viewer states what that is before consent. Codex
+  0.162, which keeps `unified_exec` on when told to switch it off and was
+  listed as unavailable for that reason, now runs in its read-only sandbox
+  with approvals off: its shell can read files your user can read, and
+  cannot write or use the network. Grok 1.0, which has no `--no-memory`,
+  runs tool-less with memory on instead of being unavailable. A CLI with
+  neither a tool-less nor a sandboxed mode runs with its own defaults.
+  Trace content is untrusted input to these CLIs, so this is weaker than
+  before for the providers it newly allows; `--assistant-containment
+  no_tools` restores the earlier behaviour. See
+  [docs/security.md](docs/security.md#containment-tiers).
 - **Breaking: what counts as an issue.** One rule, applied by the server
   (`premier list`, `premier query --issues`, the trace list's issue count)
   and by the viewer, and tested against one shared set of cases:

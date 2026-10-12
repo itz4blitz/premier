@@ -26,6 +26,40 @@ describe('assistant API', () => {
     }));
   });
 
+  it('asks the preview route for the prompt a question would send, without running it', async () => {
+    const preview = {
+      context: { scope: 'event', total_events: 12, included_events: 4, selected_sequence: 8, history_messages: 1, prompt_chars: 640 },
+      prompt: 'You are inspecting one event of a recorded run.'
+    };
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(preview), { status: 200 }));
+    vi.stubGlobal('fetch', fetch);
+    const body = {
+      provider: 'claude',
+      prompt: 'What failed?',
+      selected_event_id: 'event-8',
+      history: [{ role: 'user' as const, content: 'Summarize it.' }]
+    };
+
+    await expect(api.previewAssistant('copy of/run.atrace', body)).resolves.toEqual(preview);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith('/api/traces/copy%20of%2Frun.atrace/assistant/preview', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  });
+
+  it('reports a preview the server refuses as an ApiError carrying its status and reason', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ error: 'unknown assistant provider' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    )));
+
+    await expect(api.previewAssistant('trace', { provider: 'nobody', prompt: 'Help' }))
+      .rejects.toMatchObject({ name: 'ApiError', status: 400, message: 'unknown assistant provider' });
+  });
+
   it('surfaces the backend error instead of replacing it with a generic status', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ error: 'assistant did not respond within 45 seconds' }),
@@ -220,6 +254,48 @@ describe('stream API', () => {
     expect(completes).toEqual([expect.objectContaining({ integrity: 'abandoned', integrity_detail: 'Run premier recover.' })]);
     expect(states).toEqual(['live', 'abandoned']);
     expect(source.closed).toBe(true);
+  });
+
+  it('ends as abandoned even when the abandoned frame carries no readable manifest', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    const states: string[] = [];
+    const completes: unknown[] = [];
+    api.stream('trace-1', () => undefined, (state) => states.push(state), (manifest) => completes.push(manifest));
+    const source = FakeEventSource.instances[0];
+    const raw = source as unknown as { listeners: Map<string, Array<(event: MessageEvent) => void>> };
+    source.onopen?.(new Event('open'));
+    expect(() => raw.listeners.get('trace.abandoned')?.forEach((listener) => listener({ data: '{"trace_id": ' } as MessageEvent)))
+      .not.toThrow();
+    // The connection drops next; a finished stream must not be reported as reconnecting.
+    source.onerror?.(new Event('error'));
+    expect(completes).toEqual([]);
+    expect(states).toEqual(['live', 'abandoned']);
+    expect(source.closed).toBe(true);
+  });
+
+  it('closes on trace.abandoned for a caller that passed no completion handler', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    const states: string[] = [];
+    api.stream('trace-1', () => undefined, (state) => states.push(state));
+    const source = FakeEventSource.instances[0];
+    expect(() => source.dispatch('trace.abandoned', { trace_id: 'trace-1', integrity: 'abandoned' })).not.toThrow();
+    expect(states).toEqual(['abandoned']);
+    expect(source.closed).toBe(true);
+  });
+
+  it('ignores terminal frames that arrive after the caller closed the stream', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    const states: string[] = [];
+    const completes: unknown[] = [];
+    const close = api.stream('trace-1', () => undefined, (state) => states.push(state), (manifest) => completes.push(manifest));
+    const source = FakeEventSource.instances[0];
+    source.onopen?.(new Event('open'));
+    close();
+    source.dispatch('trace.abandoned', { trace_id: 'trace-1', integrity: 'abandoned' });
+    source.dispatch('trace.error', { error: 'the trace can no longer be read' });
+    // Neither late frame may hand over a manifest or rewrite the state the caller already saw.
+    expect(completes).toEqual([]);
+    expect(states).toEqual(['live', 'disconnected']);
   });
 
   it('reports disconnected when the browser has given up on the stream', () => {

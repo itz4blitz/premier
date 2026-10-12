@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "os": ["darwin"],
   "cpu": ["arm64"],
-  "files": ["bin/premier", "README.md", "LICENSE"],
+  "files": ["bin/premier", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
   "publishConfig": { "access": "public", "provenance": true },
   "repository": { "type": "git", "url": "git+https://github.com/PremierStudio/premier.git", "directory": "npm/platforms/darwin-arm64" }
 }

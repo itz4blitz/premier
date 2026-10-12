@@ -24,6 +24,8 @@ Commands:
   diff     Compare two traces by semantic event structure, ignoring generated identity noise. Events are aligned in order, so an inserted, removed or moved event is reported as such; captured output is compared per stream, line by line
   replay   Replay recorded evidence timing only; this never re-executes the traced command. A recorded gap longer than 10 seconds is replayed as 10 seconds
   list     List traces in a directory
+  delete   Delete trace directories
+  prune    Delete finalized traces that ended longer ago than a duration
   open     Open the local viewer, optionally focused on one trace
   serve    Serve the viewer locally or to an authenticated team
   help     Print this message or the help of the given subcommand(s)
@@ -39,6 +41,12 @@ Options:
 - A trace is a directory, by convention named `*.atrace`. The default trace
   directory is `.premier/traces` relative to the current directory. The
   on-disk format is specified in [trace-format.md](trace-format.md).
+- Traces hold command lines and captured output, so when `record` or `demo`
+  creates a `.premier` directory it also writes `.premier/.gitignore`
+  containing `*`: git then ignores the directory and everything in it,
+  including that file. This happens only when the directory is created. A
+  `.premier` directory that already exists is not touched, and neither is an
+  existing `.gitignore`; delete the file to commit traces on purpose.
 - Exit codes, for every command except `record`:
 
   | Code | Meaning |
@@ -62,6 +70,7 @@ Options:
   | `PREMIER_COLLECTOR_URL`, `PREMIER_COLLECTOR_TOKEN` | `emit` | Collector endpoint and bearer token. `record` sets them for the recorded process. |
   | `PREMIER_EMIT_TIMEOUT` | `emit` | Seconds to wait for the collector. Default `10`. |
   | `PREMIER_DISABLE_ASSISTANT` | `open`, `serve`, `record --open` | Any value other than empty, `0`, `false`, `no`, or `off` disables the local assistant. |
+  | `PREMIER_ASSISTANT_CONTAINMENT` | `open`, `serve`, `record --open` | Environment form of `--assistant-containment`: `provider_default` (the default), `read_only_sandbox`, or `no_tools`. Any other value is an error. |
   | `PREMIER_PASSWORD`, `PREMIER_AUTH_CONFIG`, `PREMIER_TLS_CERT`, `PREMIER_TLS_KEY` | `serve` | Environment forms of `--password`, `--auth-config`, `--tls-cert`, `--tls-key`. |
 
   `record` also sets `PREMIER_TRACE_ID` for the recorded process.
@@ -1300,6 +1309,105 @@ is a directory whose name starts with a dot: those are the working copies of
 shows the traces of every tenant: it reads the directory, and whoever can do
 that can read the manifests.
 
+## `delete`
+
+```text
+$ premier delete --help
+Delete trace directories
+
+Usage: premier delete [OPTIONS] <TRACES>...
+
+Arguments:
+  <TRACES>...  The trace directories to delete
+
+Options:
+      --include-abandoned  Also delete a trace whose recorder is gone without having finalized it
+      --key-file <PATH>    Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --dry-run            Print what would be deleted without deleting anything
+  -h, --help               Print help
+```
+
+Removes the named trace directories and prints one line for each, with its
+size, and a total:
+
+```text
+$ premier delete .premier/traces/trace-1791833346930-9ce388c4.atrace
+removed  .premier/traces/trace-1791833346930-9ce388c4.atrace  (2.0 KiB)
+removed 1 trace (2.0 KiB)
+```
+
+A path is removed only when it is a finished trace. Each of these is refused
+with `premier: not removed: <path>: <reason>` on stderr, the other paths are
+still handled, and the command then exits `1`:
+
+| Path | Reason given |
+| --- | --- |
+| A trace whose recorder is running | `it is still being recorded; stop the recording first`. There is no option that overrides this. |
+| An abandoned trace (see [Abandoned traces and `recover`](#abandoned-traces-and-recover)) | It names the `premier recover` command that would keep what the trace holds. `--include-abandoned` deletes it instead. |
+| A directory that is not recognisably a trace | `is not a Premier trace directory (...)`: its `manifest.json` is missing or is not a trace manifest, or the directory holds something a recorder does not write (`unexpected entry ...`). These are the checks `record` and `demo` apply before they replace a trace. |
+| A symbolic link | `is a symbolic link, not a trace directory`. Name the directory itself. |
+| The current directory or one of its ancestors, a file, a path that does not exist | Said as such. |
+| A trace that cannot be deleted | The operating system's error. |
+
+Deleting never follows a symbolic link: a link is not accepted as a trace, a
+trace directory that contains one at its top level is not recognisable as a
+trace, and a link deeper inside is unlinked, not followed.
+
+An encrypted trace can be deleted without its key. Whether it was finalized
+is then read from the recorder's own files (the lease and the active journal,
+both of which finalization removes).
+
+`--dry-run` prints `would remove` lines and removes nothing; refusals are
+reported and fail the command as they would without it.
+
+## `prune`
+
+```text
+$ premier prune --help
+Delete finalized traces that ended longer ago than a duration
+
+Usage: premier prune [OPTIONS] --older-than <DURATION>
+
+Options:
+      --key-file <PATH>        Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --older-than <DURATION>  Delete traces that ended at least this long ago: a whole number and a unit (s, m, h, d, w), such as 30d or 12h
+      --trace-dir <TRACE_DIR>  [default: .premier/traces]
+      --dry-run                Print what would be deleted without deleting anything
+      --keep-issues            Keep traces of runs that failed or recorded an issue event
+      --include-abandoned      Also delete traces whose recorder is gone without having finalized them
+  -h, --help                   Print help
+```
+
+Removes the finalized traces in `--trace-dir` whose end time is at least
+`--older-than` ago. The duration is a whole number and a unit: `s`, `m`, `h`,
+`d` (24 hours), or `w`; `30d` and `720h` mean the same. Anything else is a
+usage error (exit `2`).
+
+```text
+$ premier prune --older-than 30d --dry-run
+would remove  .premier/traces/trace-1789158540112-0b6f2a51.atrace  (41.3 KiB, ended 2026-09-02 08:15 UTC)
+would remove 1 trace (41.3 KiB); kept 12 newer, 1 still recording
+```
+
+What `prune` leaves alone, and how the closing line counts it:
+
+| Kept | Counted as |
+| --- | --- |
+| A trace that ended more recently | `newer` |
+| A trace that is still being recorded, whatever its age | `still recording` |
+| An abandoned trace, unless `--include-abandoned` is given. With it, the age is taken from when the trace was last written to, and the line for it says `abandoned, last written ...`. | `abandoned (--include-abandoned removes them)` |
+| With `--keep-issues`: a trace whose run exited non-zero or was ended by a signal or interrupt, or that holds an event `premier query --issues` would select, or whose events cannot be read | `with issues` |
+| A trace whose end time cannot be read here (encrypted without its key, written by a newer `premier`), or a directory with a `manifest.json` that is not recognisably a trace. Each is named on stderr. | `skipped` |
+
+Not looked at: directories without a `manifest.json`, directories whose name
+starts with a dot, files, and symbolic links. Every trace `prune` does select
+is removed under the rules of [`delete`](#delete); one that cannot be removed
+is reported and the command exits `1`. A `--trace-dir` that does not exist
+removes nothing and exits `0`.
+
+A trace's end time is the `ended_at` in its manifest, which is the
+recorder's clock when the run ended, not the directory's modification time.
+
 ## `open`
 
 ```text
@@ -1312,12 +1420,13 @@ Arguments:
   [TRACE]  
 
 Options:
-      --key-file <PATH>          Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
-      --trace-dir <TRACE_DIR>    [default: .premier/traces]
-      --viewer-dir <VIEWER_DIR>  Optional disk viewer (for local UI development). Default: embedded viewer
-      --bind <BIND>              [default: 127.0.0.1:4317]
-      --no-assistant             Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1)
-  -h, --help                     Print help
+      --key-file <PATH>               Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --trace-dir <TRACE_DIR>         [default: .premier/traces]
+      --viewer-dir <VIEWER_DIR>       Optional disk viewer (for local UI development). Default: embedded viewer
+      --bind <BIND>                   [default: 127.0.0.1:4317]
+      --no-assistant                  Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1)
+      --assistant-containment <TIER>  Weakest containment an assistant CLI may run under: provider_default (every installed CLI works), read_only_sandbox, or no_tools. Providers below it are listed as unavailable (also: PREMIER_ASSISTANT_CONTAINMENT)
+  -h, --help                          Print help
 ```
 
 Starts the viewer server, prints its URL, and opens a browser. The server
@@ -1351,6 +1460,13 @@ after 2 seconds (an event stream of a live trace, for example), prints
   address. Use `serve` for anything else.
 - `--no-assistant` or `PREMIER_DISABLE_ASSISTANT` removes the local assistant;
   see [security.md](security.md#the-local-assistant).
+- `--assistant-containment <TIER>` or `PREMIER_ASSISTANT_CONTAINMENT` sets the
+  weakest containment an assistant CLI may run under. The default,
+  `provider_default`, offers every installed CLI under the strongest
+  containment that CLI supports. `read_only_sandbox` and `no_tools` list a
+  provider whose CLI supports less as unavailable, with that as the reason,
+  and refuse to run it. Hyphens are accepted in place of underscores. See
+  [Containment tiers](security.md#containment-tiers).
 - Encrypted traces are readable only when the server was started with their
   key (`--key-file` or `PREMIER_TRACE_KEY_FILE`). Otherwise they are listed as
   locked; see [Viewer states](#viewer-states).
@@ -1364,16 +1480,17 @@ Serve the viewer locally or to an authenticated team
 Usage: premier serve [OPTIONS]
 
 Options:
-      --key-file <PATH>            Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
-      --trace-dir <TRACE_DIR>      [default: .premier/traces]
-      --viewer-dir <VIEWER_DIR>    Optional disk viewer (for local UI development). Default: embedded viewer
-      --bind <BIND>                [default: 127.0.0.1:4317]
-      --password <PASSWORD>        [env: PREMIER_PASSWORD]
-      --auth-config <AUTH_CONFIG>  JSON file containing SHA-256 hashed bearer tokens, tenant ownership, and scopes [env: PREMIER_AUTH_CONFIG=]
-      --tls-cert <TLS_CERT>        PEM certificate chain for native HTTPS. Must be paired with --tls-key [env: PREMIER_TLS_CERT=]
-      --tls-key <TLS_KEY>          PEM private key for native HTTPS. Must be paired with --tls-cert [env: PREMIER_TLS_KEY=]
-      --no-assistant               Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1)
-  -h, --help                       Print help
+      --key-file <PATH>               Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --trace-dir <TRACE_DIR>         [default: .premier/traces]
+      --viewer-dir <VIEWER_DIR>       Optional disk viewer (for local UI development). Default: embedded viewer
+      --bind <BIND>                   [default: 127.0.0.1:4317]
+      --password <PASSWORD>           [env: PREMIER_PASSWORD]
+      --auth-config <AUTH_CONFIG>     JSON file containing SHA-256 hashed bearer tokens, tenant ownership, and scopes [env: PREMIER_AUTH_CONFIG=]
+      --tls-cert <TLS_CERT>           PEM certificate chain for native HTTPS. Must be paired with --tls-key [env: PREMIER_TLS_CERT=]
+      --tls-key <TLS_KEY>             PEM private key for native HTTPS. Must be paired with --tls-cert [env: PREMIER_TLS_KEY=]
+      --no-assistant                  Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1)
+      --assistant-containment <TIER>  Weakest containment an assistant CLI may run under: provider_default (every installed CLI works), read_only_sandbox, or no_tools. Providers below it are listed as unavailable (also: PREMIER_ASSISTANT_CONTAINMENT)
+  -h, --help                          Print help
 ```
 
 Like `open`, without launching a browser, and with authentication and TLS.
@@ -1395,7 +1512,7 @@ checks are described in [security.md](security.md#the-viewer-server).
 | Route | Returns |
 | --- | --- |
 | `GET /api/health` | Server status. |
-| `GET /api/assistants` | The local assistant providers and whether each is available to the caller. With credentials that lack the `assistant:use` scope every provider is `available: false` with that as its `reason`. |
+| `GET /api/assistants` | The local assistant providers: for each, `installed`, `available`, and, when its CLI is installed and has a non-interactive mode, `containment` (`no_tools`, `read_only_sandbox`, or `provider_default`) with `containment_summary`, one sentence saying what that CLI can do while it answers. A provider that is not available has a `reason`: its CLI is not installed, has no non-interactive mode, or runs under weaker containment than the server's `--assistant-containment` allows. With credentials that lack the `assistant:use` scope every provider is `available: false` with that as its `reason`. |
 | `POST /api/traces/{trace}/assistant/preview` | The prompt a question would send and the part of the trace it covers (`context`), without running a provider. Takes the same body as the assistant route; `prompt` may be empty. Requires `assistant:use`. |
 | `GET /api/traces` | One entry per trace: the manifest fields plus a summary and the integrity fields below. |
 | `GET /api/traces/{trace}` | The same for one trace. |
