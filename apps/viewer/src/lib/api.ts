@@ -6,7 +6,7 @@ import type {
   TraceManifest
 } from './types';
 
-export type StreamState = 'connecting' | 'live' | 'reconnecting' | 'recorded' | 'disconnected';
+export type StreamState = 'connecting' | 'live' | 'reconnecting' | 'recorded' | 'abandoned' | 'disconnected';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -42,13 +42,24 @@ export const api = {
     }
   ),
   events: (traceId: string) => request<TraceEvent[]>(`/api/traces/${encodeURIComponent(traceId)}/events`),
+  /** One bounded page of events with a sequence greater than `afterSequence`. */
+  eventsPage: (
+    traceId: string,
+    page: { afterSequence?: number; limit: number; signal?: AbortSignal }
+  ) => request<TraceEvent[]>(
+    `/api/traces/${encodeURIComponent(traceId)}/events?after_sequence=${page.afterSequence ?? 0}&limit=${page.limit}`,
+    { signal: page.signal }
+  ),
   stream: (
     traceId: string,
     onEvent: (event: TraceEvent) => void,
     onState: (state: StreamState) => void,
-    onComplete?: (manifest: TraceManifest) => void
+    onComplete?: (manifest: TraceManifest) => void,
+    /** Follow only events after this sequence; the caller already holds the earlier ones. */
+    afterSequence = 0
   ) => {
-    const source = new EventSource(`/api/traces/${encodeURIComponent(traceId)}/stream`);
+    const resume = afterSequence > 0 ? `?after_sequence=${afterSequence}` : '';
+    const source = new EventSource(`/api/traces/${encodeURIComponent(traceId)}/stream${resume}`);
     let closed = false;
     let completed = false;
 
@@ -72,6 +83,15 @@ export const api = {
       const manifest = JSON.parse((message as MessageEvent).data) as TraceManifest;
       onComplete?.(manifest);
       close('recorded');
+    });
+    // The server's other terminal event: the recorder is gone, so nothing more will arrive. Its
+    // manifest carries `integrity: 'abandoned'`; closing here keeps EventSource from reconnecting.
+    source.addEventListener('trace.abandoned', (message) => {
+      if (closed) return;
+      completed = true;
+      const manifest = JSON.parse((message as MessageEvent).data) as TraceManifest;
+      onComplete?.(manifest);
+      close('abandoned');
     });
     source.onerror = () => {
       if (closed || completed) return;

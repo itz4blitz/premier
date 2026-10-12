@@ -10,6 +10,8 @@ npm install @premierstudio/trace
 npm install ./sdk/js
 ```
 
+Requires Node.js 18 or later. The package is ES modules only.
+
 ## Usage
 
 Run your agent under `premier record` so the collector env is injected:
@@ -39,11 +41,64 @@ if (isPremierActive()) {
 }
 ```
 
+The `isPremierActive()` guard is optional. Every call is a no-op that returns
+`null` when Premier is not recording.
+
+## API
+
+| Export | Description |
+| --- | --- |
+| `emit(event, options?)` | Send one event. Resolves to the stored event, or `null`. |
+| `premier` | The helpers below, plus `premier.emit`, `premier.childOf`, and `premier.isActive`. |
+| `childOf(parent, extra?)` | Build the causality fields that make a new event a child of `parent`. |
+| `isPremierActive(env?)` | `true` when both `PREMIER_COLLECTOR_URL` and `PREMIER_COLLECTOR_TOKEN` are set. |
+| `premierEnv(env?)` | Returns `{ traceId, collectorUrl, collectorToken }`, or throws `PremierNotActiveError`. |
+| `PremierNotActiveError` | Thrown when the collector variables are absent and the caller asked for them. |
+| `DEFAULT_EMIT_TIMEOUT_MS` | `5000`. |
+| `PremierEventInput`, `PremierEvent`, `PremierEmitOptions` | Types. |
+
+### `emit(event, options?)`
+
+`event` fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `kind` | `string` | Required. |
+| `source` | `string` | Defaults to `"premier-sdk"`. |
+| `actor_id`, `actor_type` | `string` | |
+| `status` | `string` | |
+| `parent_event_id`, `span_id`, `parent_span_id`, `correlation_id` | `string` | Causality. |
+| `links` | `string[]` | |
+| `duration_ms` | `number` | Rounded to the nearest integer and clamped to zero or above, because the collector stores an unsigned integer. A non-finite value is dropped. |
+| `payload` | `Record<string, unknown>` | |
+| `timestamp` | `string` | RFC 3339 producer time, stored verbatim. When omitted the collector records its own receipt time. |
+
+The SDK adds `trace_id` (from `PREMIER_TRACE_ID`) and a `run` object (from
+`PREMIER_RUN_NAME`, `PREMIER_REPOSITORY`, `PREMIER_BRANCH`,
+`PREMIER_ENVIRONMENT`, `PREMIER_STARTED_AT`) to each request. The local
+collector started by `premier record` ignores both.
+
+`emit` resolves to the event as the collector stored it, including the
+`event_id` and `sequence` it assigned, or to `null` when nothing was stored.
+
+### Options
+
+The same object is accepted by `emit` and, as the fourth argument, by every
+helper.
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `required` | `boolean` | `false` | Throw instead of resolving to `null`. See [Failure handling](#failure-handling). |
+| `timeoutMs` | `number` | `5000` | Give up after this many milliseconds. `0` or `Infinity` disables the timeout. |
+| `signal` | `AbortSignal` | | Caller-owned cancellation, combined with the timeout. |
+| `onError` | `(error, event) => void` | | Called with every swallowed delivery failure. |
+| `env` | `NodeJS.ProcessEnv` | `process.env` | Where the `PREMIER_*` variables are read from. |
+| `fetch` | `typeof fetch` | `globalThis.fetch` | The fetch implementation to use. The timeout also bounds a custom one. |
+
 ### Helpers
 
-Every helper takes `(actor, payload, extra?, options?)` and returns the stored
-event (or `null`). `extra` overrides the default `actor_type` / `status` and
-carries causality fields; `options` is the same object `emit` accepts.
+Every helper takes `(actor, payload?, extra?, options?)` and resolves to the
+stored event (or `null`). `payload` defaults to `{}`.
 
 | Helper | Kind | Default `actor_type` / `status` |
 | --- | --- | --- |
@@ -61,12 +116,41 @@ Close what you open: `spawn` with `result`, `delegation` with `join`, and
 `approval` with `approvalDecision` (pass `{ status: "denied" }` to refuse). Use
 `emit` directly for any other kind.
 
+`extra` is a partial event. It overrides the default `actor_type` and `status`
+and carries the causality fields, `source`, `duration_ms`, and `timestamp`.
+
+**Precedence.** A helper builds its event in this order, later entries
+winning:
+
+1. the helper's default `actor_type` and `status`;
+2. every field of `extra` whose value is not `undefined`;
+3. the positional arguments: the helper's `kind`, `actor` (as `actor_id`), and
+   `payload`.
+
+So the positional arguments always win. `extra.kind`, `extra.actor_id`, and
+`extra.payload` are ignored, and `{ status: undefined }` in `extra` keeps the
+default status instead of erasing it.
+
+```ts
+// Stored as kind "tool.execution", actor "coder", status "error".
+await premier.tool("coder", { tool: "cargo test" }, { status: "error", kind: "ignored" });
+```
+
 ### Causality
 
 Events are linked by `parent_event_id`, `span_id`, `parent_span_id`,
-`correlation_id`, and `links`, all passed through `extra`. `premier.childOf`
-derives the parent fields from an event you already emitted, and accepts the
-`null` returned when Premier is not recording:
+`correlation_id`, and `links`, all passed through `extra`.
+
+`childOf(parent, extra?)` derives the parent fields from an event you already
+emitted:
+
+- `parent_event_id` is `parent.event_id`;
+- `parent_span_id` is `parent.span_id`, when the parent has one;
+- `correlation_id` is `parent.correlation_id`, when the parent has one;
+- fields in `extra` are added last and override the derived ones.
+
+It accepts the `null` returned when Premier is not recording, and then returns
+just `extra`.
 
 ```ts
 const delegation = await premier.delegation(
@@ -96,16 +180,19 @@ await premier.join("coordinator", { joined: ["researcher"] }, premier.childOf(de
 
 ### Failure handling
 
-Telemetry never crashes or stalls your agent. `emit` and every helper return
-`null`, without throwing, when:
+Telemetry never crashes or stalls your agent. `emit` and every helper resolve
+to `null`, without throwing, when:
 
 - Premier is not recording (the collector env is absent);
-- the collector is unreachable or rejects the event (`401`, `400`, `500`, …);
-- the collector does not answer within `timeoutMs` (default 5000 ms).
+- the collector is unreachable or rejects the event (`400`, `401`, `422`,
+  `500`, …);
+- the collector does not answer within `timeoutMs` (default 5000 ms);
+- `signal` is aborted.
 
-Delivery failures are passed to `onError(error, event)`. Without `onError`, the
-first failure in the process is reported once through `console.warn` and later
-ones are silent.
+Delivery failures (every case except "not recording") are passed to
+`onError(error, event)`. Without `onError`, the first failure in the process
+is reported once through `console.warn` and later ones are silent. An
+exception thrown by `onError` itself is swallowed.
 
 ```ts
 await premier.tool("coder", { tool: "rg" }, {}, {
@@ -116,7 +203,14 @@ await premier.tool("coder", { tool: "rg" }, {}, {
 ```
 
 Pass `{ required: true }` to throw in all of the cases above instead, for
-example in a test that asserts evidence was recorded.
+example in a test that asserts evidence was recorded. When Premier is not
+recording the error is a `PremierNotActiveError`; otherwise it is the delivery
+error, and `onError` is not called.
+
+The collector rejects events that claim a kind or source reserved for the
+recorder, such as `process.exit`. See
+[docs/collector.md](../../docs/collector.md) for the wire contract and
+[docs/events.md](../../docs/events.md) for the event vocabulary.
 
 ## Premier Cloud
 
@@ -142,5 +236,6 @@ premier emit --kind agent.spawn --actor researcher --status running
 ```
 
 `premier emit` and `sdk/shell/premier-emit.sh` exit non-zero when the collector
-is unreachable or rejects the event, wait at most `PREMIER_EMIT_TIMEOUT` seconds
-(default 10), and never send the collector token through `HTTP(S)_PROXY`.
+is unreachable or rejects the event, and wait at most `PREMIER_EMIT_TIMEOUT`
+seconds (default 10). For a loopback collector they never send the collector
+token through `HTTP(S)_PROXY`.

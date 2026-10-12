@@ -120,6 +120,17 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
       role: 'cause'
     };
   }
+  // A command that never started is the whole story of its run: name it ahead of anything else.
+  const spawnFailure = events.find((event) => event.kind === 'process.spawn_failed');
+  if (spawnFailure) {
+    return {
+      title: 'The command could not be started',
+      detail: eventSummary(spawnFailure),
+      confidence: 'high',
+      event: spawnFailure,
+      role: 'cause'
+    };
+  }
   const issue = primaryIssue(events);
   if (issue) {
     return {

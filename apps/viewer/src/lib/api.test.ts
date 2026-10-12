@@ -49,6 +49,19 @@ describe('request helpers', () => {
     expect(fetch).toHaveBeenNthCalledWith(2, '/api/traces/t%2F1/events', expect.any(Object));
   });
 
+  it('requests one bounded page after a sequence cursor and forwards the abort signal', async () => {
+    const fetch = vi.fn().mockImplementation(async () => new Response(JSON.stringify([{ event_id: 'e6' }]), { status: 200 }));
+    vi.stubGlobal('fetch', fetch);
+    const abort = new AbortController();
+    await expect(api.eventsPage('t/1', { afterSequence: 5, limit: 2, signal: abort.signal })).resolves.toEqual([{ event_id: 'e6' }]);
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/traces/t%2F1/events?after_sequence=5&limit=2',
+      expect.objectContaining({ signal: abort.signal })
+    );
+    await api.eventsPage('t1', { limit: 500 });
+    expect(fetch).toHaveBeenLastCalledWith('/api/traces/t1/events?after_sequence=0&limit=500', expect.any(Object));
+  });
+
   it('maps 401 responses to an authentication message', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 401 })));
     await expect(api.traces()).rejects.toThrow('Authentication is required.');
@@ -133,6 +146,14 @@ describe('stream API', () => {
     close();
   });
 
+  it('follows the stream from a sequence cursor when the caller already holds earlier events', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    api.stream('trace/1', () => undefined, () => undefined, undefined, 4200);
+    api.stream('trace/1', () => undefined, () => undefined);
+    expect(FakeEventSource.instances[0].url).toBe('/api/traces/trace%2F1/stream?after_sequence=4200');
+    expect(FakeEventSource.instances[1].url).toBe('/api/traces/trace%2F1/stream');
+  });
+
   it('reports reconnecting while the stream is still open', () => {
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
     const states: string[] = [];
@@ -168,5 +189,21 @@ describe('stream API', () => {
     source.onerror?.(new Event('error'));
     expect(events).toEqual([]);
     expect(states).toEqual(['disconnected']);
+  });
+
+  it('treats trace.abandoned as the end of the stream', () => {
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    const states: string[] = [];
+    const completes: unknown[] = [];
+    const close = api.stream('trace-1', () => undefined, (state) => states.push(state), (manifest) => completes.push(manifest));
+    const source = FakeEventSource.instances[0];
+    source.onopen?.(new Event('open'));
+    source.dispatch('trace.abandoned', { trace_id: 'trace-1', ended_at: null, integrity: 'abandoned', integrity_detail: 'Run premier recover.' });
+    // The server closes the connection next; that must not read as a dropped stream.
+    source.onerror?.(new Event('error'));
+    close();
+    expect(completes).toEqual([expect.objectContaining({ integrity: 'abandoned', integrity_detail: 'Run premier recover.' })]);
+    expect(states).toEqual(['live', 'abandoned']);
+    expect(source.closed).toBe(true);
   });
 });

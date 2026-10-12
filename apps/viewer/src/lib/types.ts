@@ -4,8 +4,11 @@ export interface JournalFile {
   event_count: number;
 }
 
-/** `abandoned`: no finalized journal and the recorder is gone; `premier recover` finalizes it. */
-export type IntegrityStatus = 'live' | 'abandoned' | 'verified' | 'invalid';
+/**
+ * `abandoned`: no finalized journal and the recorder is gone; `premier recover` finalizes it.
+ * `locked`: encrypted, and the server has no usable key; the evidence is sealed, not damaged.
+ */
+export type IntegrityStatus = 'live' | 'abandoned' | 'verified' | 'invalid' | 'locked';
 /** What a verified trace is protected by. Only `signed` resists a deliberate rewrite. */
 export type IntegrityProtection = 'digest_only' | 'sealed' | 'signed';
 

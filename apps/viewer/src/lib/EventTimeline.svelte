@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import type { TraceEvent } from './types';
+  import type { EventLoadProgress } from './traceLoad';
   import { actorId, actorRole, categoryOf, eventSummary, isProcessNoise, timelineLayout } from './analysis';
   import { eventPayload } from './types';
   import { payloadModel, payloadProvider } from './nativePayload';
@@ -25,14 +26,19 @@
     return { provider: payloadProvider(payload), model: payloadModel(payload) };
   }
 
-  let { events, selectedSequence, onselect }: {
+  let { events, selectedSequence, onselect, loading = null }: {
     events: TraceEvent[];
     selectedSequence: number | null;
     onselect: (event: TraceEvent) => void;
+    /** Set while the journal is still arriving in pages; null once it is complete. */
+    loading?: EventLoadProgress | null;
   } = $props();
 
   const rowHeight = 64;
   const overscan = 8;
+  /** Height of the sticky column key that covers the top of the scroll viewport. */
+  const headerHeight = 34;
+  const count = (value: number) => value.toLocaleString('en-US');
   let showRawProcess = $state(false);
   let scrollElement = $state<HTMLDivElement>();
   let scrollTop = $state(0);
@@ -71,10 +77,41 @@
   let displayEvents = $derived(processed.events);
   let layout = $derived(timelineLayout(displayEvents));
   let virtualized = $derived(displayEvents.length > 300);
-  let windowStart = $derived(virtualized ? Math.max(0, Math.floor(scrollTop / rowHeight) - overscan) : 0);
-  let windowEnd = $derived(virtualized ? Math.min(layout.events.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan) : layout.events.length);
+  // The list can shrink under a stale scroll offset (filters, a new run); never window past its end.
+  let windowTop = $derived(Math.min(scrollTop, Math.max(0, displayEvents.length * rowHeight + headerHeight - viewportHeight)));
+  let windowStart = $derived(virtualized ? Math.max(0, Math.floor(windowTop / rowHeight) - overscan) : 0);
+  let windowEnd = $derived(virtualized ? Math.min(layout.events.length, Math.ceil((windowTop + viewportHeight) / rowHeight) + overscan) : layout.events.length);
   let renderedEvents = $derived(layout.events.slice(windowStart, windowEnd));
+  let selectedIndex = $derived(selectedSequence === null ? -1 : displayEvents.findIndex((event) => event.sequence === selectedSequence));
+  // Roving focus needs exactly one tab stop even when the selection is outside the rendered window.
+  let tabStopIndex = $derived(selectedIndex >= windowStart && selectedIndex < windowEnd ? selectedIndex : windowStart);
   let expandedEvents = $state<Set<string>>(new Set());
+
+  function rowElement(eventId: string) {
+    return scrollElement?.querySelector<HTMLElement>(`[data-event-id="${CSS.escape(eventId)}"]`) ?? null;
+  }
+
+  /** Scroll only when the row is not already fully visible, so clicks and arrow keys never jolt the list. */
+  function reveal(index: number, placement: 'nearest' | 'center') {
+    if (!scrollElement || index < 0) return;
+    const height = scrollElement.clientHeight || viewportHeight;
+    let top = index * rowHeight;
+    let size = rowHeight;
+    if (!virtualized) {
+      const row = rowElement(displayEvents[index].event_id);
+      if (!row) return;
+      const bounds = row.getBoundingClientRect();
+      top = bounds.top - scrollElement.getBoundingClientRect().top + scrollElement.scrollTop - headerHeight;
+      size = bounds.height;
+    }
+    const current = scrollElement.scrollTop;
+    const above = top < current;
+    const below = top + size + headerHeight > current + height;
+    if (!above && !below) return;
+    if (placement === 'center') scrollElement.scrollTop = Math.max(0, top + headerHeight - (height - size) / 2);
+    else scrollElement.scrollTop = above ? top : Math.max(0, top + size + headerHeight - height);
+    updateViewport();
+  }
 
   function navigate(event: KeyboardEvent, index: number) {
     let target = index;
@@ -85,9 +122,11 @@
     else return;
     event.preventDefault();
     const next = displayEvents[target];
+    // Keyboard moves keep the row in view themselves; the selection effect must not re-center it.
+    lastCentered = { sequence: next.sequence, index: target };
     onselect(next);
-    if (virtualized && scrollElement) scrollElement.scrollTop = target * rowHeight;
-    void tick().then(() => scrollElement?.querySelector<HTMLElement>(`[data-event-id="${CSS.escape(next.event_id)}"]`)?.focus());
+    reveal(target, 'nearest');
+    void tick().then(() => rowElement(next.event_id)?.focus());
   }
 
   function activate(event: KeyboardEvent, index: number) {
@@ -106,30 +145,30 @@
   function updateViewport() {
     if (!scrollElement) return;
     scrollTop = scrollElement.scrollTop;
-    viewportHeight = scrollElement.clientHeight;
+    viewportHeight = scrollElement.clientHeight || viewportHeight;
   }
 
   // Center on selection only when the selected sequence changes — never fight user scroll.
-  let lastCenteredSequence = $state<number | null>(null);
+  // A selection that is not loaded or not in scope yet stays pending, so a deep link to a late
+  // event is revealed as soon as its page arrives.
+  // Appended pages and live events leave its index alone, so they never move the viewport; a
+  // filter change that shifts the selected row brings it back into view.
+  let lastCentered: { sequence: number; index: number } | null = null;
   $effect(() => {
     const sequence = selectedSequence;
+    const index = selectedIndex;
     if (sequence === null || !scrollElement) return;
-    if (sequence === lastCenteredSequence) return;
-    viewportHeight = scrollElement.clientHeight || viewportHeight;
-    const index = displayEvents.findIndex((event) => event.sequence === sequence);
     if (index < 0) return;
-    if (virtualized) {
-      scrollElement.scrollTop = Math.max(0, index * rowHeight - viewportHeight / 2);
-      updateViewport();
-    }
-    lastCenteredSequence = sequence;
+    if (lastCentered?.sequence === sequence && lastCentered.index === index) return;
+    lastCentered = { sequence, index };
+    untrack(() => reveal(index, 'center'));
   });
 </script>
 
 <section class="timeline" class:virtualized aria-label="Trace events">
   <div class="panel-heading">
     <span>Event timeline</span>
-    <div><span>{events.length} event{events.length === 1 ? '' : 's'} · {layout.lanes.length} actor{layout.lanes.length === 1 ? '' : 's'}{virtualized ? ' · windowed rendering' : ''}</span>{#if processed.counts.size || showRawProcess}<button onclick={() => showRawProcess = !showRawProcess}>{showRawProcess ? 'Collapse runtime' : 'Show raw runtime'}</button>{/if}</div>
+    <div>{#if loading}<span class="load-progress" role="status">Loading {count(loading.loaded)}{loading.total !== null && loading.total >= loading.loaded ? ` of ${count(loading.total)}` : ''} events</span>{/if}<span>{events.length} event{events.length === 1 ? '' : 's'} · {layout.lanes.length} actor{layout.lanes.length === 1 ? '' : 's'}{virtualized ? ' · windowed rendering' : ''}</span>{#if processed.counts.size || showRawProcess}<button onclick={() => showRawProcess = !showRawProcess}>{showRawProcess ? 'Collapse runtime' : 'Show raw runtime'}</button>{/if}</div>
   </div>
   {#if events.length === 0}
     <div class="timeline-scroll filtered-empty" role="status"><strong>No matching evidence</strong><span>Clear or broaden the active filters.</span></div>
@@ -153,8 +192,10 @@
           onclick={() => onselect(displayEvents[index])}
           onkeydown={(keyEvent) => { navigate(keyEvent, index); activate(keyEvent, index); }}
           aria-selected={event.sequence === selectedSequence}
+          aria-setsize={displayEvents.length}
+          aria-posinset={index + 1}
           role="option"
-          tabindex={event.sequence === selectedSequence || (selectedSequence === null && index === 0) ? 0 : -1}
+          tabindex={index === tabStopIndex ? 0 : -1}
         >
           <span class="sequence">{String(event.sequence).padStart(3, '0')}</span>
           <span class="event-actor" title={`${actorRole(event)} ${actorId(event)}`}><strong>{actorId(event)}</strong><small>{actorRole(event) === 'subagent' ? 'sub-agent' : actorRole(event)}</small></span>
@@ -190,6 +231,7 @@
   .panel-heading span:first-child { color: #b7c1d0; }
   .panel-heading > div { min-width: 0; display: flex; align-items: center; gap: 8px; }
   .panel-heading > div > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .panel-heading > div > .load-progress { flex: 0 0 auto; padding: 2px 7px; border: 1px solid rgba(111,123,247,.32); border-radius: 4px; color: #b8c0ff; background: rgba(111,123,247,.08); font-variant-numeric: tabular-nums; }
   .panel-heading button { min-height: 28px; padding: 0 8px; border: 1px solid #34425a; border-radius: 5px; color: #b9c7d9; background: #111722; font-size: 9px; white-space: nowrap; cursor: pointer; }
   .timeline-scroll { padding-top: 0; }
   .lane-key { position: sticky; z-index: 1; top: 0; display: grid; grid-template-columns: 38px minmax(96px, 140px) minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 34px; padding: 0 14px; border-bottom: 1px solid var(--line); color: var(--muted); background: rgba(5, 5, 5, .96); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }

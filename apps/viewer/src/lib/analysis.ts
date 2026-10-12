@@ -296,6 +296,12 @@ export function eventSummary(event: TraceEvent): string {
     if (kind === 'agent.message' && delegates) return [`Sent to ${delegates}`, content].filter(Boolean).join(' · ');
     return content || nativeFallback() || event.source;
   }
+  // The recorder could not start the command at all; the exit code alone would hide why.
+  if (kind === 'process.spawn_failed') {
+    const executable = first(payload, ['executable']);
+    const reason = first(payload, ['error']);
+    return [`Failed to start ${executable ?? 'the command'}`, reason].filter(Boolean).join(': ');
+  }
   if (kind === 'process.exit' || typeof payload.exit_code === 'number') return `Exited with status ${payload.exit_code}`;
   return first(payload, ['summary', 'text', 'message', 'operation', 'command']) || nativeFallback() || event.source;
 }

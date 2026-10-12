@@ -4,7 +4,7 @@
   import type { EventFilters, TraceEvent, TraceManifest } from './lib/types';
   import { isAbandoned, isRecording, listKey } from './lib/types';
   import { filterEvents, isIssue, materialEvent, runHealth, traceTimeBounds } from './lib/analysis';
-  import { applyTraceComplete, mergeLiveEvents, resolveSelectedEvent, shouldCommitLoad, type EventRequest } from './lib/traceLoad';
+  import { EVENT_PAGE_SIZE, applyTraceComplete, eventPages, expectedEventCount, loadAllEvents, mergeLiveEvents, resolveSelectedEvent, shouldCommitLoad, type EventLoadProgress, type EventRequest } from './lib/traceLoad';
   import { readViewSession, writeViewSession, clearViewSession } from './lib/viewSession';
   import TraceList from './lib/TraceList.svelte';
   import EventTimeline from './lib/EventTimeline.svelte';
@@ -63,7 +63,8 @@
     : null;
 
   let traces = $state<TraceManifest[]>(bootSession?.traces ?? []);
-  let events = $state<TraceEvent[]>(bootSession?.events ?? []);
+  // Raw: the journal is only ever replaced, and proxying tens of thousands of events is costly.
+  let events = $state.raw<TraceEvent[]>(bootSession?.events ?? []);
   let selectedTrace = $state<TraceManifest | null>(bootSession?.selectedTrace ?? null);
   let selectedEvent = $state<TraceEvent | null>(bootSelected);
   let loading = $state(!bootSession);
@@ -81,6 +82,12 @@
   let comparison = $state<{ baseline: TraceManifest; baselineEvents: TraceEvent[] } | null>(null);
   let closeStream: (() => void) | null = null;
   let loadEpoch = 0;
+  /** Cancels the in-flight event pages of a load that a newer selection superseded. */
+  let loadAbort: AbortController | null = null;
+  /** Paged-load progress; null whenever the journal is complete in memory. */
+  let eventLoad = $state<EventLoadProgress | null>(null);
+  /** Selection still owed to the current load: a linked event, or the default pick. */
+  let pendingSelection: { request?: EventRequest } | null = null;
   let traceLoading = $state(Boolean(bootSession));
   /** Dim evidence only when the painted payload is not a warm stand-in for the request. */
   let contentStale = $state(false);
@@ -110,6 +117,8 @@
   let architectureWindowStart = $state<number | null>(bootInvestigation?.windowStart ?? null);
   let architectureWindowEnd = $state<number | null>(bootInvestigation?.windowEnd ?? null);
   let pollTimer: number | null = null;
+  /** The listed state the open run is being reloaded for, so a change the reload cannot settle reloads once. */
+  let reloadedForState: string | null = null;
   let sessionWriteTimer: number | null = null;
   let windowedEvents = $derived(timeScopedEvents(events));
   let windowedVisibleEvents = $derived(filterEvents(windowedEvents, filters));
@@ -340,6 +349,9 @@
     closeStream?.();
     closeStream = null;
     clearLiveBatch();
+    loadAbort?.abort();
+    const abort = new AbortController();
+    loadAbort = abort;
     const epoch = ++loadEpoch;
     // Stale-while-revalidate: keep previous evidence painted until the new payload
     // commits atomically. Only dim when the paint is not already this run.
@@ -351,42 +363,66 @@
     error = null;
     fatalError = null;
     missingEventReference = null;
+    eventLoad = null;
+    pendingSelection = null;
     try {
-      const [detail, nextEvents] = await Promise.all([
-        api.trace(trace.trace_id).catch(() => trace),
-        api.events(trace.trace_id)
-      ]);
-      if (!shouldCommitLoad(epoch, loadEpoch)) return;
-      const committed: TraceManifest = { ...trace, ...detail };
-      let nextWindowStart = architectureWindowStart;
-      let nextWindowEnd = architectureWindowEnd;
-      if (nextWindowStart !== null && nextWindowEnd !== null) {
-        [nextWindowStart, nextWindowEnd] = normalizedWindow(nextEvents, nextWindowStart, nextWindowEnd);
-      }
-      architectureWindowStart = nextWindowStart;
-      architectureWindowEnd = nextWindowEnd;
-      const scopedEvents = filterEvents(
-        nextWindowStart !== null && nextWindowEnd !== null
-          ? nextEvents.filter((event) => {
-              const bounds = traceTimeBounds(nextEvents);
-              if (!bounds) return true;
-              const timestamp = Date.parse(event.timestamp);
-              const offset = timestamp - bounds.start;
-              const endOffset = offset + Math.max(0, event.duration_ms || 0);
-              return Number.isFinite(offset) && offset <= nextWindowEnd! && endOffset >= nextWindowStart!;
-            })
-          : nextEvents,
-        filters
+      const pages = eventPages(
+        (afterSequence, limit) => api.eventsPage(trace.trace_id, { afterSequence, limit, signal: abort.signal }),
+        EVENT_PAGE_SIZE,
+        abort.signal
       );
-      const nextSelected = resolveSelectedEvent(nextEvents, scopedEvents, eventRequest, materialEvent);
-      missingEventReference = eventRequest && !nextSelected ? describeEventRequest(eventRequest) : null;
-      // Atomic commit of identity + evidence. Skip event array churn when ids match.
-      selectedTrace = committed;
-      if (!sameEventIds(events, nextEvents)) events = nextEvents;
-      if (selectedEvent?.event_id !== nextSelected?.event_id) selectedEvent = nextSelected;
-      pendingTraceId = null;
-      if (!missingEventReference) writeUrl(committed.trace_id, selectedEvent, pushHistory ? 'push' : 'replace');
-      persistSessionSoon();
+      const [detail, first] = await Promise.all([
+        api.trace(trace.trace_id).catch(() => trace),
+        pages.next()
+      ]);
+      if (!shouldCommitLoad(epoch, loadEpoch) || first.done) return;
+      const committed: TraceManifest = { ...trace, ...detail };
+      const total = expectedEventCount(committed);
+      let loaded = first.value.events;
+      let complete = first.value.last;
+      let cursor = 0;
+      // A warm paint may already show more of this run than the first pages hold;
+      // never shrink it, swap once the load has caught up.
+      let painted = false;
+      const commitPage = (page: TraceEvent[]) => {
+        for (const event of page) if (event.sequence > cursor) cursor = event.sequence;
+        if (!complete) eventLoad = { loaded: loaded.length, total };
+        if (!painted && !complete && warmPaint && loaded.length < events.length) return;
+        const initial = !painted;
+        if (initial) {
+          painted = true;
+          // Atomic commit of identity + evidence. Skip event array churn when ids match.
+          selectedTrace = committed;
+          if (!sameEventIds(events, loaded)) events = loaded;
+          contentStale = false;
+          pendingTraceId = null;
+          // The first page is enough to leave the boot skeleton; the rest appends in place.
+          loading = false;
+          pendingSelection = { request: eventRequest };
+        } else {
+          events = loaded;
+        }
+        // Only the complete journal has the real span to clamp a requested time window against.
+        if (complete && architectureWindowStart !== null && architectureWindowEnd !== null) {
+          [architectureWindowStart, architectureWindowEnd] = normalizedWindow(loaded, architectureWindowStart, architectureWindowEnd);
+        }
+        resolvePendingSelection(initial ? loaded : page, initial, pushHistory);
+        if (complete) {
+          const unresolved = pendingSelection?.request;
+          pendingSelection = null;
+          if (unresolved && hasEventIdentity(unresolved)) missingEventReference = describeEventRequest(unresolved);
+        }
+        if (initial || complete) persistSessionSoon();
+      };
+      commitPage(loaded);
+      while (!complete) {
+        const next = await pages.next();
+        if (!shouldCommitLoad(epoch, loadEpoch) || next.done) return;
+        loaded = loaded.concat(next.value.events);
+        complete = next.value.last;
+        commitPage(next.value.events);
+      }
+      eventLoad = null;
       // An abandoned trace has no recorder left to tail.
       if (isRecording(committed)) {
         closeStream = api.stream(
@@ -407,7 +443,9 @@
               item.trace_id === complete.trace_id ? { ...item, ...complete } : item
             );
             persistSessionSoon();
-          }
+          },
+          // The pages already hold everything up to the tail; follow only what comes after.
+          cursor
         );
       } else {
         live = false;
@@ -416,6 +454,7 @@
     } catch (cause) {
       if (!shouldCommitLoad(epoch, loadEpoch)) return;
       pendingTraceId = null;
+      pendingSelection = null;
       streamState = 'disconnected';
       error = cause instanceof Error ? cause.message : 'Unable to load trace.';
       if (warmPaint) {
@@ -431,13 +470,36 @@
       if (shouldCommitLoad(epoch, loadEpoch)) {
         traceLoading = false;
         contentStale = false;
+        eventLoad = null;
         if (pendingTraceId === trace.trace_id) pendingTraceId = null;
       }
     }
   }
 
+  function hasEventIdentity(request: EventRequest | undefined): boolean {
+    return Boolean(request?.eventId) || (request?.eventSequence !== undefined && request?.eventSequence !== null);
+  }
+
+  /**
+   * Settle the selection a load still owes. A linked event is looked up only in
+   * `arrived` (the newest page); the default pick waits for scoped evidence.
+   */
+  function resolvePendingSelection(arrived: TraceEvent[], initial: boolean, pushHistory: boolean) {
+    const pending = pendingSelection;
+    if (!pending || !selectedTrace) return;
+    const requested = hasEventIdentity(pending.request);
+    const next = requested
+      ? resolveSelectedEvent(arrived, arrived, pending.request, materialEvent)
+      : materialEvent(filterEvents(timeScopedEvents(events), filters));
+    if ((initial || next) && selectedEvent?.event_id !== next?.event_id) selectedEvent = next;
+    if (next) pendingSelection = null;
+    // A link that is still loading keeps its own URL; rewriting it now would drop the event.
+    if (next || (initial && !requested)) writeUrl(selectedTrace.trace_id, selectedEvent, initial && pushHistory ? 'push' : 'replace');
+  }
+
   function selectEvent(event: TraceEvent) {
     missingEventReference = null;
+    pendingSelection = null;
     selectedEvent = event;
     if (selectedTrace) writeUrl(selectedTrace.trace_id, event);
   }
@@ -454,6 +516,7 @@
 
   function closeInspector() {
     missingEventReference = null;
+    pendingSelection = null;
     selectedEvent = null;
     if (selectedTrace) writeUrl(selectedTrace.trace_id, null);
   }
@@ -559,7 +622,7 @@
     if (!baseline) return;
     comparisonLoading = true;
     try {
-      const baselineEvents = await api.events(traceId);
+      const baselineEvents = await loadAllEvents((afterSequence, limit) => api.eventsPage(traceId, { afterSequence, limit }));
       comparison = { baseline, baselineEvents };
     } catch (cause) {
       comparisonError = cause instanceof Error ? cause.message : 'Unable to compare traces.';
@@ -686,15 +749,32 @@
         if (next.length !== traces.length || next.some((item, index) => item.trace_id !== traces[index]?.trace_id || item.ended_at !== traces[index]?.ended_at || item.integrity !== traces[index]?.integrity)) {
           traces = next;
         }
-        // A recorder that died while its trace was open: stop tailing and say so.
-        const listed = selectedTrace && !selectedTrace.ended_at ? next.find((item) => listKey(item) === listKey(selectedTrace!)) : undefined;
-        if (listed && isAbandoned(listed) && !isAbandoned(selectedTrace!)) {
-          closeStream?.();
-          closeStream = null;
-          flushLiveBatch(loadEpoch);
-          selectedTrace = { ...selectedTrace!, integrity: listed.integrity, integrity_detail: listed.integrity_detail };
-          live = false;
-          streamState = 'abandoned';
+        const current = pendingTraceId ? null : selectedTrace;
+        const listed = current ? next.find((item) => listKey(item) === listKey(current)) : undefined;
+        if (current && listed && (listed.integrity !== current.integrity || (listed.ended_at ?? null) !== (current.ended_at ?? null))) {
+          if (isAbandoned(listed) && !current.ended_at) {
+            // A recorder that died while its trace was open: stop tailing and say so.
+            closeStream?.();
+            closeStream = null;
+            flushLiveBatch(loadEpoch);
+            selectedTrace = { ...current, integrity: listed.integrity, integrity_detail: listed.integrity_detail };
+            live = false;
+            streamState = 'abandoned';
+            reloadedForState = null;
+          } else {
+            // The open run changed under the user (recovered, finalized, or recording again):
+            // what is painted is stale, so reload its manifest and events, keeping the selection.
+            const state = `${listKey(listed)}|${listed.integrity}|${listed.ended_at}`;
+            if (state !== reloadedForState) {
+              reloadedForState = state;
+              const inspected = selectedEvent;
+              void selectTrace(listed, inspected ? { eventId: inspected.event_id } : undefined).then(() => {
+                if (!inspected && selectedTrace && listKey(selectedTrace) === listKey(listed) && !pendingTraceId) openRunOverview();
+              });
+            }
+          }
+        } else if (listed) {
+          reloadedForState = null;
         }
         // The empty state has nothing selected; adopt the first recording as soon as it appears.
         if (next.length && !selectedTrace && !pendingTraceId && !fatalError) void applyLocationState();
@@ -702,6 +782,8 @@
     }, 4000);
   });
   onDestroy(() => {
+    loadEpoch += 1;
+    loadAbort?.abort();
     closeStream?.();
     clearLiveBatch();
     stopReplay();
@@ -857,7 +939,7 @@
       {#if traceLoading}
         <div class="trace-load-progress" role="status" aria-live="polite">
           <span class="trace-load-bar" aria-hidden="true"></span>
-          <span class="sr-only">Loading run evidence…</span>
+          <span class="sr-only">Loading run evidence…{#if eventLoad} {eventLoad.loaded.toLocaleString('en-US')}{eventLoad.total !== null && eventLoad.total >= eventLoad.loaded ? ` of ${eventLoad.total.toLocaleString('en-US')}` : ''} events loaded{/if}</span>
         </div>
       {/if}
       {#if selectedTrace}
@@ -926,7 +1008,7 @@
               {#if viewMode === 'timeline'}
                 <div class="mode-content events-mode">
                   {#if selectedTrace}<InvestigationSummary trace={selectedTrace} {events} onselect={inspectEvent} />{/if}
-                  <EventTimeline events={windowedVisibleEvents} selectedSequence={selectedEvent?.sequence ?? null} onselect={selectEvent} />
+                  <EventTimeline events={windowedVisibleEvents} selectedSequence={selectedEvent?.sequence ?? null} onselect={selectEvent} loading={eventLoad} />
                 </div>
               {:else if viewMode === 'analytics'}
                 <div class="mode-content analytics-mode"><TraceAnalytics events={windowedVisibleEvents} selectedEventId={selectedEvent?.event_id ?? null} {live} filtered={filtersActive} onreset={clearScope} onselect={selectEvent} /></div>

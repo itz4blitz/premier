@@ -6,10 +6,29 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path};
+use std::sync::OnceLock;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use zeroize::Zeroize;
 
 pub const KEY_FILE_ENV: &str = "PREMIER_TRACE_KEY_FILE";
+
+/// Key file chosen for this process (`premier --key-file`); outranks [`KEY_FILE_ENV`].
+static KEY_FILE_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Use `path` as the trace key file for the rest of this process, as if
+/// [`KEY_FILE_ENV`] named it. Only the first call takes effect.
+pub fn set_key_file(path: impl Into<PathBuf>) {
+    let _ = KEY_FILE_OVERRIDE.set(path.into());
+}
+
+/// Whether a trace key file was named, by [`set_key_file`] or [`KEY_FILE_ENV`].
+/// It may still be unreadable or the wrong key.
+pub fn key_file_configured() -> bool {
+    KEY_FILE_OVERRIDE.get().is_some() || std::env::var_os(KEY_FILE_ENV).is_some()
+}
 
 pub struct EncryptionKey([u8; 32]);
 
@@ -102,8 +121,11 @@ impl EncryptionKey {
 }
 
 pub(crate) fn key_from_environment() -> Result<Option<EncryptionKey>> {
-    std::env::var_os(KEY_FILE_ENV)
-        .map(|path| EncryptionKey::from_file(Path::new(&path)))
+    KEY_FILE_OVERRIDE
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os(KEY_FILE_ENV).map(PathBuf::from))
+        .map(|path| EncryptionKey::from_file(&path))
         .transpose()
 }
 

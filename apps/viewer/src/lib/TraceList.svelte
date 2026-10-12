@@ -56,6 +56,7 @@
 
   function health(trace: TraceManifest): { label: string; tone: 'success' | 'warning' | 'error' | 'live' } {
     if (trace.integrity === 'invalid') return { label: 'Unverified', tone: 'error' };
+    if (trace.integrity === 'locked') return { label: 'Encrypted · key required', tone: 'warning' };
     if (isAbandoned(trace)) return { label: 'Abandoned', tone: 'warning' };
     if (trace.exit_code !== null && trace.exit_code !== 0) return { label: 'Failed', tone: 'error' };
     if ((trace.summary?.issue_count ?? 0) > 0) return { label: 'Needs attention', tone: 'warning' };
@@ -130,6 +131,7 @@
           <span class="run-title-line">
             <strong>{title(trace)}</strong>
             {#if isAbandoned(trace)}<span class="abandoned-badge" title={trace.integrity_detail || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.'}>Abandoned</span>
+            {:else if trace.integrity === 'locked'}<span class="abandoned-badge" title={trace.integrity_detail || 'This trace is encrypted. Restart premier with --key-file to read it.'}>Locked</span>
             {:else if !trace.ended_at}<span class="live-badge">Live</span>{/if}
             {#if trace.trace_id === selectedId && !matchingTraces.some((item) => item.trace_id === trace.trace_id)}<span class="outside-badge">Pinned</span>{/if}
           </span>

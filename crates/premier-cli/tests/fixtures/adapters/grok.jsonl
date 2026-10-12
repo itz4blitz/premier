@@ -1,2 +1,8 @@
-{"type":"session.started","session_id":"grok-session"}
-{"type":"assistant.message","id":"msg-1","content":"done"}
+{"type":"session.started","session_id":"grok-session","model":"grok-fixture","ts":1772619300}
+{"type":"assistant.message","id":"msg-1","content":"I will inspect the ledger module."}
+{"type":"tool.started","tool_call_id":"call-1","name":"read_file","arguments":{"path":"src/ledger.rs"}}
+{"type":"tool.completed","tool_call_id":"call-1","status":"success","output":"fn round_credit(value: i64) -> i64 { value / 100 }"}
+{"type":"tool.started","tool_call_id":"call-2","name":"bash","arguments":{"command":"cargo test"}}
+{"type":"tool.completed","tool_call_id":"call-2","status":"failed","error":"exit status 101","output":"test parser::rounding ... FAILED"}
+{"type":"assistant.message","id":"msg-2","content":"round_credit truncates negative credits.","usage":{"input_tokens":820,"output_tokens":64}}
+{"type":"session.completed","session_id":"grok-session","usage":{"input_tokens":1500,"output_tokens":110},"cost_usd":0.004}

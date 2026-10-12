@@ -693,6 +693,132 @@ fn first_party_adapter_fixtures_validate_without_lifecycle_diagnostics() {
     }
 }
 
+fn record_adapter_fixture(provider: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join(format!("{provider}.atrace"));
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/adapters")
+        .join(format!("{provider}.jsonl"));
+    let recorded = Command::new(env!("CARGO_BIN_EXE_premier"))
+        .args(["record", "--adapter", provider, "--output"])
+        .arg(&trace)
+        .args(["sh", "-c", "cat \"$1\"", "sh"])
+        .arg(&fixture)
+        .output()
+        .unwrap();
+    assert!(
+        recorded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    (temp, trace)
+}
+
+#[test]
+fn native_adapter_resolves_parents_links_and_subagent_lifecycle_to_stored_event_ids() {
+    let (_temp, trace) = record_adapter_fixture("claude");
+    let events: Vec<_> = read_events(&trace)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.source == "adapter.claude.v1")
+        .collect();
+    let find = |kind: &str, correlation: &str| {
+        events
+            .iter()
+            .rfind(|event| event.kind == kind && event.correlation_id == correlation)
+            .unwrap_or_else(|| panic!("no {kind} for {correlation}"))
+    };
+
+    let session = &events[0];
+    assert_eq!(session.kind, "agent.turn");
+    assert_eq!(session.payload()["lifecycle"], "session_start");
+    assert_eq!(session.parent_event_id, "");
+    let first_message = &events[1];
+    assert_eq!(first_message.kind, "model.response");
+    assert_eq!(first_message.parent_event_id, session.event_id);
+
+    // The hook line and the call share an id; the result hangs off the call itself.
+    let call = find("tool.invocation", "tool-1");
+    assert_eq!(call.payload()["native_type"], "assistant");
+    assert_eq!(call.parent_event_id, session.event_id);
+    let result = find("tool.result", "tool-1");
+    assert_eq!(result.parent_event_id, call.event_id);
+    assert_eq!(result.links, vec![call.event_id.clone()]);
+    let failed = find("tool.result", "tool-2");
+    assert_eq!(failed.status, "error");
+    assert_eq!(
+        failed.parent_event_id,
+        find("tool.invocation", "tool-2").event_id
+    );
+
+    let task = find("tool.invocation", "tool-3");
+    let spawn = find("agent.spawn", "tool-3");
+    assert_eq!(spawn.actor_id, "claude:subagent:tool-3");
+    assert_eq!(spawn.actor_type, "subagent");
+    assert_eq!(spawn.source, "adapter.claude.v1");
+    assert_eq!(spawn.parent_event_id, task.event_id);
+    assert_eq!(spawn.links, vec![task.event_id.clone()]);
+    assert_eq!(spawn.payload()["synthesized"], true);
+    assert_eq!(spawn.payload()["synthesized_from"], "parent_tool_use_id");
+    assert!(spawn.payload().get("native").is_none());
+    let subagent: Vec<_> = events
+        .iter()
+        .filter(|event| event.actor_id == "claude:subagent:tool-3")
+        .collect();
+    assert_eq!(subagent[0].event_id, spawn.event_id);
+    assert_eq!(subagent[1].kind, "tool.invocation");
+    assert_eq!(subagent[1].parent_event_id, spawn.event_id);
+    assert!(subagent[1].payload().get("synthesized").is_none());
+    let joined = find("agent.result", "tool-3");
+    let task_result = find("tool.result", "tool-3");
+    assert_eq!(joined.actor_id, "claude:subagent:tool-3");
+    assert_eq!(joined.status, "ok");
+    assert_eq!(joined.parent_event_id, spawn.event_id);
+    assert_eq!(
+        joined.links,
+        vec![spawn.event_id.clone(), task_result.event_id.clone()]
+    );
+    assert_eq!(joined.payload()["synthesized"], true);
+    assert!(joined.sequence > task_result.sequence);
+
+    let outcome = events.last().unwrap();
+    assert_eq!(outcome.kind, "agent.result");
+    assert_eq!(outcome.status, "ok");
+    assert_eq!(outcome.actor_id, "claude");
+    assert_eq!(outcome.parent_event_id, session.event_id);
+    assert_eq!(outcome.payload()["lifecycle"], "run_result");
+    assert_eq!(outcome.payload()["usage"]["input_tokens"], 181);
+    assert_eq!(outcome.payload()["usage"]["cost_usd"], 0.0123);
+    assert!(!events.iter().any(|event| event.kind == "provider.event"));
+
+    let all = read_events(&trace).unwrap();
+    assert!(premier_trace::validate_events(&all).is_empty());
+}
+
+#[test]
+fn native_adapter_keeps_receipt_time_and_records_the_provider_timestamp() {
+    let (_temp, trace) = record_adapter_fixture("gemini");
+    let events = read_events(&trace).unwrap();
+    let init = events
+        .iter()
+        .find(|event| event.source == "adapter.gemini.v1")
+        .unwrap();
+    assert_eq!(init.kind, "agent.turn");
+    assert_eq!(
+        init.payload()["native_timestamp"],
+        "2026-03-04T10:15:00.120Z"
+    );
+    // The fixture's provider time is long past; the event keeps the recorder's receipt time.
+    assert!(!init.timestamp.starts_with("2026-03-04T10:15:00"));
+    let outcome = events
+        .iter()
+        .rfind(|event| event.source == "adapter.gemini.v1")
+        .unwrap();
+    assert_eq!(outcome.kind, "agent.result");
+    assert_eq!(outcome.parent_event_id, init.event_id);
+    assert_eq!(outcome.payload()["usage"]["total_tokens"], 1530);
+}
+
 #[test]
 fn demo_refuses_to_delete_an_arbitrary_existing_directory() {
     let temp = tempfile::tempdir().unwrap();
@@ -1030,6 +1156,91 @@ fn pty_recorder_sigterm_is_forwarded_to_the_process_group_and_finalized() {
     assert_recorder_signal_is_forwarded("-TERM", 15, 143, true);
 }
 
+/// A spawned recorder whose whole process group is killed when it goes out
+/// of scope. The tests below record commands such as `sleep 300`; without
+/// this, a failed assertion, a recorder killed by `wait_bounded`, or a
+/// descendant that outlives the run would leave them behind.
+///
+/// Spawn the recorder with `process_group(0)`: a pipe-mode child stays in the
+/// recorder's group, and a PTY child loses its terminal with the recorder.
+#[cfg(unix)]
+struct RecorderProcess(std::process::Child);
+
+#[cfg(unix)]
+impl std::ops::Deref for RecorderProcess {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for RecorderProcess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RecorderProcess {
+    fn drop(&mut self) {
+        if let Ok(group) = i32::try_from(self.0.id()) {
+            // SAFETY: signals only the process group this test created; a
+            // group with no members left reports ESRCH, which is fine.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dropped_test_recorder_leaves_no_recorded_command_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("cleanup.atrace");
+    // The child ignores every stop request the recorder would forward, and
+    // a second descendant runs in the background.
+    let (recorder, mut stdout) = spawn_ready_recorder(
+        &trace,
+        false,
+        "600000",
+        "trap '' TERM HUP INT; sleep 300 & echo READY; echo \"PIDS $$ $!\"; wait",
+    );
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let pids: Vec<u32> = line
+        .trim()
+        .strip_prefix("PIDS ")
+        .unwrap_or_else(|| panic!("unexpected line {line:?}"))
+        .split(' ')
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2);
+    assert!(pids.iter().all(|pid| process_exists(*pid)));
+
+    drop(recorder);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while pids.iter().any(|pid| process_exists(*pid)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "recorded commands {pids:?} outlived the test recorder"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(unix)]
 fn assert_recorder_signal_is_forwarded(
     kill_argument: &str,
@@ -1045,18 +1256,20 @@ fn assert_recorder_signal_is_forwarded(
     if pty {
         command.arg("--pty");
     }
-    let mut recorder = command
-        .arg("--output")
-        .arg(&trace)
-        .args(["sh", "-c", "printf 'READY %s\\n' \"$$\"; exec sleep 300"])
-        // A recorder in its terminal's foreground process group treats SIGINT
-        // as Ctrl-C; a supervised recorder is not in the foreground.
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut recorder = RecorderProcess(
+        command
+            .arg("--output")
+            .arg(&trace)
+            .args(["sh", "-c", "printf 'READY %s\\n' \"$$\"; exec sleep 300"])
+            // A recorder in its terminal's foreground process group treats SIGINT
+            // as Ctrl-C; a supervised recorder is not in the foreground.
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
 
     // Reading the child's output through Premier proves the child is running
     // and Premier's signal forwarder has already been installed.
@@ -1098,45 +1311,39 @@ fn assert_recorder_signal_is_forwarded(
     assert_eq!(exit.payload()["forwarded_by_recorder"], true);
     premier_trace::verify(&trace).unwrap();
     assert!(!trace.join(premier_trace::RECORDER_LEASE).exists());
-    let child_still_exists = Command::new("kill")
-        .args(["-0", &child_pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(
-        !child_still_exists.success(),
-        "recorded child was not reaped"
-    );
+    assert!(!process_exists(child_pid), "recorded child was not reaped");
 }
 
 /// Spawn `premier record` around a shell script that prints `READY` once it
 /// is running, and wait for that marker through Premier's mirrored stdout.
+/// Dropping the recorder kills whatever it left running.
 #[cfg(unix)]
 fn spawn_ready_recorder(
     trace: &std::path::Path,
     pty: bool,
     stop_grace_ms: &str,
     script: &str,
-) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
+) -> (RecorderProcess, BufReader<std::process::ChildStdout>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_premier"));
     command.arg("record");
     if pty {
         command.arg("--pty");
     }
-    let mut recorder = command
-        .arg("--output")
-        .arg(trace)
-        .args(["sh", "-c", script])
-        .env("PREMIER_STOP_GRACE_MS", stop_grace_ms)
-        // Keep the recorder out of the terminal's foreground process group,
-        // like a supervised recorder, even when the tests run interactively.
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut recorder = RecorderProcess(
+        command
+            .arg("--output")
+            .arg(trace)
+            .args(["sh", "-c", script])
+            .env("PREMIER_STOP_GRACE_MS", stop_grace_ms)
+            // Keep the recorder out of the terminal's foreground process group,
+            // like a supervised recorder, even when the tests run interactively.
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let mut stdout = BufReader::new(recorder.stdout.take().unwrap());
     let mut line = String::new();
     while !line.contains("READY") {
@@ -1343,15 +1550,21 @@ fn record_finalizes_when_a_descendant_keeps_the_output_pipe_open() {
     let temp = tempfile::tempdir().unwrap();
     let trace = temp.path().join("held-pipe.atrace");
     let started = std::time::Instant::now();
-    let recorded = Command::new(env!("CARGO_BIN_EXE_premier"))
-        .args(["record", "--output"])
-        .arg(&trace)
-        .args(["sh", "-c", "sleep 20 & echo done; exit 3"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::null())
-        .status()
-        .unwrap();
+    // The descendant outlives the recording by design; dropping the recorder
+    // ends it with the test instead of twenty seconds later.
+    let mut recorder = RecorderProcess(
+        Command::new(env!("CARGO_BIN_EXE_premier"))
+            .args(["record", "--output"])
+            .arg(&trace)
+            .args(["sh", "-c", "sleep 20 & echo done; exit 3"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let recorded = wait_bounded(&mut recorder, || {});
 
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
@@ -1783,6 +1996,67 @@ fn recover_refuses_a_trace_whose_recorder_is_alive_even_past_the_idle_threshold(
         String::from_utf8_lossy(&forced.stderr)
     );
     premier_trace::verify(&trace).unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn recover_refuses_a_suspended_recorder_whose_lease_went_stale() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("suspended.atrace");
+    let (mut recorder, _stdout) =
+        spawn_ready_recorder(&trace, false, "60000", "echo READY; exec sleep 300");
+    let premier = env!("CARGO_BIN_EXE_premier");
+    let lease_path = trace.join(premier_trace::RECORDER_LEASE);
+    let lease = std::fs::read_to_string(&lease_path).unwrap();
+    assert!(
+        lease.starts_with(&format!("{} start=", recorder.id())),
+        "{lease}"
+    );
+
+    // Suspend the recorder, as a stopped job or a sleeping laptop would, and
+    // let its lease look ten minutes old: twice the default idle guard.
+    signal_process("-STOP", recorder.id());
+    std::fs::File::options()
+        .write(true)
+        .open(&lease_path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+        .unwrap();
+
+    let guarded = Command::new(premier)
+        .arg("recover")
+        .arg(&trace)
+        .args(["--stale-after-seconds", "0"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&guarded.stderr);
+    assert!(
+        !guarded.status.success(),
+        "a suspended recording was finalized"
+    );
+    assert!(stderr.contains("still being recorded"), "{stderr}");
+    let listed = Command::new(premier)
+        .args(["list", "--trace-dir"])
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains("[recording]"), "{listed}");
+    assert!(!listed.contains("premier recover"), "{listed}");
+
+    // Resumed, the recorder finishes its own trace.
+    signal_process("-CONT", recorder.id());
+    signal_process("-TERM", recorder.id());
+    wait_bounded(&mut recorder, || {});
+    premier_trace::verify(&trace).unwrap();
+    assert_eq!(
+        premier_trace::read_manifest(&trace)
+            .unwrap()
+            .termination
+            .unwrap()
+            .kind,
+        premier_trace::TerminationKind::Signal
+    );
 }
 
 #[cfg(unix)]

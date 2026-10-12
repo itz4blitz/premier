@@ -17,6 +17,8 @@ pub enum IntegrityStatus {
     Verified,
     /// Finalized or readable trace failed verification.
     Invalid,
+    /// Encrypted, and no usable key was supplied: the evidence is sealed, not damaged.
+    Locked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

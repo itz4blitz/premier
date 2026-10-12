@@ -219,4 +219,24 @@ describe('buildInvestigationSummary', () => {
       label: 'Recorded lifecycle evidence is incomplete'
     }));
   });
+
+  it('names a command that could not be started as the cause', () => {
+    const spawnFailed = event(2, 'process.spawn_failed', {
+      source: 'premier', actor_id: 'root', actor_type: 'process', status: 'error', span_id: 'command', parent_span_id: 'session',
+      payload_json: JSON.stringify({ executable: 'no-such-agent', error: 'No such file or directory (os error 2)', exit_code: 127, success: false })
+    });
+    const events = [
+      event(1, 'session.start', { source: 'premier', actor_id: 'root', actor_type: 'process', status: 'running', span_id: 'session' }),
+      spawnFailed
+    ];
+    const result = buildInvestigationSummary(trace({ exit_code: 127, termination: { kind: 'exit', exit_code: 127 } }), events);
+    expect(result.cause).toMatchObject({
+      title: 'The command could not be started',
+      detail: 'Failed to start no-such-agent: No such file or directory (os error 2)',
+      confidence: 'high',
+      role: 'cause'
+    });
+    expect(result.cause.event?.event_id).toBe(spawnFailed.event_id);
+    expect(result.gaps.map((gap) => gap.id)).not.toContain('exit-cause');
+  });
 });

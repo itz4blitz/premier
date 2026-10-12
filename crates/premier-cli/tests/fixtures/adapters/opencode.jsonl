@@ -1,4 +1,8 @@
-{"type":"step_start","session_id":"open-session"}
-{"type":"tool_use","id":"tool-1","name":"read"}
-{"type":"tool_use","sessionID":"open-session","part":{"type":"tool","callID":"tool-1","tool":"read","state":{"status":"completed","output":"ok"}}}
-{"type":"step_finish","sessionID":"open-session","part":{"type":"step-finish","tokens":{"input":10,"output":5}}}
+{"type":"step_start","timestamp":1772619300120,"sessionID":"open-session","part":{"id":"prt-1","sessionID":"open-session","messageID":"msg-1","type":"step-start","snapshot":"4b825dc6"}}
+{"type":"text","timestamp":1772619301402,"sessionID":"open-session","part":{"id":"prt-2","sessionID":"open-session","messageID":"msg-1","type":"text","text":"I will read the ledger module.","time":{"start":1772619301100,"end":1772619301400}}}
+{"type":"tool_use","timestamp":1772619301701,"sessionID":"open-session","part":{"id":"prt-3","sessionID":"open-session","messageID":"msg-1","type":"tool","callID":"tool-1","tool":"read","state":{"status":"completed","input":{"filePath":"src/ledger.rs"},"output":"fn round_credit(value: i64) -> i64 { value / 100 }","title":"src/ledger.rs","metadata":{"truncated":false},"time":{"start":1772619301650,"end":1772619301700}}}}
+{"type":"tool_use","timestamp":1772619306944,"sessionID":"open-session","part":{"id":"prt-4","sessionID":"open-session","messageID":"msg-1","type":"tool","callID":"tool-2","tool":"bash","state":{"status":"error","input":{"command":"cargo test"},"error":"Command exited with code 101","time":{"start":1772619302310,"end":1772619306940}}}}
+{"type":"step_finish","timestamp":1772619307010,"sessionID":"open-session","part":{"id":"prt-5","sessionID":"open-session","messageID":"msg-1","type":"step-finish","reason":"tool-calls","cost":0.0021,"tokens":{"input":1400,"output":60,"reasoning":0,"cache":{"read":900,"write":0}}}}
+{"type":"step_start","timestamp":1772619307100,"sessionID":"open-session","part":{"id":"prt-6","sessionID":"open-session","messageID":"msg-2","type":"step-start","snapshot":"4b825dc6"}}
+{"type":"text","timestamp":1772619308015,"sessionID":"open-session","part":{"id":"prt-7","sessionID":"open-session","messageID":"msg-2","type":"text","text":"round_credit truncates negative credits.","time":{"start":1772619307600,"end":1772619308010}}}
+{"type":"step_finish","timestamp":1772619308090,"sessionID":"open-session","part":{"id":"prt-8","sessionID":"open-session","messageID":"msg-2","type":"step-finish","reason":"stop","cost":0.0009,"tokens":{"input":1530,"output":70,"reasoning":0,"cache":{"read":1400,"write":0}}}}

@@ -21,8 +21,10 @@ export type PremierEventInput = {
   links?: string[];
   payload?: Record<string, unknown>;
   /**
-   * RFC3339 producer timestamp, stored verbatim as the event timestamp.
-   * When omitted, the collector records its own receipt time instead.
+   * RFC3339 producer timestamp. The local recorder always stamps the event
+   * `timestamp` with its own receipt time and keeps this value as
+   * `payload.producer_timestamp`; anything that is not RFC3339 is rejected
+   * with HTTP 400, as is a timestamp sent with a non-object payload.
    */
   timestamp?: string;
 };

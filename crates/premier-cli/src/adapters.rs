@@ -1,3 +1,4 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use premier_trace::EventInput;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -10,6 +11,10 @@ const MAX_NATIVE_LINE_BYTES: usize = 256 * 1024;
 const MAX_BUFFERED_LINE_BYTES: usize = 16 * 1024 * 1024;
 const TRUNCATED_STRING_BYTES: usize = 8 * 1024;
 const MAX_TRACKED_TOOL_CALLS: usize = 1024;
+/// Bound on remembered stored event ids; per-call entries are dropped first when it is reached.
+const MAX_TRACKED_EVENT_IDS: usize = 4 * MAX_TRACKED_TOOL_CALLS;
+const SESSION_KEY: &str = "session";
+const TURN_KEY: &str = "turn";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdapterChoice {
@@ -133,6 +138,83 @@ impl Provider {
     }
 }
 
+/// A normalized event plus the causal references only the appender can resolve. The adapter
+/// never sees the ids the writer assigns, so it names the events it depends on by key and
+/// [`NativeAdapter::commit`] swaps the keys for stored event ids.
+#[derive(Debug)]
+pub struct AdapterEvent {
+    pub input: EventInput,
+    /// Key under which this event's stored id is remembered.
+    opens: Option<String>,
+    /// A weak opener (a hook line about a call) yields to the call itself.
+    weak: bool,
+    /// Key forgotten once this event is stored.
+    closes: Option<String>,
+    /// Candidate parents, most specific first; the first one already stored wins.
+    parents: Vec<String>,
+    /// Keys whose stored ids become `links`.
+    links: Vec<String>,
+}
+
+impl AdapterEvent {
+    fn unlinked(input: EventInput) -> Self {
+        Self {
+            input,
+            opens: None,
+            weak: false,
+            closes: None,
+            parents: Vec::new(),
+            links: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for AdapterEvent {
+    type Target = EventInput;
+
+    fn deref(&self) -> &EventInput {
+        &self.input
+    }
+}
+
+impl std::ops::DerefMut for AdapterEvent {
+    fn deref_mut(&mut self) -> &mut EventInput {
+        &mut self.input
+    }
+}
+
+/// The stored event that opened a session, turn, tool call, approval or subagent.
+struct Opened {
+    event_id: String,
+    weak: bool,
+    actor_id: String,
+}
+
+/// Lines whose exact type states where a session or turn starts and ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    SessionStart,
+    TurnStart,
+    RunResult,
+}
+
+impl Phase {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::SessionStart | Self::TurnStart => "agent.turn",
+            Self::RunResult => "agent.result",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::TurnStart => "turn_start",
+            Self::RunResult => "run_result",
+        }
+    }
+}
+
 pub struct NativeAdapter {
     provider: Provider,
     pending: Vec<u8>,
@@ -140,6 +222,10 @@ pub struct NativeAdapter {
     line_number: u64,
     session_id: String,
     tool_names: HashMap<String, String>,
+    /// Stored event ids by reference key, filled in by `commit`.
+    event_ids: HashMap<String, Opened>,
+    /// Subagents by spawning tool call id; true while the spawning call has no result yet.
+    subagents: HashMap<String, bool>,
 }
 
 impl NativeAdapter {
@@ -151,10 +237,80 @@ impl NativeAdapter {
             line_number: 0,
             session_id: String::new(),
             tool_names: HashMap::new(),
+            event_ids: HashMap::new(),
+            subagents: HashMap::new(),
         }
     }
 
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<EventInput> {
+    /// Stores `events` in order through `append`, which returns the event id the writer
+    /// assigned. Reference keys become `parent_event_id` and `links`, and each stored id is
+    /// remembered for the events that follow, so a parent is always an earlier stored event.
+    pub fn commit<E>(
+        &mut self,
+        events: Vec<AdapterEvent>,
+        mut append: impl FnMut(EventInput) -> Result<String, E>,
+    ) -> Result<(), E> {
+        for event in events {
+            let AdapterEvent {
+                mut input,
+                opens,
+                weak,
+                closes,
+                parents,
+                links,
+            } = event;
+            if let Some(parent) = parents.iter().find_map(|key| self.event_ids.get(key)) {
+                input.parent_event_id = parent.event_id.clone();
+                // Only the stored spawning call knows which actor a subagent descends from.
+                if input.kind == "agent.spawn" && !parent.actor_id.is_empty() {
+                    input.payload["parent_actor"] = json!(parent.actor_id);
+                }
+            }
+            for key in &links {
+                if let Some(linked) = self.event_ids.get(key)
+                    && !input.links.contains(&linked.event_id)
+                {
+                    input.links.push(linked.event_id.clone());
+                }
+            }
+            let actor_id = input.actor_id.clone();
+            let event_id = append(input)?;
+            if let Some(key) = closes {
+                self.event_ids.remove(&key);
+            }
+            if let Some(key) = opens {
+                self.remember(
+                    key,
+                    Opened {
+                        event_id,
+                        weak,
+                        actor_id,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn remember(&mut self, key: String, opened: Opened) {
+        // The latest session or turn wins; a call keeps its first record unless that was a hook.
+        let replace = key == SESSION_KEY
+            || key == TURN_KEY
+            || self
+                .event_ids
+                .get(&key)
+                .is_none_or(|existing| existing.weak && !opened.weak);
+        if !replace {
+            return;
+        }
+        if self.event_ids.len() >= MAX_TRACKED_EVENT_IDS {
+            self.event_ids
+                .retain(|key, _| key == SESSION_KEY || key == TURN_KEY);
+        }
+        self.event_ids.insert(key, opened);
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
         for &byte in bytes {
             if self.discarded_bytes > 0 {
@@ -180,7 +336,7 @@ impl NativeAdapter {
         events
     }
 
-    pub fn finish(&mut self) -> Vec<EventInput> {
+    pub fn finish(&mut self) -> Vec<AdapterEvent> {
         if self.discarded_bytes > 0 {
             return vec![self.discarded_diagnostic()];
         }
@@ -192,7 +348,7 @@ impl NativeAdapter {
         self.parse_line(&line)
     }
 
-    fn parse_line(&mut self, line: &[u8]) -> Vec<EventInput> {
+    fn parse_line(&mut self, line: &[u8]) -> Vec<AdapterEvent> {
         if line.iter().all(u8::is_ascii_whitespace) {
             return Vec::new();
         }
@@ -221,13 +377,16 @@ impl NativeAdapter {
         if oversized.is_some() {
             // Status, pairing and identity came from the full line; only the stored copy shrinks.
             for event in &mut events {
-                truncate_payload(&mut event.payload, line_bytes);
+                // Synthesized events hold no copy of the line.
+                if event.payload.get("native").is_some() {
+                    truncate_payload(&mut event.payload, line_bytes);
+                }
             }
         }
         events
     }
 
-    fn discarded_diagnostic(&mut self) -> EventInput {
+    fn discarded_diagnostic(&mut self) -> AdapterEvent {
         let line_bytes = std::mem::take(&mut self.discarded_bytes);
         self.diagnostic(
             &format!(
@@ -238,7 +397,7 @@ impl NativeAdapter {
         )
     }
 
-    fn diagnostic(&self, message: &str, line_bytes: Option<usize>) -> EventInput {
+    fn diagnostic(&self, message: &str, line_bytes: Option<usize>) -> AdapterEvent {
         let mut payload = json!({
             "provider": self.provider.id(),
             "adapter_schema_version": ADAPTER_SCHEMA_VERSION,
@@ -248,7 +407,7 @@ impl NativeAdapter {
         if let Some(line_bytes) = line_bytes {
             payload["line_bytes"] = json!(line_bytes);
         }
-        EventInput {
+        AdapterEvent::unlinked(EventInput {
             kind: "adapter.diagnostic".into(),
             source: format!("adapter.{}.v{ADAPTER_SCHEMA_VERSION}", self.provider.id()),
             actor_id: self.provider.id().into(),
@@ -256,10 +415,10 @@ impl NativeAdapter {
             status: "warning".into(),
             payload,
             ..EventInput::default()
-        }
+        })
     }
 
-    fn normalize(&mut self, native: Value) -> Vec<EventInput> {
+    fn normalize(&mut self, native: Value) -> Vec<AdapterEvent> {
         let provider = self.provider;
         let native_type = string_at(
             &native,
@@ -277,14 +436,33 @@ impl NativeAdapter {
         if let Some(session) = string_at(&native, SESSION_ID_PATHS) {
             self.session_id = session.to_owned();
         }
-        let combined = combined_discriminators(&native);
+        let parent_tool = string_at(&native, &[&["parent_tool_use_id"]])
+            .unwrap_or("")
+            .to_owned();
+        let mut events = Vec::new();
+        if !parent_tool.is_empty() && !self.subagents.contains_key(&parent_tool) {
+            // The provider never announces a subagent; its first line is the earliest evidence.
+            if self.subagents.len() >= MAX_TRACKED_TOOL_CALLS {
+                self.subagents.clear();
+            }
+            self.subagents.insert(parent_tool.clone(), true);
+            events.push(self.subagent_event(
+                "agent.spawn",
+                "running",
+                "parent_tool_use_id",
+                &parent_tool,
+            ));
+        }
+        let discriminators = Discriminators::of(&native);
         let blocks = tool_blocks(&native);
         let scopes = outcome_scopes(&native);
-        let decision = contains_any(&combined, &["approval", "permission"])
+        let decision = discriminators
+            .has(APPROVAL_WORDS)
             .then(|| approval_decision(&scopes))
             .flatten();
-        let completed = is_completed(&scopes, &combined) || decision.is_some();
-        let kind = classify_kind(provider, &native, &combined, completed);
+        let completed = is_completed(&scopes, &discriminators) || decision.is_some();
+        let phase = lifecycle_phase(provider, &native);
+        let kind = classify_kind(provider, &native, &discriminators, phase, completed);
         let tool_kind = kind.starts_with("tool.") || kind.starts_with("approval.");
         // A line that is itself a tool event speaks for the first nested block of the same phase.
         let block = if tool_kind {
@@ -301,21 +479,29 @@ impl NativeAdapter {
             || type_states_failure(&native, block);
         // An explicit failure ends the lifecycle even when the provider never says "completed".
         let kind = if failed && !completed {
-            classify_kind(provider, &native, &combined, true)
+            classify_kind(provider, &native, &discriminators, phase, true)
         } else {
             kind
         };
+        // A session's start, turns and result pair up through the session, not per-line ids.
+        let session_scoped = matches!(kind, "agent.turn" | "agent.result")
+            && parent_tool.is_empty()
+            && !self.session_id.is_empty();
         let correlation_id = if tool_kind {
             tool_correlation(&native, block)
+        } else if session_scoped {
+            Some(self.session_id.as_str())
         } else {
             None
         }
         .or_else(|| string_at(&native, CORRELATION_PATHS))
         .unwrap_or("")
         .to_owned();
-        let parent_tool = string_at(&native, &[&["parent_tool_use_id"]])
-            .unwrap_or("")
-            .to_owned();
+        let hook = native_type.starts_with("hook")
+            || ["hook_name", "hook_event_name"]
+                .iter()
+                .any(|key| native.get(*key).is_some());
+        let native_timestamp = native_timestamp(&native);
         let status = if let Some(decision) = decision {
             decision
         } else if failed {
@@ -337,12 +523,22 @@ impl NativeAdapter {
         if tool_kind {
             for part in &blocks {
                 if !block.is_some_and(|block| std::ptr::eq(block, *part)) {
-                    extra.push(self.part_event(part, block_kind(part), &parent_tool));
+                    extra.push(self.part_event(
+                        part,
+                        block_kind(part),
+                        &parent_tool,
+                        native_timestamp.as_deref(),
+                    ));
                 }
             }
         } else {
             for call in function_calls(&native) {
-                extra.push(self.part_event(call, "tool.invocation", &parent_tool));
+                extra.push(self.part_event(
+                    call,
+                    "tool.invocation",
+                    &parent_tool,
+                    native_timestamp.as_deref(),
+                ));
             }
         }
         let mut payload = json!({
@@ -367,25 +563,196 @@ impl NativeAdapter {
         if !parent_tool.is_empty() {
             payload["parent_actor"] = json!(provider.id());
         }
+        if let Some(phase) = phase {
+            payload["lifecycle"] = json!(phase.label());
+        }
+        if session_scoped {
+            payload["session_id"] = json!(self.session_id);
+        }
+        if let Some(timestamp) = &native_timestamp {
+            payload["native_timestamp"] = json!(timestamp);
+        }
         let duration_ms = native
             .get("duration_ms")
             .or_else(|| native.get("item")?.get("duration_ms"))
+            .or_else(|| native.get("stats")?.get("duration_ms"))
             .and_then(Value::as_u64)
             .unwrap_or_default();
         payload["native"] = native;
-        let mut events = vec![EventInput {
+        let main = EventInput {
             kind: kind.into(),
             status: status.into(),
             duration_ms,
             payload,
             ..self.identified(correlation_id, &parent_tool)
-        }];
-        events.extend(extra);
+        };
+        let parts = extra.into_iter().map(|part| (part, false, None));
+        for (input, hook, phase) in std::iter::once((main, hook, phase)).chain(parts) {
+            let event = self.linked(input, &parent_tool, hook, phase);
+            let finished = self.subagent_result(&event);
+            events.push(event);
+            events.extend(finished);
+        }
         events
     }
 
+    /// Names the stored events this one hangs off: the call a result or approval answers, the
+    /// spawn of the subagent it belongs to, then the open turn and the session.
+    fn linked(
+        &self,
+        input: EventInput,
+        parent_tool: &str,
+        hook: bool,
+        phase: Option<Phase>,
+    ) -> AdapterEvent {
+        let keyed = |prefix: &str| {
+            (!input.correlation_id.is_empty()).then(|| format!("{prefix}:{}", input.correlation_id))
+        };
+        let (tool, approval, result) = (keyed("tool"), keyed("approval"), keyed("result"));
+        let subagent = !parent_tool.is_empty();
+        let (mut opens, mut closes) = (None, None);
+        let (mut parents, mut links) = (Vec::new(), Vec::new());
+        match input.kind.as_str() {
+            "tool.invocation" => {
+                if hook {
+                    parents.extend(tool.clone());
+                }
+                opens = tool;
+            }
+            "tool.result" => {
+                parents.extend(tool.clone());
+                links.extend(tool);
+                // Only a result that ends a subagent is referenced later.
+                if self.subagents.get(&input.correlation_id) == Some(&true) {
+                    opens = result;
+                }
+            }
+            "approval.request" => {
+                parents.extend(tool);
+                opens = approval;
+            }
+            "approval.decision" => {
+                parents.extend(approval.clone());
+                parents.extend(tool);
+                links.extend(approval);
+            }
+            "agent.turn" if !subagent => {
+                let key = if phase == Some(Phase::SessionStart) {
+                    SESSION_KEY
+                } else {
+                    TURN_KEY
+                };
+                opens = Some(key.to_owned());
+            }
+            "agent.result" if !subagent => closes = Some(TURN_KEY.to_owned()),
+            _ => {}
+        }
+        if subagent {
+            parents.push(format!("agent:{parent_tool}"));
+        }
+        if opens.as_deref() != Some(SESSION_KEY) {
+            if opens.as_deref() != Some(TURN_KEY) {
+                parents.push(TURN_KEY.to_owned());
+            }
+            parents.push(SESSION_KEY.to_owned());
+        }
+        AdapterEvent {
+            input,
+            opens,
+            weak: hook,
+            closes,
+            parents,
+            links,
+        }
+    }
+
+    /// The subagent's completion, inferred from the result of the tool call that spawned it.
+    fn subagent_result(&mut self, result: &EventInput) -> Option<AdapterEvent> {
+        if result.kind != "tool.result" {
+            return None;
+        }
+        let open = self.subagents.get_mut(&result.correlation_id)?;
+        if !std::mem::take(open) {
+            return None;
+        }
+        Some(self.subagent_event(
+            "agent.result",
+            &result.status,
+            "tool_result",
+            &result.correlation_id,
+        ))
+    }
+
+    /// A subagent lifecycle event no native line states. `synthesized` marks it as inference,
+    /// so it carries no `native` object; the links point at the evidence it was drawn from.
+    fn subagent_event(
+        &self,
+        kind: &str,
+        status: &str,
+        evidence: &str,
+        tool_id: &str,
+    ) -> AdapterEvent {
+        let provider = self.provider.id();
+        let spawn = kind == "agent.spawn";
+        let mut payload = json!({
+            "provider": provider,
+            "adapter_schema_version": ADAPTER_SCHEMA_VERSION,
+            "synthesized": true,
+            "synthesized_from": evidence,
+            "parent_tool_use_id": tool_id,
+            "line": self.line_number,
+        });
+        if spawn {
+            payload["parent_actor"] = json!(provider);
+        }
+        if let Some(tool) = self.tool_names.get(tool_id) {
+            payload["tool"] = json!(tool);
+        }
+        let (agent_key, tool_key) = (format!("agent:{tool_id}"), format!("tool:{tool_id}"));
+        let (parents, links) = if spawn {
+            (
+                vec![
+                    tool_key.clone(),
+                    TURN_KEY.to_owned(),
+                    SESSION_KEY.to_owned(),
+                ],
+                vec![tool_key],
+            )
+        } else {
+            (
+                vec![agent_key.clone()],
+                vec![agent_key.clone(), format!("result:{tool_id}")],
+            )
+        };
+        AdapterEvent {
+            input: EventInput {
+                kind: kind.into(),
+                source: format!("adapter.{provider}.v{ADAPTER_SCHEMA_VERSION}"),
+                actor_id: format!("{provider}:subagent:{tool_id}"),
+                actor_type: "subagent".into(),
+                span_id: tool_id.into(),
+                parent_span_id: self.session_id.clone(),
+                correlation_id: tool_id.into(),
+                status: status.into(),
+                payload,
+                ..EventInput::default()
+            },
+            opens: spawn.then_some(agent_key),
+            weak: false,
+            closes: None,
+            parents,
+            links,
+        }
+    }
+
     /// One event for a tool call or result that shares its native line with other content.
-    fn part_event(&mut self, part: &Value, kind: &'static str, parent_tool: &str) -> EventInput {
+    fn part_event(
+        &mut self,
+        part: &Value,
+        kind: &'static str,
+        parent_tool: &str,
+        native_timestamp: Option<&str>,
+    ) -> EventInput {
         let correlation_id = string_at(
             part,
             &[&["tool_use_id"], &["tool_call_id"], &["call_id"], &["id"]],
@@ -410,6 +777,9 @@ impl NativeAdapter {
         }
         if !parent_tool.is_empty() {
             payload["parent_actor"] = json!(self.provider.id());
+        }
+        if let Some(timestamp) = native_timestamp {
+            payload["native_timestamp"] = json!(timestamp);
         }
         payload["native"] = part.clone();
         EventInput {
@@ -565,6 +935,84 @@ fn string_at<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a str> {
     })
 }
 
+/// Lowercase words of a discriminator: `item.completed`, `tool_use` and `PreToolUse` split on
+/// punctuation and case, so markers match whole words instead of substrings ("pending" is not
+/// "end").
+fn words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut after_lower = false;
+    for character in value.chars() {
+        let boundary = !character.is_alphanumeric() || (character.is_uppercase() && after_lower);
+        if boundary && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        after_lower = character.is_lowercase() || character.is_ascii_digit();
+        if character.is_alphanumeric() {
+            word.extend(character.to_lowercase());
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+const COMPLETION_WORDS: &[&str] = &[
+    "completed",
+    "complete",
+    "result",
+    "results",
+    "finish",
+    "finished",
+    "end",
+    "ended",
+];
+const APPROVAL_WORDS: &[&str] = &["approval", "approvals", "permission", "permissions"];
+const MESSAGE_WORDS: &[&str] = &["assistant", "message", "messages"];
+const AGENT_WORDS: &[&str] = &["session", "thread", "agent", "step", "turn"];
+
+fn is_tool_word(word: &str) -> bool {
+    matches!(
+        word,
+        "tool" | "tools" | "toolcall" | "toolcalls" | "tooluse" | "toolresult" | "mcp"
+    )
+}
+
+/// Every type-like value on a native line, each split into words.
+struct Discriminators(Vec<Vec<String>>);
+
+impl Discriminators {
+    fn of(native: &Value) -> Self {
+        let mut values = Vec::new();
+        collect_discriminators(native, &mut values);
+        Self(values.iter().map(|value| words(value)).collect())
+    }
+
+    fn has(&self, markers: &[&str]) -> bool {
+        self.any(|word| markers.contains(&word))
+    }
+
+    fn any(&self, matches: impl Fn(&str) -> bool) -> bool {
+        self.0.iter().flatten().any(|word| matches(word))
+    }
+
+    /// Two adjacent words of one value, such as `command_execution`.
+    fn has_pair(&self, first: &str, second: &str) -> bool {
+        self.0.iter().any(|value| {
+            value
+                .windows(2)
+                .any(|pair| pair[0] == first && pair[1] == second)
+        })
+    }
+
+    fn names_tool(&self) -> bool {
+        self.any(is_tool_word)
+            || self.has_pair("command", "execution")
+            || self.has_pair("function", "call")
+    }
+}
+
 fn collect_discriminators(value: &Value, output: &mut Vec<String>) {
     match value {
         Value::Object(object) => {
@@ -588,7 +1036,7 @@ fn collect_discriminators(value: &Value, output: &mut Vec<String>) {
                     "type" | "subtype" | "kind" | "event" | "hook_name" | "role"
                 ) && let Some(value) = value.as_str()
                 {
-                    output.push(value.to_ascii_lowercase());
+                    output.push(value.to_owned());
                 }
                 collect_discriminators(value, output);
             }
@@ -602,10 +1050,60 @@ fn collect_discriminators(value: &Value, output: &mut Vec<String>) {
     }
 }
 
-fn combined_discriminators(native: &Value) -> String {
-    let mut discriminators = Vec::new();
-    collect_discriminators(native, &mut discriminators);
-    discriminators.join(" ")
+/// A provider timestamp in a well-known field of the line (or its message, item or part),
+/// normalized to RFC 3339 UTC. It is recorded beside the event, never as the event's own time:
+/// that stays the recorder's receipt time.
+fn native_timestamp(native: &Value) -> Option<String> {
+    const KEYS: [&str; 6] = [
+        "timestamp",
+        "time",
+        "created_at",
+        "createdAt",
+        "created",
+        "ts",
+    ];
+    [
+        Some(native),
+        native.get("message"),
+        native.get("item"),
+        native.get("part"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|scope| {
+        KEYS.iter()
+            .find_map(|key| normalize_timestamp(scope.get(*key)?))
+    })
+}
+
+fn normalize_timestamp(value: &Value) -> Option<String> {
+    let instant = match value {
+        Value::String(text) => {
+            let text = text.trim();
+            match DateTime::parse_from_rfc3339(text) {
+                Ok(parsed) => parsed.with_timezone(&Utc),
+                Err(_) => epoch_timestamp(text.parse().ok()?)?,
+            }
+        }
+        Value::Number(number) => epoch_timestamp(number.as_f64()?)?,
+        _ => return None,
+    };
+    Some(instant.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+/// Epoch seconds or milliseconds. Values outside 2000-01-01..5138 in either unit are more
+/// likely durations or counters than instants and are left alone.
+fn epoch_timestamp(value: f64) -> Option<DateTime<Utc>> {
+    const EARLIEST_SECONDS: f64 = 946_684_800.0;
+    const LATEST_SECONDS: f64 = 100_000_000_000.0;
+    let millis = if (EARLIEST_SECONDS..LATEST_SECONDS).contains(&value) {
+        value * 1000.0
+    } else if (EARLIEST_SECONDS * 1000.0..LATEST_SECONDS * 1000.0).contains(&value) {
+        value
+    } else {
+        return None;
+    };
+    DateTime::from_timestamp_millis(millis.round() as i64)
 }
 
 /// Objects in which a provider states the outcome of the event itself: the line, its Codex
@@ -640,10 +1138,8 @@ fn exit_code(scope: &Value) -> Option<&Value> {
         .filter(|code| !code.is_null())
 }
 
-fn is_completed(scopes: &[&Value], combined: &str) -> bool {
-    ["completed", "result", "finish", "end"]
-        .iter()
-        .any(|marker| combined.contains(marker))
+fn is_completed(scopes: &[&Value], discriminators: &Discriminators) -> bool {
+    discriminators.has(COMPLETION_WORDS)
         || scopes.iter().any(|scope| {
             exit_code(scope).is_some()
                 || outcome_status(scope).is_some_and(|status| {
@@ -696,8 +1192,12 @@ fn type_states_failure(native: &Value, block: Option<&Value>) -> bool {
     .flatten()
     .filter_map(Value::as_str)
     .any(|value| {
-        let value = value.to_ascii_lowercase();
-        value.contains("error") || value.contains("fail")
+        words(value).iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "error" | "errors" | "errored" | "fail" | "failed" | "failure"
+            )
+        })
     })
 }
 
@@ -739,7 +1239,7 @@ fn tool_blocks(native: &Value) -> Vec<&Value> {
         block
             .get("type")
             .and_then(Value::as_str)
-            .is_some_and(|kind| kind.to_ascii_lowercase().contains("tool"))
+            .is_some_and(|kind| words(kind).iter().any(|word| is_tool_word(word)))
     })
     .collect()
 }
@@ -748,7 +1248,7 @@ fn block_kind(block: &Value) -> &'static str {
     let result = block
         .get("type")
         .and_then(Value::as_str)
-        .is_some_and(|kind| kind.to_ascii_lowercase().contains("result"));
+        .is_some_and(|kind| words(kind).iter().any(|word| word == "result"));
     lifecycle_kind(result, "tool.result", "tool.invocation")
 }
 
@@ -927,39 +1427,65 @@ fn normalized_usage(native: &Value) -> Option<Value> {
     (!usage.is_empty()).then_some(Value::Object(usage))
 }
 
+/// Session and turn boundaries a provider states with an exact line type: Claude `system`/`init`
+/// and `result`, Codex `thread.started` and `turn.*`, Gemini `init` and `result`.
+fn lifecycle_phase(provider: Provider, native: &Value) -> Option<Phase> {
+    let lower = |key: &str| {
+        native
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+    };
+    let kind = lower("type")?;
+    match kind.as_str() {
+        "system" if lower("subtype").as_deref() == Some("init") => Some(Phase::SessionStart),
+        "init" | "thread.started" | "session.started" | "session.start" => {
+            Some(Phase::SessionStart)
+        }
+        "turn.started" => Some(Phase::TurnStart),
+        // Droid's JSON mode prints one result object and nothing before it: that object is
+        // the model's answer, not the end of a recorded turn.
+        "result" if provider != Provider::Droid => Some(Phase::RunResult),
+        "turn.completed" | "turn.failed" => Some(Phase::RunResult),
+        _ => None,
+    }
+}
+
 fn classify_kind(
     provider: Provider,
     native: &Value,
-    combined: &str,
+    discriminators: &Discriminators,
+    phase: Option<Phase>,
     completed: bool,
 ) -> &'static str {
-    if provider == Provider::Droid && native.get("type").and_then(Value::as_str) == Some("result") {
+    if let Some(phase) = phase {
+        return phase.kind();
+    }
+    let native_type = native.get("type").and_then(Value::as_str);
+    if provider == Provider::Droid && native_type == Some("result") {
         return "model.response";
     }
     if provider == Provider::Kimi && native.get("role").and_then(Value::as_str) == Some("tool") {
         return "tool.result";
     }
-    if contains_any(combined, &["approval", "permission"]) {
+    // OpenCode streams assistant prose as bare `text` parts.
+    if provider == Provider::Opencode && native_type == Some("text") {
+        return "model.response";
+    }
+    if discriminators.has(APPROVAL_WORDS) {
         return lifecycle_kind(completed, "approval.decision", "approval.request");
     }
-    if contains_any(
-        combined,
-        &["tool", "command_execution", "function_call", "mcp_"],
-    ) {
+    if discriminators.names_tool() {
         return lifecycle_kind(completed, "tool.result", "tool.invocation");
     }
-    if contains_any(combined, &["assistant", "message", "model", "turn"]) {
-        let response = completed || contains_any(combined, &["assistant", "message"]);
-        return lifecycle_kind(response, "model.response", "model.request");
+    let message = discriminators.has(MESSAGE_WORDS);
+    if message || discriminators.has(&["model"]) {
+        return lifecycle_kind(completed || message, "model.response", "model.request");
     }
-    if contains_any(combined, &["session", "thread", "agent", "step"]) {
+    if discriminators.has(AGENT_WORDS) {
         return lifecycle_kind(completed, "agent.result", "agent.turn");
     }
     "provider.event"
-}
-
-fn contains_any(value: &str, markers: &[&str]) -> bool {
-    markers.iter().any(|marker| value.contains(marker))
 }
 
 fn lifecycle_kind(
@@ -979,7 +1505,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn lines(provider: Provider, natives: &[Value]) -> Vec<EventInput> {
+    fn lines(provider: Provider, natives: &[Value]) -> Vec<AdapterEvent> {
         let mut adapter = NativeAdapter::new(provider);
         natives
             .iter()
@@ -987,10 +1513,33 @@ mod tests {
             .collect()
     }
 
-    fn one(provider: Provider, native: Value) -> EventInput {
+    fn one(provider: Provider, native: Value) -> AdapterEvent {
         let mut events = lines(provider, &[native]);
         assert_eq!(events.len(), 1, "{events:?}");
         events.remove(0)
+    }
+
+    /// Feeds `chunks` through push and commit the way the recorder does, with `e1`, `e2`, …
+    /// standing in for the ids the writer assigns.
+    fn stored(provider: Provider, chunks: &[&[u8]]) -> Vec<EventInput> {
+        let mut adapter = NativeAdapter::new(provider);
+        let mut stored = Vec::new();
+        for chunk in chunks {
+            let events = adapter.push(chunk);
+            adapter
+                .commit(events, |input| {
+                    stored.push(input);
+                    Ok::<_, std::convert::Infallible>(format!("e{}", stored.len()))
+                })
+                .unwrap();
+        }
+        stored
+    }
+
+    fn stored_lines(provider: Provider, natives: &[Value]) -> Vec<EventInput> {
+        let chunks: Vec<_> = natives.iter().map(|native| format!("{native}\n")).collect();
+        let chunks: Vec<_> = chunks.iter().map(String::as_bytes).collect();
+        stored(provider, &chunks)
     }
 
     #[test]
@@ -1012,65 +1561,512 @@ mod tests {
 
     #[test]
     fn provider_fixtures_normalize_to_typed_events() {
-        let cases = [
-            (
-                Provider::Codex,
-                include_bytes!("../tests/fixtures/adapters/codex.jsonl").as_slice(),
-                "tool.result",
-            ),
+        type Row = (&'static str, &'static str, &'static str);
+        let cases: [(Provider, &[u8], &[Row]); 7] = [
             (
                 Provider::Claude,
-                include_bytes!("../tests/fixtures/adapters/claude.jsonl").as_slice(),
-                "tool.invocation",
+                include_bytes!("../tests/fixtures/adapters/claude.jsonl"),
+                &[
+                    ("agent.turn", "running", "claude-session"),
+                    ("model.response", "ok", "msg-1"),
+                    ("tool.invocation", "running", "tool-1"),
+                    ("tool.invocation", "running", "tool-1"),
+                    ("tool.result", "ok", "tool-1"),
+                    ("tool.invocation", "running", "tool-2"),
+                    ("tool.result", "error", "tool-2"),
+                    ("tool.invocation", "running", "tool-3"),
+                    ("agent.spawn", "running", "tool-3"),
+                    ("tool.invocation", "running", "tool-4"),
+                    ("tool.result", "ok", "tool-4"),
+                    ("model.response", "ok", "msg-6"),
+                    ("tool.result", "ok", "tool-3"),
+                    ("agent.result", "ok", "tool-3"),
+                    ("model.response", "ok", "msg-7"),
+                    ("agent.result", "ok", "claude-session"),
+                ],
+            ),
+            (
+                Provider::Codex,
+                include_bytes!("../tests/fixtures/adapters/codex.jsonl"),
+                &[
+                    ("agent.turn", "running", "codex-thread"),
+                    ("agent.turn", "running", "codex-thread"),
+                    ("provider.event", "ok", "item_0"),
+                    ("tool.invocation", "running", "item_1"),
+                    ("tool.result", "ok", "item_1"),
+                    ("tool.invocation", "running", "item_2"),
+                    ("tool.result", "error", "item_2"),
+                    ("model.response", "ok", "item_3"),
+                    ("agent.result", "ok", "codex-thread"),
+                ],
             ),
             (
                 Provider::Gemini,
-                include_bytes!("../tests/fixtures/adapters/gemini.jsonl").as_slice(),
-                "tool.result",
+                include_bytes!("../tests/fixtures/adapters/gemini.jsonl"),
+                &[
+                    ("agent.turn", "running", "gemini-session"),
+                    ("model.response", "ok", ""),
+                    ("model.response", "ok", ""),
+                    ("tool.invocation", "running", "read_file-1"),
+                    ("tool.result", "ok", "read_file-1"),
+                    ("tool.invocation", "running", "run_shell_command-2"),
+                    ("tool.result", "error", "run_shell_command-2"),
+                    ("model.response", "ok", ""),
+                    ("agent.result", "ok", "gemini-session"),
+                ],
             ),
             (
                 Provider::Grok,
-                include_bytes!("../tests/fixtures/adapters/grok.jsonl").as_slice(),
-                "model.response",
+                include_bytes!("../tests/fixtures/adapters/grok.jsonl"),
+                &[
+                    ("agent.turn", "running", "grok-session"),
+                    ("model.response", "ok", "msg-1"),
+                    ("tool.invocation", "running", "call-1"),
+                    ("tool.result", "ok", "call-1"),
+                    ("tool.invocation", "running", "call-2"),
+                    ("tool.result", "error", "call-2"),
+                    ("model.response", "ok", "msg-2"),
+                    ("agent.result", "ok", "grok-session"),
+                ],
             ),
             (
                 Provider::Opencode,
-                include_bytes!("../tests/fixtures/adapters/opencode.jsonl").as_slice(),
-                "tool.invocation",
+                include_bytes!("../tests/fixtures/adapters/opencode.jsonl"),
+                &[
+                    ("agent.turn", "running", "open-session"),
+                    ("model.response", "ok", ""),
+                    ("tool.result", "ok", "tool-1"),
+                    ("tool.result", "error", "tool-2"),
+                    ("agent.result", "ok", "open-session"),
+                    ("agent.turn", "running", "open-session"),
+                    ("model.response", "ok", ""),
+                    ("agent.result", "ok", "open-session"),
+                ],
             ),
             (
                 Provider::Kimi,
-                include_bytes!("../tests/fixtures/adapters/kimi.jsonl").as_slice(),
-                "tool.result",
+                include_bytes!("../tests/fixtures/adapters/kimi.jsonl"),
+                &[
+                    ("model.response", "ok", ""),
+                    ("tool.invocation", "running", "call-1"),
+                    ("tool.result", "ok", "call-1"),
+                    ("model.response", "ok", ""),
+                    ("tool.invocation", "running", "call-2"),
+                    // Kimi states this failure only in the result text, which is not evidence.
+                    ("tool.result", "ok", "call-2"),
+                    ("model.response", "ok", ""),
+                    ("tool.invocation", "running", "call-3"),
+                    ("tool.invocation", "running", "call-4"),
+                    ("tool.result", "ok", "call-3"),
+                    ("tool.result", "error", "call-4"),
+                    ("model.response", "ok", ""),
+                ],
             ),
             (
                 Provider::Droid,
-                include_bytes!("../tests/fixtures/adapters/droid.jsonl").as_slice(),
-                "model.response",
+                include_bytes!("../tests/fixtures/adapters/droid.jsonl"),
+                &[("model.response", "ok", "droid-session")],
             ),
         ];
         for (provider, fixture, expected) in cases {
-            let mut adapter = NativeAdapter::new(provider);
-            let events = adapter.push(fixture);
-            assert!(
-                events.iter().any(|event| event.kind == expected),
-                "{} lacked {expected}: {events:?}",
-                provider.id()
-            );
+            let events = stored(provider, &[fixture]);
+            let rows: Vec<(&str, &str, &str)> = events
+                .iter()
+                .map(|event| {
+                    (
+                        event.kind.as_str(),
+                        event.status.as_str(),
+                        event.correlation_id.as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(rows, expected, "{}", provider.id());
             assert!(
                 events
                     .iter()
                     .all(|event| event.source == format!("adapter.{}.v1", provider.id()))
             );
-            assert!(
-                events.iter().all(|event| event.status != "error"),
-                "{} fixture reported a failure: {events:?}",
-                provider.id()
-            );
-            // Every tool result in a fixture pairs with an invocation or stands alone by id.
-            for result in events.iter().filter(|event| event.kind == "tool.result") {
-                assert!(!result.correlation_id.is_empty(), "{result:?}");
+            for (index, event) in events.iter().enumerate() {
+                // A parent or link is always an event stored earlier.
+                for reference in event.links.iter().chain([&event.parent_event_id]) {
+                    let earlier = reference
+                        .strip_prefix('e')
+                        .map(|id| id.parse::<usize>().unwrap());
+                    assert!(
+                        reference.is_empty() || earlier.is_some_and(|id| id <= index),
+                        "{event:?}"
+                    );
+                }
+                // Every paired tool result names the call it answers.
+                let mut calls = (0..index).filter(|earlier| {
+                    events[*earlier].kind == "tool.invocation"
+                        && events[*earlier].correlation_id == event.correlation_id
+                });
+                if event.kind == "tool.result" && calls.clone().next().is_some() {
+                    assert!(
+                        calls.any(|call| event.links == [format!("e{}", call + 1)]),
+                        "{event:?}"
+                    );
+                    assert_eq!(event.parent_event_id, event.links[0], "{event:?}");
+                }
             }
+        }
+    }
+
+    #[test]
+    fn stored_event_ids_become_parents_and_links() {
+        let events = stored_lines(
+            Provider::Claude,
+            &[
+                json!({"type": "system", "subtype": "init", "session_id": "s", "uuid": "u-0"}),
+                json!({"type": "hook_started", "hook_name": "PreToolUse",
+                       "tool_use_id": "toolu_01", "tool_name": "Bash"}),
+                json!({"type": "permission_request", "tool_use_id": "toolu_01"}),
+                json!({"type": "permission_response", "tool_use_id": "toolu_01",
+                       "behavior": "allow"}),
+                json!({"type": "assistant", "session_id": "s", "message": {"id": "msg_1",
+                       "content": [{"type": "tool_use", "id": "toolu_01", "name": "Bash"}]}}),
+                json!({"type": "hook_started", "hook_name": "PostToolUse",
+                       "tool_use_id": "toolu_01", "tool_name": "Bash"}),
+                json!({"type": "user", "session_id": "s", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"},
+                    {"type": "tool_result", "tool_use_id": "toolu_lost", "content": "ok"}
+                ]}}),
+                json!({"type": "result", "subtype": "success", "session_id": "s", "uuid": "u-9"}),
+            ],
+        );
+        let shape: Vec<_> = events
+            .iter()
+            .map(|event| {
+                (
+                    event.kind.as_str(),
+                    event.parent_event_id.as_str(),
+                    event.links.join(","),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("agent.turn", "", String::new()),
+                ("tool.invocation", "e1", String::new()),
+                // Until the call itself is stored, the hook line stands in for it.
+                ("approval.request", "e2", String::new()),
+                ("approval.decision", "e3", "e3".into()),
+                ("tool.invocation", "e1", String::new()),
+                // A later hook hangs off the call instead of replacing it.
+                ("tool.invocation", "e5", String::new()),
+                ("tool.result", "e5", "e5".into()),
+                // A result whose call was never seen still belongs to the session.
+                ("tool.result", "e1", String::new()),
+                ("agent.result", "e1", String::new()),
+            ]
+        );
+        // The session's start and result pair through the session id, not their own uuids.
+        assert_eq!(events[0].correlation_id, "s");
+        assert_eq!(events[8].correlation_id, "s");
+        assert_eq!(events[0].payload["lifecycle"], "session_start");
+        assert_eq!(events[0].payload["session_id"], "s");
+
+        let codex = stored_lines(
+            Provider::Codex,
+            &[
+                json!({"type": "thread.started", "thread_id": "t"}),
+                json!({"type": "turn.started"}),
+                json!({"type": "item.completed", "item": {"id": "m", "type": "agent_message"}}),
+                json!({"type": "turn.completed"}),
+                json!({"type": "turn.started"}),
+                json!({"type": "turn.failed", "error": {"message": "quota"}}),
+            ],
+        );
+        let parents: Vec<_> = codex
+            .iter()
+            .map(|event| event.parent_event_id.as_str())
+            .collect();
+        // Work hangs off its turn, a turn off the thread, and a closed turn adopts nothing.
+        assert_eq!(parents, ["", "e1", "e2", "e2", "e1", "e5"]);
+        assert_eq!(codex[1].payload["lifecycle"], "turn_start");
+        assert_eq!(codex[5].payload["lifecycle"], "run_result");
+        assert_eq!(codex[5].status, "error");
+    }
+
+    #[test]
+    fn remembered_event_ids_stay_bounded() {
+        let mut adapter = NativeAdapter::new(Provider::Gemini);
+        let mut count = 0_usize;
+        let mut feed = |adapter: &mut NativeAdapter, native: Value| {
+            let events = adapter.push(format!("{native}\n").as_bytes());
+            adapter
+                .commit(events, |_| {
+                    count += 1;
+                    Ok::<_, std::convert::Infallible>(format!("e{count}"))
+                })
+                .unwrap();
+        };
+        feed(&mut adapter, json!({"type": "init", "session_id": "s"}));
+        for index in 0..MAX_TRACKED_EVENT_IDS + 10 {
+            feed(
+                &mut adapter,
+                json!({"type": "tool_use", "tool_id": format!("t{index}")}),
+            );
+            assert!(adapter.event_ids.len() <= MAX_TRACKED_EVENT_IDS);
+        }
+        assert_eq!(adapter.event_ids[SESSION_KEY].event_id, "e1");
+    }
+
+    #[test]
+    fn subagent_lifecycle_is_synthesized_and_marked() {
+        let events = stored_lines(
+            Provider::Claude,
+            &[
+                json!({"type": "system", "subtype": "init", "session_id": "s"}),
+                json!({"type": "assistant", "session_id": "s", "message": {"id": "m1", "content": [
+                    {"type": "tool_use", "id": "task_1", "name": "Task", "input": {}}]}}),
+                json!({"type": "assistant", "session_id": "s", "parent_tool_use_id": "task_1",
+                       "message": {"id": "m2", "content": [
+                    {"type": "tool_use", "id": "task_2", "name": "Task", "input": {}}]}}),
+                json!({"type": "assistant", "session_id": "s", "parent_tool_use_id": "task_2",
+                       "message": {"id": "m3", "content": [{"type": "text", "text": "deep"}]}}),
+                json!({"type": "user", "session_id": "s", "parent_tool_use_id": "task_1",
+                       "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "task_2", "is_error": true}]}}),
+                json!({"type": "user", "session_id": "s", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "task_1", "content": "done"}]}}),
+                // A straggler after the spawning call returned does not reopen the subagent.
+                json!({"type": "assistant", "session_id": "s", "parent_tool_use_id": "task_1",
+                       "message": {"id": "m4", "content": [{"type": "text", "text": "late"}]}}),
+            ],
+        );
+        let kinds: Vec<_> = events.iter().map(|event| event.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "agent.turn",
+                "tool.invocation",
+                "agent.spawn",
+                "tool.invocation",
+                "agent.spawn",
+                "model.response",
+                "tool.result",
+                "agent.result",
+                "tool.result",
+                "agent.result",
+                "model.response",
+            ]
+        );
+        let outer = &events[2];
+        assert_eq!(outer.actor_id, "claude:subagent:task_1");
+        assert_eq!(outer.actor_type, "subagent");
+        assert_eq!(outer.source, "adapter.claude.v1");
+        assert_eq!(outer.status, "running");
+        assert_eq!(outer.parent_event_id, "e2");
+        assert_eq!(outer.links, ["e2"]);
+        assert_eq!(outer.span_id, "task_1");
+        assert_eq!(outer.parent_span_id, "s");
+        assert_eq!(outer.correlation_id, "task_1");
+        assert_eq!(
+            outer.payload,
+            json!({"provider": "claude", "adapter_schema_version": 1, "synthesized": true,
+                   "synthesized_from": "parent_tool_use_id", "parent_tool_use_id": "task_1",
+                   "parent_actor": "claude", "tool": "Task", "line": 3})
+        );
+        // The subagent's own events hang off its spawn and are not marked as inference.
+        assert_eq!(events[3].parent_event_id, "e3");
+        assert!(events[3].payload.get("synthesized").is_none());
+
+        // A nested subagent descends from the subagent whose tool call spawned it.
+        let inner = &events[4];
+        assert_eq!(inner.actor_id, "claude:subagent:task_2");
+        assert_eq!(inner.parent_event_id, "e4");
+        assert_eq!(inner.payload["parent_actor"], "claude:subagent:task_1");
+        assert_eq!(events[5].parent_event_id, "e5");
+
+        let failed = &events[7];
+        assert_eq!(failed.actor_id, "claude:subagent:task_2");
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.parent_event_id, "e5");
+        assert_eq!(failed.links, ["e5", "e7"]);
+        assert_eq!(failed.payload["synthesized_from"], "tool_result");
+        let finished = &events[9];
+        assert_eq!(finished.status, "ok");
+        assert_eq!(finished.correlation_id, "task_1");
+        assert_eq!(finished.links, ["e3", "e9"]);
+        assert_eq!(
+            finished.payload,
+            json!({"provider": "claude", "adapter_schema_version": 1, "synthesized": true,
+                   "synthesized_from": "tool_result", "parent_tool_use_id": "task_1",
+                   "tool": "Task", "line": 6})
+        );
+        assert_eq!(events[10].parent_event_id, "e3");
+    }
+
+    #[test]
+    fn lifecycle_markers_match_whole_words() {
+        assert_eq!(words("item.completed"), ["item", "completed"]);
+        assert_eq!(words("PreToolUse"), ["pre", "tool", "use"]);
+        assert_eq!(words("mcp__logs__search"), ["mcp", "logs", "search"]);
+        assert_eq!(words("step-finish"), ["step", "finish"]);
+
+        // "pending" contains "end" but does not say the call ended.
+        let pending = one(
+            Provider::Grok,
+            json!({"type": "tool_call", "subtype": "pending", "call_id": "c1", "name": "bash"}),
+        );
+        assert_eq!(pending.kind, "tool.invocation");
+        assert_eq!(pending.status, "running");
+        let ended = one(
+            Provider::Grok,
+            json!({"type": "tool_call", "subtype": "end", "call_id": "c1"}),
+        );
+        assert_eq!(ended.kind, "tool.result");
+
+        for (native, kind) in [
+            // Words that merely contain a marker are not that marker.
+            (json!({"type": "stool_sample"}), "provider.event"),
+            (json!({"type": "remodel"}), "provider.event"),
+            (json!({"type": "terrorism_report"}), "provider.event"),
+            (json!({"type": "function", "id": "f"}), "provider.event"),
+            (
+                json!({"type": "function_call", "call_id": "f"}),
+                "tool.invocation",
+            ),
+            (
+                json!({"type": "mcp_call", "call_id": "f"}),
+                "tool.invocation",
+            ),
+            (
+                json!({"type": "toolCall", "call_id": "f"}),
+                "tool.invocation",
+            ),
+            (json!({"type": "turn_start"}), "agent.turn"),
+            (json!({"type": "turn_end"}), "agent.result"),
+        ] {
+            let event = one(Provider::Grok, native);
+            assert_eq!(event.kind, kind, "{event:?}");
+            assert_ne!(event.status, "error", "{event:?}");
+        }
+    }
+
+    #[test]
+    fn session_start_and_final_result_lines_are_typed_with_usage_and_cost() {
+        let claude = one(
+            Provider::Claude,
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                   "duration_ms": 4210, "num_turns": 5, "session_id": "s", "uuid": "u",
+                   "total_cost_usd": 0.5, "permission_denials": [],
+                   "usage": {"input_tokens": 100, "output_tokens": 20,
+                             "cache_read_input_tokens": 7}}),
+        );
+        assert_eq!(claude.kind, "agent.result");
+        assert_eq!(claude.status, "ok");
+        assert_eq!(claude.duration_ms, 4210);
+        assert_eq!(claude.correlation_id, "s");
+        assert_eq!(claude.span_id, "s");
+        assert_eq!(claude.payload["lifecycle"], "run_result");
+        assert_eq!(
+            claude.payload["usage"],
+            json!({"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                   "input_tokens_details": {"cached_tokens": 7}, "cost_usd": 0.5})
+        );
+        let failed = one(
+            Provider::Claude,
+            json!({"type": "result", "subtype": "error_max_turns", "is_error": true,
+                   "session_id": "s"}),
+        );
+        assert_eq!(failed.kind, "agent.result");
+        assert_eq!(failed.status, "error");
+
+        let gemini = lines(
+            Provider::Gemini,
+            &[
+                json!({"type": "init", "session_id": "g", "model": "gemini-test"}),
+                json!({"type": "result", "status": "success", "stats": {
+                    "total_tokens": 30, "input_tokens": 20, "output_tokens": 10,
+                    "duration_ms": 900}}),
+            ],
+        );
+        assert_eq!(gemini[0].kind, "agent.turn");
+        assert_eq!(gemini[0].status, "running");
+        assert_eq!(gemini[0].payload["lifecycle"], "session_start");
+        assert_eq!(gemini[0].payload["model"], "gemini-test");
+        assert_eq!(gemini[1].kind, "agent.result");
+        assert_eq!(gemini[1].correlation_id, "g");
+        assert_eq!(gemini[1].duration_ms, 900);
+        assert_eq!(gemini[1].payload["usage"]["total_tokens"], 30);
+
+        let opencode = one(
+            Provider::Opencode,
+            json!({"type": "text", "sessionID": "o", "part": {"type": "text", "text": "hi"}}),
+        );
+        assert_eq!(opencode.kind, "model.response");
+    }
+
+    #[test]
+    fn native_timestamps_are_recorded_beside_the_receipt_time() {
+        for (native, expected) in [
+            (
+                json!({"type": "message", "timestamp": "2026-03-04T12:15:00.120+02:00"}),
+                Some("2026-03-04T10:15:00.120Z"),
+            ),
+            (
+                json!({"type": "message", "ts": 1_772_619_300}),
+                Some("2026-03-04T10:15:00.000Z"),
+            ),
+            (
+                json!({"type": "message", "time": 1_772_619_300_120_u64}),
+                Some("2026-03-04T10:15:00.120Z"),
+            ),
+            (
+                json!({"type": "message", "created_at": 1_772_619_300.5}),
+                Some("2026-03-04T10:15:00.500Z"),
+            ),
+            (
+                json!({"type": "message", "created_at": "1772619300"}),
+                Some("2026-03-04T10:15:00.000Z"),
+            ),
+            (
+                json!({"type": "item.completed", "item": {"id": "i", "type": "agent_message",
+                       "created_at": "2026-03-04T10:15:00Z"}}),
+                Some("2026-03-04T10:15:00.000Z"),
+            ),
+            // An elapsed time, an unparseable value and an object are not instants.
+            (json!({"type": "message", "time": 12}), None),
+            (json!({"type": "message", "timestamp": "yesterday"}), None),
+            (
+                json!({"type": "message", "time": {"start": 1_772_619_300}}),
+                None,
+            ),
+            (json!({"type": "message"}), None),
+        ] {
+            let event = one(Provider::Grok, native);
+            assert_eq!(
+                event
+                    .payload
+                    .get("native_timestamp")
+                    .and_then(Value::as_str),
+                expected,
+                "{:?}",
+                event.payload
+            );
+            // The event's own time is left to the writer: its receipt time.
+            assert_eq!(event.timestamp, None);
+        }
+
+        // Every event cut from one line carries that line's provider time.
+        let parts = lines(
+            Provider::Claude,
+            &[
+                json!({"type": "assistant", "timestamp": "2026-03-04T10:15:00Z",
+                     "parent_tool_use_id": "task_1", "message": {"id": "m", "content": [
+                {"type": "tool_use", "id": "a", "name": "Read"},
+                {"type": "tool_use", "id": "b", "name": "Grep"}]}}),
+            ],
+        );
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].payload.get("native_timestamp").is_none());
+        assert_eq!(parts[0].timestamp, None);
+        for part in &parts[1..] {
+            assert_eq!(part.payload["native_timestamp"], "2026-03-04T10:15:00.000Z");
         }
     }
 
@@ -1219,12 +2215,12 @@ mod tests {
             (
                 Provider::Codex,
                 json!({"type": "turn.failed", "error": {"message": "quota"}}),
-                "model.response",
+                "agent.result",
             ),
             (
                 Provider::Claude,
                 json!({"type": "result", "subtype": "error_during_execution", "is_error": false}),
-                "provider.event",
+                "agent.result",
             ),
         ] {
             let event = one(provider, native);
@@ -1365,6 +2361,8 @@ mod tests {
                                      "cache_read_input_tokens": 3}}}),
             ],
         );
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].kind, "agent.turn");
         assert_eq!(events[0].payload["model"], "claude-test");
         assert_eq!(events[1].actor_id, "claude");
         assert_eq!(events[1].actor_type, "agent");
@@ -1373,7 +2371,8 @@ mod tests {
         assert_eq!(events[1].payload["tool"], "Task");
         assert!(events[1].payload["native"]["message"].is_object());
 
-        let sub = &events[2];
+        assert_eq!(events[2].kind, "agent.spawn");
+        let sub = &events[3];
         assert_eq!(sub.kind, "model.response");
         assert_eq!(sub.actor_id, "claude:subagent:toolu_task");
         assert_eq!(sub.actor_type, "subagent");

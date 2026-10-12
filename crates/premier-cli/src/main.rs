@@ -31,7 +31,7 @@ use std::time::{Duration as StdDuration, Instant};
 use tracing_subscriber::EnvFilter;
 
 mod adapters;
-use adapters::{ADAPTER_SCHEMA_VERSION, AdapterChoice, NativeAdapter, Provider};
+use adapters::{ADAPTER_SCHEMA_VERSION, AdapterChoice, AdapterEvent, NativeAdapter, Provider};
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +40,12 @@ use adapters::{ADAPTER_SCHEMA_VERSION, AdapterChoice, NativeAdapter, Provider};
     about = "Local-first agent trace recorder and viewer"
 )]
 struct Cli {
+    /// Trace encryption key file, used to write new traces encrypted and to
+    /// read encrypted ones. The file holds one 256-bit key as exactly 64 hex
+    /// characters (for example from `openssl rand -hex 32`) and must be
+    /// readable only by its owner (mode 0600).
+    #[arg(long, global = true, value_name = "PATH", env = premier_trace::KEY_FILE_ENV)]
+    key_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -86,9 +92,23 @@ enum Commands {
         /// 256 KiB is stored in pieces, and only a match up to 16 KiB is
         /// guaranteed across such a cut. A partial line (such as a prompt) is
         /// stored after 1 second without output, so a match the output pauses
-        /// inside can be split; use --redact-literal for exact secrets.
+        /// inside can be split; use --redact-literal for exact secrets. Set
+        /// PREMIER_REDACTION_IDLE_FLUSH_MS to change that idle period (in
+        /// milliseconds).
         #[arg(long = "redact-regex")]
         redact_regexes: Vec<String>,
+        /// Regex to redact that may match across line breaks, such as a
+        /// multi-line token or key block. It applies to the same places as
+        /// --redact-regex, with the same syntax (`.` crosses a line break
+        /// only with `(?s)`; `\n` and `\s` always can). In terminal output
+        /// it is matched over a sliding window: the most recent 16 KiB are
+        /// held back, so a match up to 16 KiB is redacted however the output
+        /// was split into lines and writes, and a longer match may be stored
+        /// in part. In structured payloads it is matched over each whole
+        /// string value. Held output is still stored after the idle period
+        /// described under --redact-regex.
+        #[arg(long = "redact-regex-multiline", value_name = "REGEX")]
+        redact_multiline_regexes: Vec<String>,
         /// Do not apply the built-in secret value patterns (API keys, bearer
         /// credentials, URL passwords, private key blocks, JWTs) to structured
         /// event payloads and the recorded command line.
@@ -240,6 +260,7 @@ enum Commands {
         allow_unverified: bool,
     },
     /// Replay recorded evidence timing only; this never re-executes the traced command.
+    /// A recorded gap longer than 10 seconds is replayed as 10 seconds.
     Replay {
         trace: PathBuf,
         /// Playback speed multiplier (for example 2 replays twice as fast).
@@ -304,7 +325,22 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
         .init();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    if let Some(key_file) = cli.key_file {
+        premier_trace::set_key_file(key_file);
+    }
+    if matches!(
+        cli.command,
+        Commands::Verify { .. }
+            | Commands::Query { .. }
+            | Commands::Export { .. }
+            | Commands::Diff { .. }
+            | Commands::Replay { .. }
+            | Commands::List { .. }
+    ) {
+        die_quietly_on_broken_pipe();
+    }
+    match cli.command {
         Commands::Record {
             output,
             name,
@@ -317,12 +353,14 @@ async fn main() -> Result<()> {
             redact_fields,
             redact_literals,
             redact_regexes,
+            redact_multiline_regexes,
             no_default_secret_patterns,
             redact_known_secrets,
             sign_key,
             command,
         } => {
             let redaction = RedactionConfig::new(redact_fields, redact_literals, redact_regexes)?
+                .multiline_regexes(redact_multiline_regexes)?
                 .default_secret_patterns(!no_default_secret_patterns)
                 .known_secrets_in_terminal(redact_known_secrets);
             let sign_key = load_signing_key(sign_key.as_deref())?;
@@ -399,9 +437,9 @@ async fn main() -> Result<()> {
             for diagnostic in &manifest.diagnostics {
                 println!(
                     "warning {} at sequence {}: {}",
-                    diagnostic.code,
+                    printable(&diagnostic.code),
                     diagnostic.sequence.unwrap_or(0),
-                    diagnostic.message
+                    printable(&diagnostic.message)
                 );
             }
             Ok(())
@@ -751,6 +789,49 @@ fn parse_replay_speed(value: &str) -> std::result::Result<f64, String> {
     Ok(speed)
 }
 
+/// One-shot commands that print evidence end like any other Unix filter when
+/// their reader goes away (`premier query ... | head -1`): killed by SIGPIPE,
+/// which a shell reports as status 141, instead of panicking in `println!`.
+/// Rust ignores SIGPIPE by default; `record`, `open`, and `serve` keep that,
+/// because a closed terminal or client socket must not kill them.
+fn die_quietly_on_broken_pipe() {
+    #[cfg(unix)]
+    // SAFETY: restoring the default disposition of SIGPIPE has no
+    // preconditions; it runs before the command produces any output.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// `value` made safe for a terminal line: control characters (NUL, ESC, CR,
+/// LF, ...) and invisible or direction-changing format characters are shown
+/// as escapes, so recorded text can neither drive the terminal nor forge
+/// extra output lines. JSON output never passes through here and stays exact.
+fn printable(value: &str) -> std::borrow::Cow<'_, str> {
+    let unsafe_char = |c: char| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{200b}'..='\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2069}'
+                    | '\u{feff}'
+            )
+    };
+    if !value.contains(unsafe_char) {
+        return value.into();
+    }
+    let mut escaped = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        if unsafe_char(c) {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped.into()
+}
+
 fn print_json(value: &impl Serialize) -> Result<()> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -769,14 +850,15 @@ fn query_trace(trace: PathBuf, options: QueryOptions, json_output: bool) -> Resu
         println!(
             "{:>6}  {}  {:<24} {:<18} {}",
             event.sequence,
-            event.timestamp,
-            event.kind,
+            printable(&event.timestamp),
+            printable(&event.kind),
+            // An event without an actor is unattributed, not the root process.
             if event.actor_id.is_empty() {
-                "root"
+                "-".into()
             } else {
-                &event.actor_id
+                printable(&event.actor_id)
             },
-            event.status
+            printable(&event.status)
         );
     }
     eprintln!(
@@ -800,6 +882,12 @@ fn export_trace(
     let manifest =
         read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
     let export = portable_evidence_with(&manifest, &read_events(&trace)?, redaction);
+    if manifest.encryption.is_some() {
+        eprintln!(
+            "warning: {} is encrypted, but this export is plaintext; protect or delete it accordingly",
+            trace.display()
+        );
+    }
     if let Some(output) = output {
         let mut bytes = serde_json::to_vec_pretty(&export)?;
         bytes.push(b'\n');
@@ -811,7 +899,7 @@ fn export_trace(
                 .unwrap_or("premier-export"),
             std::process::id()
         ));
-        fs::write(&temporary, bytes)
+        write_private(&temporary, &bytes)
             .with_context(|| format!("cannot write export {}", temporary.display()))?;
         if let Err(error) = fs::rename(&temporary, &output) {
             let _ = fs::remove_file(&temporary);
@@ -829,6 +917,26 @@ fn export_trace(
     } else {
         print_json(&export)
     }
+}
+
+/// Create `path` readable and writable by its owner only (0600 on Unix): an
+/// export holds the trace's evidence in plaintext.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    // A leftover file would keep its own, possibly wider, permissions.
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn diff_traces(baseline: PathBuf, current: PathBuf, json_output: bool) -> Result<()> {
@@ -852,13 +960,18 @@ fn diff_traces(baseline: PathBuf, current: PathBuf, json_output: bool) -> Result
         println!(
             "{:?}\t{}\t{} field change{}",
             item.status,
-            item.key,
+            printable(&item.key),
             item.changes.len(),
             if item.changes.len() == 1 { "" } else { "s" }
         );
     }
     Ok(())
 }
+
+/// Longest recorded gap between two events that replay waits out (before
+/// `--speed` scaling). Timestamps are recorded evidence, not trusted input: a
+/// wrong clock or a forged timestamp must not make replay sleep for years.
+const MAX_REPLAY_GAP: StdDuration = StdDuration::from_secs(10);
 
 fn replay_trace(trace: PathBuf, speed: f64, no_sleep: bool) -> Result<()> {
     read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
@@ -878,6 +991,7 @@ fn replay_trace(trace: PathBuf, speed: f64, no_sleep: bool) -> Result<()> {
                 if let Ok(delay) = delay.to_std()
                     && !delay.is_zero()
                 {
+                    let delay = delay.min(MAX_REPLAY_GAP);
                     thread::sleep(StdDuration::from_secs_f64(delay.as_secs_f64() / speed));
                 }
             }
@@ -1454,14 +1568,22 @@ async fn record(options: RecordOptions) -> Result<()> {
     let recorder_lease = RecorderLease::start(&output)?;
     let trace_id = writer.lock().unwrap().trace_id().to_owned();
     let collector_token = uuid::Uuid::now_v7().to_string();
-    let collector_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let collector_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    collector_listener.set_nonblocking(true)?;
     let collector_address = collector_listener.local_addr()?;
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
     let collector_writer = writer.clone();
     let collector_token_for_server = collector_token.clone();
-    let collector_task = tokio::spawn(async move {
+    // The collector gets a runtime of its own so that finalization can tear
+    // it down, connections included, without waiting on its clients.
+    let collector_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("premier-collector")
+        .enable_all()
+        .build()?;
+    let collector_task = collector_runtime.spawn(async move {
         axum::serve(
-            collector_listener,
+            tokio::net::TcpListener::from_std(collector_listener)?,
             instrumentation_app(collector_writer, collector_token_for_server),
         )
         .with_graceful_shutdown(async move {
@@ -1469,6 +1591,11 @@ async fn record(options: RecordOptions) -> Result<()> {
         })
         .await
     });
+    let collector = Collector {
+        runtime: Some(collector_runtime),
+        shutdown: Some(shutdown_sender),
+        task: collector_task,
+    };
     #[cfg(unix)]
     let terminal = pty.then(terminal_size);
     #[cfg(not(unix))]
@@ -1562,8 +1689,7 @@ async fn record(options: RecordOptions) -> Result<()> {
                 Ok(()) => {
                     finalize_recording(
                         writer,
-                        shutdown_sender,
-                        collector_task,
+                        collector,
                         ProcessTermination::exited(failure.exit_code),
                     )
                     .await
@@ -1641,8 +1767,7 @@ async fn record(options: RecordOptions) -> Result<()> {
     );
     // From here on a recorder failure must not replace the command's own
     // exit status, so finalization errors are reported instead of returned.
-    let finalized =
-        finalize_recording(writer, shutdown_sender, collector_task, termination.clone()).await;
+    let finalized = finalize_recording(writer, collector, termination.clone()).await;
     match &finalized {
         Ok(manifest) => eprintln!("\ntrace {} → {}", manifest.trace_id, output.display()),
         Err(error) => eprintln!(
@@ -1699,15 +1824,57 @@ async fn record(options: RecordOptions) -> Result<()> {
     }
 }
 
+/// The local collector server and the runtime that owns its connections.
+struct Collector {
+    runtime: Option<tokio::runtime::Runtime>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Drop for Collector {
+    /// Reached without `stop` only when recording fails early. A runtime may
+    /// not be dropped inside an async context, so detach it instead.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// How long in-flight collector requests get to finish once the recorded
+/// command has exited. A request still open after this (a detached descendant
+/// that sent half a body and went to sleep) is dropped, not waited for.
+const COLLECTOR_SHUTDOWN_DEADLINE: StdDuration = StdDuration::from_secs(2);
+
+impl Collector {
+    /// Stop accepting events and release every reference to the trace writer.
+    async fn stop(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let served = tokio::time::timeout(COLLECTOR_SHUTDOWN_DEADLINE, &mut self.task).await;
+        // Shutting the runtime down drops its tasks, which closes whatever
+        // connections remain. That blocks, so it runs off the async threads.
+        if let Some(runtime) = self.runtime.take() {
+            tokio::task::spawn_blocking(move || {
+                runtime.shutdown_timeout(COLLECTOR_SHUTDOWN_DEADLINE)
+            })
+            .await?;
+        }
+        match served {
+            Ok(result) => Ok(result??),
+            Err(_) => Ok(()),
+        }
+    }
+}
+
 /// Stop the collector, reclaim the trace writer from it, and finalize.
 async fn finalize_recording(
     writer: Arc<Mutex<TraceWriter>>,
-    shutdown_sender: tokio::sync::oneshot::Sender<()>,
-    collector_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    collector: Collector,
     termination: ProcessTermination,
 ) -> Result<premier_trace::TraceManifest> {
-    let _ = shutdown_sender.send(());
-    collector_task.await??;
+    collector.stop().await?;
     let writer = Arc::try_unwrap(writer)
         .map_err(|_| anyhow::anyhow!("collector still owns the trace writer"))?
         .into_inner()
@@ -1807,7 +1974,22 @@ const OUTPUT_DRAIN_LIMIT: StdDuration = StdDuration::from_secs(5);
 /// A partial line held back for a redaction rule (for example an interactive
 /// prompt) is journaled once its stream has been quiet this long, so it is
 /// not lost if the recorder is killed before the line ends.
-const HELD_OUTPUT_IDLE_FLUSH: StdDuration = StdDuration::from_secs(1);
+const DEFAULT_HELD_OUTPUT_IDLE_FLUSH: StdDuration = StdDuration::from_secs(1);
+/// Overrides [`DEFAULT_HELD_OUTPUT_IDLE_FLUSH`], in milliseconds. A longer
+/// period keeps a rule from being split by output that pauses mid-secret; a
+/// shorter one journals prompts sooner.
+const HELD_OUTPUT_IDLE_FLUSH_ENV: &str = "PREMIER_REDACTION_IDLE_FLUSH_MS";
+
+/// The idle period after which held output is journaled, read once.
+fn held_output_idle_flush() -> StdDuration {
+    static PERIOD: std::sync::OnceLock<StdDuration> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        std::env::var(HELD_OUTPUT_IDLE_FLUSH_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .map_or(DEFAULT_HELD_OUTPUT_IDLE_FLUSH, StdDuration::from_millis)
+    })
+}
 
 /// What the capture loop hands its callback.
 enum Captured<'a> {
@@ -1952,7 +2134,8 @@ fn capture_pipes(
             if stream == "stdout"
                 && let Some(adapter) = native_adapter.as_mut()
             {
-                faults.note(append_adapter_events(writer, adapter.push(bytes)));
+                let events = adapter.push(bytes);
+                faults.note(append_adapter_events(writer, adapter, events));
             }
         },
     );
@@ -1968,7 +2151,8 @@ fn capture_pipes(
         ));
     }
     if let Some(adapter) = native_adapter.as_mut() {
-        faults.note(append_adapter_events(writer, adapter.finish()));
+        let events = adapter.finish();
+        faults.note(append_adapter_events(writer, adapter, events));
     }
     let (status, output_open_at_exit) = drained?;
     let status = match status {
@@ -2175,13 +2359,13 @@ impl PendingOutput {
 }
 
 /// Journal the partial line a redaction rule is holding back once its stream
-/// has been quiet for [`HELD_OUTPUT_IDLE_FLUSH`]. The rules still apply to it.
+/// has been quiet for [`held_output_idle_flush`]. The rules still apply to it.
 fn append_idle_output(
     writer: &Arc<Mutex<TraceWriter>>,
     kind: &str,
     pending: &mut PendingOutput,
 ) -> Result<()> {
-    if pending.last_output.elapsed() < HELD_OUTPUT_IDLE_FLUSH {
+    if pending.last_output.elapsed() < held_output_idle_flush() {
         return Ok(());
     }
     match pending.redaction.flush_idle() {
@@ -2242,15 +2426,20 @@ fn append_pending_utf8(
     Ok(())
 }
 
-fn append_adapter_events(writer: &Arc<Mutex<TraceWriter>>, events: Vec<EventInput>) -> Result<()> {
+/// Stores adapter events in order. The adapter learns each stored event id as it is assigned,
+/// which is how later events get their `parent_event_id` and `links`.
+fn append_adapter_events(
+    writer: &Arc<Mutex<TraceWriter>>,
+    adapter: &mut NativeAdapter,
+    events: Vec<AdapterEvent>,
+) -> Result<()> {
     if events.is_empty() {
         return Ok(());
     }
     let mut writer = writer.lock().unwrap();
-    for event in events {
-        writer.append_input(event)?;
-    }
-    Ok(())
+    adapter.commit(events, |event| {
+        writer.append_input(event).map(|stored| stored.event_id)
+    })
 }
 
 #[cfg(unix)]
@@ -2332,14 +2521,25 @@ struct RecorderLease {
 impl RecorderLease {
     fn start(trace_root: &std::path::Path) -> Result<Self> {
         let path = trace_root.join(RECORDER_LEASE);
-        std::fs::write(&path, std::process::id().to_string())?;
+        // The lease names this process by id and start time, so a suspended
+        // recorder is not mistaken for a reused process id.
+        let contents = premier_cli::liveness::lease_contents();
+        std::fs::write(&path, &contents)?;
         let (stop, receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
             loop {
                 match receiver.recv_timeout(StdDuration::from_secs(2)) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if std::fs::write(&path, std::process::id().to_string()).is_err() {
+                        // Refresh only a lease that still exists: once
+                        // `premier recover --force` has removed it, it must
+                        // not reappear beside the finalized trace.
+                        let refreshed = fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(&path)
+                            .and_then(|mut lease| lease.write_all(contents.as_bytes()));
+                        if refreshed.is_err() {
                             break;
                         }
                     }
@@ -2642,12 +2842,20 @@ fn list(trace_dir: PathBuf) -> Result<()> {
         return Ok(());
     }
     let mut manifests = Vec::new();
+    // An encrypted trace that cannot be opened is still listed, from the
+    // public part of its manifest, instead of silently vanishing.
+    let mut sealed = Vec::new();
     for entry in std::fs::read_dir(trace_dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir()
-            && let Ok(manifest) = read_manifest(entry.path())
-        {
-            manifests.push((entry.path(), manifest));
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        match read_manifest(entry.path()) {
+            Ok(manifest) => manifests.push((entry.path(), manifest)),
+            Err(error) if premier_trace::trace_is_encrypted(entry.path()).unwrap_or(false) => {
+                sealed.push(encrypted_list_line(&entry.path(), &error));
+            }
+            Err(_) => {}
         }
     }
     manifests.sort_by_key(|(_, manifest)| std::cmp::Reverse(manifest.started_at));
@@ -2658,13 +2866,39 @@ fn list(trace_dir: PathBuf) -> Result<()> {
             Some(state) => format!("  [{}]", state.describe(&path)),
         };
         println!(
-            "{}  {}  {}{state}",
-            manifest.trace_id,
+            "{}  {}  {}{}",
+            printable(&manifest.trace_id),
             manifest.started_at,
-            manifest.name.unwrap_or_else(|| manifest.command.join(" "))
+            printable(&manifest.name.unwrap_or_else(|| manifest.command.join(" "))),
+            printable(&state)
         );
     }
+    sealed.sort();
+    for line in sealed.iter().rev() {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// The `list` line for an encrypted trace that could not be opened. Its name
+/// and command are sealed, so the directory name stands in for them.
+fn encrypted_list_line(path: &std::path::Path, error: &anyhow::Error) -> String {
+    let public = fs::read(path.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_default();
+    let reason = if premier_trace::key_file_configured() {
+        format!("{error:#}")
+    } else {
+        "key required".to_owned()
+    };
+    format!(
+        "{}  {}  {}  [encrypted: {}]",
+        printable(public["trace_id"].as_str().unwrap_or("unknown")),
+        printable(public["started_at"].as_str().unwrap_or("unknown")),
+        printable(&path.file_name().unwrap_or_default().to_string_lossy()),
+        printable(&reason)
+    )
 }
 
 /// Directory that contains `trace`, treating the empty parent of a bare

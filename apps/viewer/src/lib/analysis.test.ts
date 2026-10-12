@@ -259,3 +259,30 @@ describe('traceTimeBounds', () => {
     expect(traceTimeBounds([{ ...first, timestamp: 'not a time' }, { ...second, duration_ms: 0 }])).toEqual({ start: Date.parse(second.timestamp), span: 1 });
   });
 });
+
+describe('process.spawn_failed', () => {
+  // What `premier record` writes when the command cannot be started.
+  const spawnFailed: TraceEvent = {
+    ...event(2, 'root', 'process.spawn_failed', 'error'),
+    source: 'premier', actor_type: 'process', span_id: 'command', parent_span_id: 'session',
+    payload_json: JSON.stringify({ executable: 'no-such-agent', error: 'No such file or directory (os error 2)', exit_code: 127, success: false })
+  };
+  const scope = (category: 'process' | 'error' | 'tool') => ({ search: '', category, actorId: null, errorsOnly: false, correlationId: null });
+
+  it('is a process-family issue', () => {
+    expect(isIssue(spawnFailed)).toBe(true);
+    expect(categoryOf(spawnFailed)).toBe('error');
+    expect(filterEvents([spawnFailed], scope('process'))).toEqual([spawnFailed]);
+    expect(filterEvents([spawnFailed], scope('error'))).toEqual([spawnFailed]);
+    expect(filterEvents([spawnFailed], scope('tool'))).toEqual([]);
+    expect(countByCategory([spawnFailed], 'process')).toBe(1);
+    expect(countByCategory([spawnFailed], 'error')).toBe(1);
+  });
+
+  it('summarizes what failed to start and why instead of an exit status', () => {
+    expect(eventSummary(spawnFailed)).toBe('Failed to start no-such-agent: No such file or directory (os error 2)');
+    expect(eventSummary({ ...spawnFailed, payload_json: '{"exit_code":126}' })).toBe('Failed to start the command');
+    // A real exit keeps its own wording.
+    expect(eventSummary({ ...spawnFailed, kind: 'process.exit', payload_json: '{"exit_code":127}' })).toBe('Exited with status 127');
+  });
+});

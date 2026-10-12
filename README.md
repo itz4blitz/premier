@@ -48,19 +48,21 @@ npm install --save-dev @premierstudio/premier
 npx premier record -- npm test
 ```
 
-Premier is script-free: installation does not run lifecycle scripts or download executables from arbitrary URLs. The npm launcher selects the signed native package for your platform.
+Premier is script-free: installation does not run lifecycle scripts or download executables from arbitrary URLs. The npm launcher selects the native package for your platform, published through npm trusted publishing with provenance.
 
 ## Works with the agents you already use
 
-| Agent | Native structured capture |
-| --- | :---: |
-| Claude Code | ✓ |
-| OpenAI Codex | ✓ |
-| Gemini CLI | ✓ |
-| Grok | ✓ |
-| Kimi | ✓ |
-| OpenCode | ✓ |
-| Droid / GLM | ✓ |
+| Agent | Native structured capture when run with |
+| --- | --- |
+| Claude Code | `claude ... --output-format stream-json` |
+| OpenAI Codex | `codex ... --json` |
+| Gemini CLI | `gemini ... --output-format stream-json` |
+| Grok | `grok ... --output-format streaming-json` |
+| Kimi | `kimi ... --output-format stream-json` |
+| OpenCode | `opencode ... --format json` |
+| Droid | `droid ... --output-format json` |
+
+"Native structured capture" means Premier reads the JSON lines the CLI prints in that output mode and adds typed model, tool, and approval events next to the raw output. It is heuristic and best effort, and it only sees what the CLI prints. An interactive session, or any run under `--pty`, is recorded as terminal output and exit status only. [How adapters work and where they stop →](docs/adapters.md)
 
 ```sh
 premier record --adapter auto -- codex exec --json "review this repository"
@@ -72,10 +74,16 @@ Unknown harness? Premier can record any process immediately, then accept typed e
 
 ## Evidence, not vibes
 
-- **Reconstruct the run** — terminal output, model calls, tools, approvals, delegation, messages, joins, timing, and exit semantics.
-- **Follow causality** — actor identity, parent events, spans, correlations, and cross-links stay attached to the evidence.
-- **Find the failure** — filter issues, compare runs, inspect topology, query locally, and export a reviewed evidence package.
+- **Reconstruct the run** — terminal output, timing, and exit semantics for any command; model calls, tools, approvals, delegation, messages, and joins when an adapter or your harness reports them.
+- **Follow causality** — the actor identity, parent events, spans, correlations, and cross-links that producers report stay attached to the evidence.
+- **Find the failure** — filter issues, compare runs, inspect topology, query locally, and export a redacted evidence package for review.
 - **Keep control** — traces are local-first, portable, integrity-checked, redactable, and optionally encrypted.
+
+## Ask a local assistant
+
+The viewer can put questions about a trace to an agent CLI already installed on your machine (Claude, Codex, Grok, or Gemini), run in an empty directory with its tools disabled or restricted to read-only.
+
+Asking a question sends redacted trace content to the model provider behind the CLI you pick; turn the assistant off with `premier open --no-assistant` or `PREMIER_DISABLE_ASSISTANT=1`. [What is sent and how it is confined →](docs/security.md#the-local-assistant)
 
 ## Instrument your own harness
 
@@ -102,15 +110,31 @@ Premier injects a loopback collector URL and per-run bearer token into every rec
 
 ## Built for sensitive evidence
 
-- Local loopback collection by default
-- Structured secret redaction before journal writes
-- Explicit terminal redaction rules
-- XChaCha20-Poly1305 trace encryption
-- Tamper detection and recovery for interrupted runs
+- Loopback-only collector with a per-run bearer token
+- Secret-named fields and well-known credential shapes redacted from structured events and the recorded command line before journal writes
+- Terminal output stored as printed unless you add literal, regex, or known-secret redaction rules
+- Optional XChaCha20-Poly1305 encryption at rest, enabled with a key file
+- Journal digest verification, and recovery of interrupted runs
+- Local viewer that refuses non-loopback hosts and cross-origin API requests
 - Signed release archives and npm trusted publishing with provenance
 - No npm install scripts
 
-Review every trace before sharing it. Premier cannot reliably identify secrets hidden inside arbitrary unlabelled terminal text.
+Review every trace before sharing it. Premier cannot reliably identify secrets hidden inside arbitrary unlabelled terminal text. Verification detects a corrupted, truncated, or edited journal; it does not prove who recorded a trace, and it cannot detect someone who rewrites an unencrypted trace's manifest along with its journal. [Security model →](docs/security.md)
+
+## Documentation
+
+Guides live at [premier.dev/docs](https://premier.dev/docs). The reference for this repository's code lives next to it:
+
+| Reference | Covers |
+| --- | --- |
+| [CLI](docs/cli.md) | Every command, flag, environment variable, and exit code; signals; recovery. |
+| [Redaction](docs/redaction.md) | What is removed when, the built-in patterns, export, and what is not caught. |
+| [Collector](docs/collector.md) | The local HTTP contract for emitting events from any language. |
+| [Events](docs/events.md) | Event kinds, statuses, causality fields, validation, and what counts as an issue. |
+| [Adapters](docs/adapters.md) | Per-agent detection, what is extracted, and the limits. |
+| [Security](docs/security.md) | Collector, viewer server, local assistant, encryption, and verification. |
+| [JavaScript SDK](sdk/js/README.md) | `@premierstudio/trace` helpers and options. |
+| [Changelog](CHANGELOG.md) | Behaviour changes by release. |
 
 ## Explore
 

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, State};
 use axum::http::uri::Authority;
@@ -585,10 +585,37 @@ async fn capture_event(
             message: "invalid collector token".into(),
         });
     }
-    let bytes = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
-        .await
-        .map_err(|error| ApiResponseError::bad_request(&error.to_string()))?;
-    let input: EventInput = serde_json::from_slice(&bytes)
+    let too_large = || ApiResponseError {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        message: format!("event body exceeds {COLLECTOR_BODY_LIMIT} bytes"),
+    };
+    let declared_length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared_length.is_some_and(|length| length > COLLECTOR_BODY_LIMIT) {
+        return Err(too_large());
+    }
+    // A producer that stops sending mid-body must not hold a collector
+    // connection (and with it the recorder's shutdown) open indefinitely.
+    let bytes = tokio::time::timeout(
+        COLLECTOR_BODY_TIMEOUT,
+        axum::body::to_bytes(request.into_body(), COLLECTOR_BODY_LIMIT),
+    )
+    .await
+    .map_err(|_| ApiResponseError {
+        status: StatusCode::REQUEST_TIMEOUT,
+        message: "event body was not received in time".into(),
+    })?
+    .map_err(|error| {
+        if body_limit_exceeded(&error) {
+            too_large()
+        } else {
+            ApiResponseError::bad_request(&error.to_string())
+        }
+    })?;
+    let mut input: EventInput = serde_json::from_slice(&bytes)
         .map_err(|error| ApiResponseError::bad_request(&error.to_string()))?;
     if let Some(reason) = recorder_owned(&input) {
         return Err(ApiResponseError {
@@ -596,12 +623,122 @@ async fn capture_event(
             message: reason,
         });
     }
+    validate_collector_event(&input).map_err(|reason| ApiResponseError::bad_request(&reason))?;
+    keep_producer_timestamp(&mut input).map_err(|reason| ApiResponseError::bad_request(&reason))?;
     let event = state
         .writer
         .lock()
         .map_err(|_| ApiResponseError::internal("trace writer lock was poisoned"))?
         .append_input(input)?;
     Ok(Json(event))
+}
+
+const COLLECTOR_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Longest a collector request may take to deliver its body.
+const COLLECTOR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest `kind`, `source`, or `actor_type` a collector client may send.
+const MAX_COLLECTOR_NAME_BYTES: usize = 128;
+/// Longest free-text identity field (`actor_id`, span ids, `status`, ...).
+const MAX_COLLECTOR_TEXT_BYTES: usize = 256;
+/// RFC 3339 with nanoseconds and an offset is 35 bytes.
+const MAX_TIMESTAMP_BYTES: usize = 64;
+
+fn body_limit_exceeded(error: &axum::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = cause {
+        if error.to_string().contains("length limit exceeded") {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
+}
+
+/// Reject collector input that could pass for something it is not once
+/// displayed. `kind`, `source`, and `actor_type` are names that
+/// [`recorder_owned`] and every reader compare as text, so they are held to
+/// `[A-Za-z0-9._:-]`: no Unicode lookalike (a zero-width space inside
+/// `process.exit`, a Cyrillic `о`) can render like a recorder-owned name.
+/// Free-text identity fields keep Unicode but may not carry control
+/// characters into a terminal or a log line.
+fn validate_collector_event(input: &EventInput) -> Result<(), String> {
+    let name = |field: &str, value: &str, required: bool| {
+        if value.is_empty() {
+            return if required {
+                Err(format!("event {field} cannot be empty"))
+            } else {
+                Ok(())
+            };
+        }
+        if value.len() > MAX_COLLECTOR_NAME_BYTES {
+            return Err(format!(
+                "event {field} exceeds {MAX_COLLECTOR_NAME_BYTES} bytes"
+            ));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+        {
+            return Err(format!(
+                "event {field} may only contain ASCII letters, digits, and `.`, `_`, `:`, `-`"
+            ));
+        }
+        Ok(())
+    };
+    name("kind", &input.kind, true)?;
+    name("source", &input.source, true)?;
+    name("actor_type", &input.actor_type, false)?;
+    let text = |field: &str, value: &str| {
+        if value.len() > MAX_COLLECTOR_TEXT_BYTES {
+            return Err(format!(
+                "event {field} exceeds {MAX_COLLECTOR_TEXT_BYTES} bytes"
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!("event {field} contains a control character"));
+        }
+        Ok(())
+    };
+    text("actor_id", &input.actor_id)?;
+    text("span_id", &input.span_id)?;
+    text("parent_span_id", &input.parent_span_id)?;
+    text("correlation_id", &input.correlation_id)?;
+    text("status", &input.status)?;
+    text("parent_event_id", &input.parent_event_id)?;
+    input.links.iter().try_for_each(|link| text("links", link))
+}
+
+/// The event `timestamp` of collector evidence is always the recorder's
+/// receipt time: it is the only clock the recorder can vouch for, it keeps
+/// timestamps in journal order, and it stops a producer from back- or
+/// forward-dating evidence (or making `premier replay` wait out an invented
+/// gap). A producer's own RFC 3339 `timestamp` is still evidence of what the
+/// producer claimed, so it is kept, verbatim and clearly labelled, as
+/// `payload.producer_timestamp`.
+fn keep_producer_timestamp(input: &mut EventInput) -> Result<(), String> {
+    let Some(claimed) = input.timestamp.take() else {
+        return Ok(());
+    };
+    let claimed = claimed.trim();
+    if claimed.is_empty() {
+        return Ok(());
+    }
+    if claimed.len() > MAX_TIMESTAMP_BYTES || DateTime::parse_from_rfc3339(claimed).is_err() {
+        return Err(
+            "event timestamp must be an RFC 3339 date-time such as 2026-01-31T12:00:00Z".into(),
+        );
+    }
+    if input.payload.is_null() {
+        input.payload = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(payload) = input.payload.as_object_mut() else {
+        return Err(
+            "an event with a timestamp needs an object payload: the producer time is kept as payload.producer_timestamp"
+                .into(),
+        );
+    };
+    payload.insert("producer_timestamp".into(), claimed.into());
+    Ok(())
 }
 
 /// Why a collector client may not assert `input`, if it claims evidence only
@@ -950,14 +1087,71 @@ fn probe_assistant_capabilities(
         .filter(|flag| !help.contains(**flag))
         .copied()
         .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !missing.is_empty() {
+        return Err(format!(
             "installed CLI is missing required safe flags: {}",
             missing.join(", ")
-        ))
+        ));
     }
+    if provider == "codex" {
+        verify_codex_lockdown(executable)?;
+    }
+    Ok(())
+}
+
+/// Codex features that give the model command execution. `assistant_args`
+/// turns each off with `--config features.<name>=false`.
+const CODEX_DISABLED_FEATURES: [&str; 2] = ["shell_tool", "unified_exec"];
+
+/// Accepting a flag is not the same as honouring it: Codex 0.162 takes
+/// `--config features.unified_exec=false` and keeps the feature on. Ask the
+/// installed CLI for the effective state under the exact overrides
+/// `assistant_args` passes, and refuse the provider unless every
+/// command-execution feature is reported off.
+fn verify_codex_lockdown(executable: &Path) -> std::result::Result<(), String> {
+    let mut command = std::process::Command::new(executable);
+    for feature in CODEX_DISABLED_FEATURES {
+        command.args(["--config", &format!("features.{feature}=false")]);
+    }
+    let output = command
+        .args(["features", "list"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| {
+            format!("could not verify that Codex command execution is disabled: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(
+            "could not verify that Codex command execution is disabled: `codex features list` failed"
+                .into(),
+        );
+    }
+    codex_lockdown_gap(&String::from_utf8_lossy(&output.stdout)).map_or(Ok(()), Err)
+}
+
+/// Why `codex features list` output (`<name> <stage> <true|false>` per line)
+/// does not confirm the lock-down, if it does not.
+fn codex_lockdown_gap(features: &str) -> Option<String> {
+    let state = |feature: &str| {
+        features.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(feature)).then(|| fields.next_back().map(str::to_owned))?
+        })
+    };
+    let unconfirmed = CODEX_DISABLED_FEATURES
+        .iter()
+        .filter(|feature| state(feature).as_deref() != Some("false"))
+        .map(|feature| match state(feature) {
+            Some(state) => format!("{feature} is {state}"),
+            None => format!("{feature} is not reported"),
+        })
+        .collect::<Vec<_>>();
+    (!unconfirmed.is_empty()).then(|| {
+        format!(
+            "installed Codex CLI does not confirm that command execution is disabled ({} with it switched off)",
+            unconfirmed.join(", ")
+        )
+    })
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
@@ -1451,6 +1645,9 @@ async fn spawn_blocking_api<T: Send + 'static>(
 
 fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
     let (artifact, integrity) = integrity_fields(path);
+    // Sealed evidence the server holds no usable key for is intact, not
+    // damaged: say so, and keep the public envelope so the viewer can tell.
+    let locked = premier_trace::trace_is_encrypted(path).unwrap_or(false);
     let partial = fs::read(path.join("manifest.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -1488,7 +1685,7 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
     TraceListEntry {
         manifest: TraceManifest {
             format_version: 0,
-            trace_id: format!("damaged:{artifact}"),
+            trace_id: format!("{}:{artifact}", if locked { "locked" } else { "damaged" }),
             tenant_id: premier_trace::LOCAL_TENANT.into(),
             name,
             command,
@@ -1502,15 +1699,30 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
             redaction: None,
             adapter: None,
             seal: None,
-            encryption: None,
+            encryption: locked
+                .then(|| serde_json::from_value(partial["encryption"].clone()).ok())
+                .flatten(),
         },
         summary: None,
         artifact,
-        integrity: IntegrityStatus::Invalid,
-        integrity_detail: Some(format!(
-            "invalid manifest: {}",
-            integrity.detail.unwrap_or_else(|| error.to_string())
-        )),
+        integrity: if locked {
+            IntegrityStatus::Locked
+        } else {
+            IntegrityStatus::Invalid
+        },
+        integrity_detail: Some(if !locked {
+            format!(
+                "invalid manifest: {}",
+                integrity.detail.unwrap_or_else(|| error.to_string())
+            )
+        } else if premier_trace::key_file_configured() {
+            format!(
+                "encrypted trace: the configured key cannot open it ({}); restart with the key file that sealed it (--key-file or PREMIER_TRACE_KEY_FILE)",
+                integrity.detail.unwrap_or_else(|| error.to_string())
+            )
+        } else {
+            "encrypted trace: key required; restart with --key-file or PREMIER_TRACE_KEY_FILE to read it".into()
+        }),
         integrity_protection: None,
         integrity_signer: None,
     }
@@ -1622,28 +1834,45 @@ struct EventPageQuery {
     limit: Option<usize>,
 }
 
+/// Consecutive polls that must classify a trace as abandoned before the event
+/// stream ends with `trace.abandoned`.
+const STREAM_ABANDONED_POLLS: u32 = 2;
+
+/// Tail a trace as server-sent events: `trace.event` for each event, then
+/// exactly one terminal event before the stream closes — `trace.complete`
+/// once the trace is finalized (by its recorder or by `premier recover`), or
+/// `trace.abandoned` when its recorder is gone. Both carry the trace detail.
 async fn stream_events(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
     AxumPath(trace_id): AxumPath<String>,
+    Query(query): Query<StreamQuery>,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiResponseError> {
     require_scope(&principal, "trace:read")?;
     let trace_path = resolve_trace(&state, &trace_id, &principal)?;
+    // A client that already paged the journal resumes after its last sequence
+    // instead of receiving every recorded event a second time.
+    let resume_after = query.after_sequence.unwrap_or(0);
     let stream = async_stream::stream! {
         let mut byte_offset = 0_u64;
-        let mut seen_sequence = 0_u64;
+        let mut seen_sequence = resume_after;
+        let mut abandoned_polls = 0_u32;
         loop {
             if let Ok(tail) = read_active_events_after(&trace_path, byte_offset) {
                 byte_offset = tail.next_byte_offset;
                 for event in tail.events {
+                    if event.sequence <= resume_after {
+                        continue;
+                    }
                     seen_sequence = seen_sequence.max(event.sequence);
                     if let Ok(message) = Event::default().event("trace.event").json_data(event) {
                         yield Ok(message);
                     }
                 }
             }
-            let finalized = read_manifest(&trace_path)
-                .ok()
+            let manifest = read_manifest(&trace_path).ok();
+            let finalized = manifest
+                .as_ref()
                 .is_some_and(|manifest| manifest.journal.is_some());
             if finalized {
                 // The active journal may have been atomically replaced between
@@ -1678,10 +1907,39 @@ async fn stream_events(
                 }
                 break;
             }
+            // Nobody is left to append to or finalize an abandoned trace, so
+            // tailing it would never end. Say so and close the stream; a
+            // later `premier recover` shows up through the trace list.
+            let abandoned = manifest.and_then(|manifest| {
+                let integrity = liveness::unfinalized_integrity(&trace_path, &manifest)?;
+                (integrity.status == IntegrityStatus::Abandoned).then_some(TraceSnapshot {
+                    manifest,
+                    summary: None,
+                    integrity,
+                })
+            });
+            match abandoned {
+                // A recorder that is just starting has not written its lease
+                // yet; only a repeated answer counts.
+                Some(snapshot) if abandoned_polls + 1 >= STREAM_ABANDONED_POLLS => {
+                    let detail = trace_detail(&trace_path, snapshot);
+                    if let Ok(message) = Event::default().event("trace.abandoned").json_data(detail) {
+                        yield Ok(message);
+                    }
+                    break;
+                }
+                Some(_) => abandoned_polls += 1,
+                None => abandoned_polls = 0,
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamQuery {
+    after_sequence: Option<u64>,
 }
 
 impl AppState {
@@ -1701,8 +1959,23 @@ fn resolve_trace(
     if trace_id.contains('/') || trace_id.contains('\\') || trace_id == "." || trace_id == ".." {
         return Err(ApiResponseError::bad_request("invalid trace id"));
     }
-    let root = &state.trace_dir;
-    for entry in fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))? {
+    let entries = match fs::read_dir(&state.trace_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiResponseError::not_found("trace not found"));
+        }
+        // The response must not name where the server keeps its traces.
+        Err(error) => {
+            tracing::warn!(
+                "cannot read trace directory {}: {error}",
+                state.trace_dir.display()
+            );
+            return Err(ApiResponseError::internal(
+                "cannot read the trace directory",
+            ));
+        }
+    };
+    for entry in entries {
         let entry = entry?;
         if state.serves(&entry)
             && entry.file_type()?.is_dir()
@@ -2285,6 +2558,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_resumes_after_a_sequence_without_replaying_earlier_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_dir = temp.path().join("traces");
+        let trace = trace_dir.join("resume.atrace");
+        let mut writer = TraceWriter::create(&trace, vec!["agent".into()]).unwrap();
+        let trace_id = writer.trace_id().to_owned();
+        for index in 0..5 {
+            writer
+                .append("custom.event", "test", serde_json::json!({"index": index}))
+                .unwrap();
+        }
+        writer.finish(0).unwrap();
+        let all = read_events(&trace).unwrap();
+        let cursor = all[all.len() - 3].sequence;
+        let viewer = temp.path().join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        let response = app(trace_dir, Some(viewer), AuthPolicy::default())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/traces/{trace_id}/stream?after_sequence={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(text.matches("event: trace.event").count(), 2, "{text}");
+        for event in &all[..all.len() - 2] {
+            assert!(
+                !text.contains(&event.event_id),
+                "replayed {}",
+                event.event_id
+            );
+        }
+        for event in &all[all.len() - 2..] {
+            assert!(text.contains(&event.event_id), "missing {}", event.event_id);
+        }
+        assert!(text.contains("event: trace.complete"));
+    }
+
+    #[tokio::test]
     async fn events_endpoint_preserves_full_reads_and_supports_bounded_sequence_pages() {
         let temp = tempfile::tempdir().unwrap();
         let trace_dir = temp.path().join("traces");
@@ -2361,7 +2680,7 @@ mod tests {
             }
             trace
         };
-        let abandoned = unfinished("abandoned.atrace", None);
+        unfinished("abandoned.atrace", None);
         // This test process stands in for a recorder that is still running.
         unfinished("live.atrace", Some(std::process::id().to_string()));
         let viewer = temp.path().join("viewer");
@@ -2400,8 +2719,13 @@ mod tests {
             assert_eq!(gone["integrity"], "abandoned");
             let detail = gone["integrity_detail"].as_str().unwrap();
             assert!(
-                detail.contains(&format!("premier recover --force {}", abandoned.display())),
+                detail.contains("`premier recover --force abandoned.atrace`"),
                 "{detail}"
+            );
+            // The server-side location of the trace is not the client's business.
+            assert!(
+                !String::from_utf8_lossy(&body).contains(&temp.path().display().to_string()),
+                "trace list leaks a server path"
             );
 
             let trace_id = gone["trace_id"].as_str().unwrap();
@@ -2420,6 +2744,10 @@ mod tests {
             let detail_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(detail_json["integrity"], "abandoned");
             assert!(
+                !String::from_utf8_lossy(&body).contains(&temp.path().display().to_string()),
+                "trace detail leaks a server path"
+            );
+            assert!(
                 detail_json["integrity_detail"]
                     .as_str()
                     .unwrap()
@@ -2427,6 +2755,135 @@ mod tests {
                 "{detail_json}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn trace_lookups_do_not_reveal_the_trace_directory_when_it_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let viewer = temp.path().join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        // A trace directory that does not exist, and one that is not a directory.
+        let not_a_directory = temp.path().join("traces-file");
+        fs::write(&not_a_directory, "").unwrap();
+        for (trace_dir, expected) in [
+            (temp.path().join("missing"), StatusCode::NOT_FOUND),
+            (not_a_directory, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let app = app(trace_dir, Some(viewer.clone()), AuthPolicy::default());
+            for route in ["", "/events", "/stream"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/api/traces/some-trace{route}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{route}");
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                let body = String::from_utf8_lossy(&body);
+                assert!(
+                    !body.contains(&temp.path().display().to_string()),
+                    "{route} leaks a server path: {body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_ends_with_a_terminal_event_for_an_abandoned_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_dir = temp.path().join("traces");
+        let trace = trace_dir.join("abandoned.atrace");
+        let mut writer = TraceWriter::create(&trace, vec!["agent".into()]).unwrap();
+        let trace_id = writer.trace_id().to_owned();
+        writer
+            .append("session.start", "test", serde_json::json!({}))
+            .unwrap();
+        // No lease and no finalization: the recorder is gone.
+        drop(writer);
+        let viewer = temp.path().join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        let response = app(trace_dir, Some(viewer), AuthPolicy::default())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/traces/{trace_id}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The body only completes if the server closes the stream.
+        let body = tokio::time::timeout(
+            Duration::from_secs(30),
+            to_bytes(response.into_body(), 64 * 1024),
+        )
+        .await
+        .expect("the stream of an abandoned trace must end")
+        .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: trace.event"), "{text}");
+        assert!(text.contains("session.start"), "{text}");
+        assert!(text.contains("event: trace.abandoned"), "{text}");
+        assert!(!text.contains("event: trace.complete"), "{text}");
+        let terminal = text
+            .split("event: trace.abandoned")
+            .nth(1)
+            .and_then(|rest| rest.lines().find_map(|line| line.strip_prefix("data: ")))
+            .expect("terminal event data");
+        let terminal: serde_json::Value = serde_json::from_str(terminal).unwrap();
+        assert_eq!(terminal["trace_id"], trace_id);
+        assert_eq!(terminal["integrity"], "abandoned");
+        assert!(
+            terminal["integrity_detail"]
+                .as_str()
+                .unwrap()
+                .contains("premier recover --force abandoned.atrace")
+        );
+        assert!(!text.contains(&temp.path().display().to_string()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_stays_open_while_the_recorder_is_alive() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_dir = temp.path().join("traces");
+        let trace = trace_dir.join("live.atrace");
+        let mut writer = TraceWriter::create(&trace, vec!["agent".into()]).unwrap();
+        let trace_id = writer.trace_id().to_owned();
+        writer
+            .append("session.start", "test", serde_json::json!({}))
+            .unwrap();
+        // This test process stands in for a recorder that is still running.
+        fs::write(
+            trace.join(premier_trace::RECORDER_LEASE),
+            liveness::lease_contents(),
+        )
+        .unwrap();
+        let viewer = temp.path().join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        let response = app(trace_dir, Some(viewer), AuthPolicy::default())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/traces/{trace_id}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let open = tokio::time::timeout(
+            Duration::from_millis(1500),
+            to_bytes(response.into_body(), 64 * 1024),
+        )
+        .await;
+        assert!(open.is_err(), "a live trace's stream ended: {open:?}");
+        // Finalizing the trace is what ends it.
+        drop(writer);
     }
 
     #[tokio::test]
@@ -2819,6 +3276,62 @@ mod tests {
         );
         assert!(gemini.contains(&"--allowed-mcp-server-names".into()));
         assert!(assistant_args("opencode", "question").is_none());
+    }
+
+    #[test]
+    fn codex_is_only_trusted_when_its_feature_list_confirms_the_lockdown() {
+        // Every feature the probe checks is one the invocation switches off.
+        let codex = assistant_args("codex", "question").unwrap();
+        for feature in CODEX_DISABLED_FEATURES {
+            let disabled = format!("features.{feature}=false");
+            assert!(
+                codex
+                    .windows(2)
+                    .any(|args| args[0] == "--config" && args[1] == disabled)
+            );
+        }
+        let locked = "apps                 stable             true\n\
+                      shell_tool           stable             false\n\
+                      unified_exec         stable             false\n\
+                      unified_exec_tty     stable             true\n";
+        assert_eq!(codex_lockdown_gap(locked), None);
+        // What Codex 0.162.1 reports with both overrides applied.
+        let ignored = "shell_tool           stable             false\n\
+                       unified_exec         stable             true\n";
+        let reason = codex_lockdown_gap(ignored).unwrap();
+        assert!(reason.contains("unified_exec is true"), "{reason}");
+        assert!(!reason.contains("shell_tool"), "{reason}");
+        let unknown = codex_lockdown_gap("shell_tool stable false\n").unwrap();
+        assert!(
+            unknown.contains("unified_exec is not reported"),
+            "{unknown}"
+        );
+        assert!(codex_lockdown_gap("").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_probe_marks_the_provider_unavailable_when_a_disable_flag_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fake = |name: &str, unified_exec: &str| {
+            let executable = temp.path().join(name);
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\ncase \"$*\" in\n*'features list') printf 'shell_tool stable false\\nunified_exec stable {unified_exec}\\n';;\n*) printf '%s\\n' --ask-for-approval --sandbox --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --config;;\nesac\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            executable
+        };
+        assert_eq!(
+            probe_assistant_capabilities("codex", &fake("honours", "false")),
+            Ok(())
+        );
+        let reason = probe_assistant_capabilities("codex", &fake("ignores", "true")).unwrap_err();
+        assert!(reason.contains("unified_exec is true"), "{reason}");
     }
 
     #[test]

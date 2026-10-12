@@ -5,6 +5,12 @@ fn premier() -> Command {
     Command::new(env!("CARGO_BIN_EXE_premier"))
 }
 
+/// Overrides how long the recorder waits before journaling held output.
+const IDLE_FLUSH_ENV: &str = "PREMIER_REDACTION_IDLE_FLUSH_MS";
+/// An idle period no test outlasts: a pause between two writes never flushes
+/// held text, however slowly a loaded machine runs the pause.
+const NO_IDLE_FLUSH_MS: &str = "600000";
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -47,6 +53,7 @@ fn terminal_rules_redact_secrets_split_across_separate_writes() {
         ])
         .arg(&trace)
         .args(["sh", "-c", script])
+        .env(IDLE_FLUSH_ENV, NO_IDLE_FLUSH_MS)
         .output()
         .unwrap();
     assert_success(&recorded);
@@ -98,6 +105,7 @@ fn pty_terminal_rules_redact_secrets_split_across_separate_writes() {
             "-c",
             "printf SUPERSECRET; sleep 0.3; printf 'VALUE\\n'",
         ])
+        .env(IDLE_FLUSH_ENV, NO_IDLE_FLUSH_MS)
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -120,6 +128,7 @@ fn pty_capture_redacts_a_split_secret_and_keeps_the_rest_of_the_output_intact() 
             "-c",
             "printf 'before\\n'; printf 'token=SEC'; sleep 0.3; printf 'RET done\\n'; printf 'after ✓\\n'",
         ])
+        .env(IDLE_FLUSH_ENV, NO_IDLE_FLUSH_MS)
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -412,28 +421,66 @@ fn export_reports_what_it_redacted_and_the_active_rules() {
     assert_eq!(export["redaction"]["redacted"]["already_redacted"], 3);
 }
 
+/// A spawned recorder whose whole process group is killed when it goes out
+/// of scope, so neither a failed assertion nor a killed recorder leaves the
+/// recorded command (`sleep 20`) running.
+#[cfg(unix)]
+struct Recorder(std::process::Child);
+
+#[cfg(unix)]
+impl std::ops::Deref for Recorder {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for Recorder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        // The recorder leads its own process group (`process_group(0)`).
+        let group = format!("-{}", self.0.id());
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &group])
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawn a recorder with a regex rule around a command that prints a prompt
 /// without a line break and then waits, and return once the prompt has been
-/// mirrored to the recorder's stdout.
+/// mirrored to the recorder's stdout. Held output is journaled after
+/// `idle_flush_ms` without output.
 #[cfg(unix)]
-fn record_unterminated_prompt(trace: &std::path::Path) -> std::process::Child {
+fn record_unterminated_prompt(trace: &std::path::Path, idle_flush_ms: &str) -> Recorder {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
 
-    let mut recorder = premier()
-        .args(["record", "--redact-regex", "sk-[a-z0-9]+", "--output"])
-        .arg(trace)
-        .args([
-            "sh",
-            "-c",
-            "printf 'key sk-abc123 Password: '; exec sleep 20",
-        ])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut recorder = Recorder(
+        premier()
+            .args(["record", "--redact-regex", "sk-[a-z0-9]+", "--output"])
+            .arg(trace)
+            .args([
+                "sh",
+                "-c",
+                "printf 'key sk-abc123 Password: '; exec sleep 20",
+            ])
+            .env(IDLE_FLUSH_ENV, idle_flush_ms)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let mut stdout = recorder.stdout.take().unwrap();
     let mut seen = Vec::new();
     let mut byte = [0_u8; 1];
@@ -449,9 +496,9 @@ fn record_unterminated_prompt(trace: &std::path::Path) -> std::process::Child {
 fn a_held_prompt_is_journaled_after_an_idle_period_and_survives_a_killed_recorder() {
     let temp = tempfile::tempdir().unwrap();
     let trace = temp.path().join("idle.atrace");
-    let mut recorder = record_unterminated_prompt(&trace);
+    let mut recorder = record_unterminated_prompt(&trace, "100");
     // The line never ends, so only the idle flush can journal it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut stored = String::new();
     while stored.is_empty() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -473,7 +520,16 @@ fn a_held_prompt_is_journaled_after_an_idle_period_and_survives_a_killed_recorde
 fn a_held_prompt_is_journaled_when_the_recorder_finalizes_after_a_signal() {
     let temp = tempfile::tempdir().unwrap();
     let trace = temp.path().join("signal.atrace");
-    let mut recorder = record_unterminated_prompt(&trace);
+    let mut recorder = record_unterminated_prompt(&trace, NO_IDLE_FLUSH_MS);
+    // The idle period is configurable: with the default of one second the
+    // prompt would be journaled by now, and finalization would have nothing
+    // left to prove.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(
+        stored_text(&read_events(&trace).unwrap(), "process.stdout"),
+        "",
+        "{IDLE_FLUSH_ENV} was not honored"
+    );
     let signal = Command::new("kill")
         .args(["-TERM", &recorder.id().to_string()])
         .status()
@@ -485,6 +541,112 @@ fn a_held_prompt_is_journaled_when_the_recorder_finalizes_after_a_signal() {
         stored_text(&read_events(&trace).unwrap(), "process.stdout"),
         "key [REDACTED] Password: "
     );
+}
+
+/// A secret spanning two lines and one spanning three, each written in
+/// pieces that end inside a line.
+const MULTILINE_SCRIPT: &str = "printf 'one\\ntoken:\\n  sk9'; sleep 0.2; \
+     printf 'abc\\nBEGIN TOKEN\\nabc'; sleep 0.2; \
+     printf 'def\\nEND TOK'; sleep 0.2; printf 'EN\\nafter\\n'";
+
+fn record_multiline_secrets(trace: &std::path::Path, pty: bool) -> Output {
+    let mut command = premier();
+    command.arg("record");
+    if pty {
+        command.arg("--pty");
+    }
+    let recorded = command
+        .args([
+            "--redact-regex-multiline",
+            r"token:\s+[a-z0-9]+",
+            "--redact-regex-multiline",
+            "(?s)BEGIN TOKEN.*?END TOKEN",
+            "--output",
+        ])
+        .arg(trace)
+        .args(["sh", "-c", MULTILINE_SCRIPT])
+        .env(IDLE_FLUSH_ENV, NO_IDLE_FLUSH_MS)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_success(&recorded);
+    recorded
+}
+
+#[test]
+fn multiline_regex_rules_redact_secrets_spanning_lines_and_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("multiline.atrace");
+    let recorded = record_multiline_secrets(&trace, false);
+    // The live terminal stays raw; only the journal is redacted.
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.stdout),
+        "one\ntoken:\n  sk9abc\nBEGIN TOKEN\nabcdef\nEND TOKEN\nafter\n"
+    );
+    let events = read_events(&trace).unwrap();
+    assert_eq!(
+        stored_text(&events, "process.stdout"),
+        "one\n[REDACTED]\n[REDACTED]\nafter\n"
+    );
+    // The recorded command line holds the pieces, never a whole secret.
+    let stored = persisted(&trace);
+    for secret in ["sk9abc", "abcdef", "END TOKEN"] {
+        assert!(!stored.contains(secret), "{secret} persisted");
+    }
+    premier_trace::verify(&trace).unwrap();
+    let provenance = premier_trace::read_manifest(&trace)
+        .unwrap()
+        .redaction
+        .expect("redaction provenance");
+    assert_eq!(provenance.terminal_multiline_regex_count, 2);
+    assert_eq!(provenance.terminal_regex_count, 0);
+    // The same pattern as a line-scoped rule never sees the block whole.
+    let line_scoped = temp.path().join("line-scoped.atrace");
+    let recorded = premier()
+        .args(["record", "--redact-regex", "(?s)BEGIN TOKEN.*?END TOKEN"])
+        .arg("--output")
+        .arg(&line_scoped)
+        .args(["sh", "-c", MULTILINE_SCRIPT])
+        .env(IDLE_FLUSH_ENV, NO_IDLE_FLUSH_MS)
+        .output()
+        .unwrap();
+    assert_success(&recorded);
+    assert!(persisted(&line_scoped).contains("abcdef"));
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_multiline_regex_rules_redact_secrets_spanning_lines_and_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("multiline-pty.atrace");
+    record_multiline_secrets(&trace, true);
+    // The terminal translates each newline to CRLF, which `\s` and `(?s).`
+    // both cross.
+    assert_eq!(
+        stored_text(&read_events(&trace).unwrap(), "process.terminal"),
+        "one\r\n[REDACTED]\r\n[REDACTED]\r\nafter\r\n"
+    );
+}
+
+#[test]
+fn an_invalid_multiline_regex_is_rejected_before_anything_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let trace = temp.path().join("invalid.atrace");
+    let recorded = premier()
+        .args(["record", "--redact-regex-multiline", "(", "--output"])
+        .arg(&trace)
+        .args(["sh", "-c", "echo ran"])
+        .output()
+        .unwrap();
+    assert!(!recorded.status.success());
+    assert!(
+        String::from_utf8_lossy(&recorded.stderr)
+            .contains("invalid multi-line terminal redaction regex"),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    assert!(recorded.stdout.is_empty());
+    assert!(!trace.exists());
 }
 
 #[test]
@@ -499,6 +661,10 @@ fn redact_regex_help_states_its_line_scope_and_limits() {
         "Regex rules are line-scoped",
         "never spans a line break",
         "256 KiB",
+        "PREMIER_REDACTION_IDLE_FLUSH_MS",
+        "--redact-regex-multiline <REGEX>",
+        "may match across line breaks",
+        "a match up to 16 KiB is redacted",
         "--no-default-secret-patterns",
         "--redact-known-secrets",
     ] {

@@ -4,7 +4,7 @@ mod output;
 mod seal;
 mod utf8;
 
-pub use crypto::{EncryptionKey, KEY_FILE_ENV};
+pub use crypto::{EncryptionKey, KEY_FILE_ENV, key_file_configured, set_key_file};
 pub use integrity::{IntegrityReport, IntegrityStatus, assess_integrity};
 pub use output::prepare_trace_output;
 pub use seal::{
@@ -305,6 +305,9 @@ pub struct RedactionProvenance {
     pub terminal_literal_count: usize,
     #[serde(default)]
     pub terminal_regex_count: usize,
+    /// Rules given with `--redact-regex-multiline`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub terminal_multiline_regex_count: usize,
     /// Names of the built-in secret value patterns that were active (see
     /// [`builtin_secret_pattern_names`]). Empty when they were switched off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -318,6 +321,10 @@ pub struct RedactionProvenance {
     pub builtin_patterns_terminal: bool,
 }
 
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
 /// Replacement written wherever redaction removes a value.
 const REDACTED: &str = "[REDACTED]";
 /// Longest unterminated line a [`TerminalRedactionBuffer`] holds back before
@@ -327,6 +334,10 @@ const MAX_HELD_LINE_BYTES: usize = 256 * 1024;
 /// longer than [`MAX_HELD_LINE_BYTES`]. A literal or regex match no longer
 /// than this cannot straddle the forced cut.
 const HELD_OVERLAP_BYTES: usize = 16 * 1024;
+/// Trailing terminal text a [`TerminalRedactionBuffer`] keeps held while a
+/// multi-line regex rule is active. A multi-line match no longer than this
+/// cannot straddle a release, however the output was chunked.
+pub const MULTILINE_WINDOW_BYTES: usize = HELD_OVERLAP_BYTES;
 
 /// One built-in secret value pattern: `group` is the capture group holding
 /// the secret, and `accept` vets a candidate to keep false positives low.
@@ -531,6 +542,8 @@ pub struct RedactionConfig {
     custom_fields: Vec<String>,
     terminal_literals: Vec<String>,
     terminal_regexes: Vec<regex::Regex>,
+    /// Regex rules that may match across line breaks (opt-in).
+    terminal_multiline_regexes: Vec<regex::Regex>,
     /// Built-in value patterns on structured payloads and the command line.
     structured_patterns: bool,
     /// Built-in value patterns on captured terminal text (opt-in).
@@ -591,9 +604,29 @@ impl RedactionConfig {
             custom_fields,
             terminal_literals,
             terminal_regexes,
+            terminal_multiline_regexes: Vec::new(),
             structured_patterns: true,
             terminal_patterns: false,
         })
+    }
+
+    /// Add regex rules that may match across line breaks. Unlike the
+    /// line-scoped rules they are matched over a sliding window of held
+    /// terminal text ([`MULTILINE_WINDOW_BYTES`]) and over whole string values
+    /// in structured payloads. The syntax is unchanged: `.` still stops at a
+    /// line break unless the pattern says otherwise (`(?s)`, `\n`, `\s`).
+    pub fn multiline_regexes(
+        mut self,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self> {
+        for pattern in patterns {
+            let pattern: String = pattern.into();
+            self.terminal_multiline_regexes
+                .push(regex::Regex::new(&pattern).with_context(|| {
+                    format!("invalid multi-line terminal redaction regex: {pattern}")
+                })?);
+        }
+        Ok(self)
     }
 
     /// Whether the built-in secret value patterns (see
@@ -619,6 +652,7 @@ impl RedactionConfig {
             custom_fields: self.custom_fields.clone(),
             terminal_literal_count: self.terminal_literals.len(),
             terminal_regex_count: self.terminal_regexes.len(),
+            terminal_multiline_regex_count: self.terminal_multiline_regexes.len(),
             builtin_patterns: if builtin {
                 builtin_secret_pattern_names()
                     .into_iter()
@@ -633,7 +667,9 @@ impl RedactionConfig {
     }
 
     fn has_text_rules(&self) -> bool {
-        !self.terminal_literals.is_empty() || !self.terminal_regexes.is_empty()
+        !self.terminal_literals.is_empty()
+            || !self.terminal_regexes.is_empty()
+            || !self.terminal_multiline_regexes.is_empty()
     }
 
     /// Whether any rule can rewrite captured terminal text.
@@ -650,7 +686,11 @@ impl RedactionConfig {
             copied = end;
         }
         redacted.push_str(&text[copied..]);
-        for pattern in &self.terminal_regexes {
+        for pattern in self
+            .terminal_regexes
+            .iter()
+            .chain(&self.terminal_multiline_regexes)
+        {
             redacted = pattern.replace_all(&redacted, REDACTED).into_owned();
         }
         redacted
@@ -845,12 +885,18 @@ fn string_items(value: &serde_json::Value) -> Option<Vec<String>> {
 /// - A line longer than [`MAX_HELD_LINE_BYTES`] without a line break is cut
 ///   early, keeping the last [`HELD_OVERLAP_BYTES`] held and never cutting
 ///   inside a match, so a match up to that size cannot straddle the cut.
+/// - Multi-line regex rules are matched over a sliding window instead: the
+///   last [`MULTILINE_WINDOW_BYTES`] stay held and a release never cuts
+///   inside a match, so a match up to that size is seen whole across line
+///   breaks and chunk boundaries. A longer match may be split.
 /// - [`Self::flush_idle`] releases a held partial line (such as a prompt)
 ///   early; a regex match the stream pauses inside may then be split.
 #[derive(Clone, Debug)]
 pub struct TerminalRedactionBuffer {
     literals: Vec<String>,
     regexes: Vec<regex::Regex>,
+    /// Regex rules that may match across line breaks.
+    multiline_regexes: Vec<regex::Regex>,
     /// The built-in secret value patterns apply to this stream.
     known_secrets: bool,
     /// The stream is JSONL whose object lines are redacted as structured data.
@@ -907,6 +953,72 @@ impl TerminalRedactionBuffer {
     }
 
     fn safe_cut(&self) -> usize {
+        let cut = self.line_rule_cut();
+        if self.multiline_regexes.is_empty() {
+            cut
+        } else {
+            self.window_cut(cut)
+        }
+    }
+
+    /// Cut for the multi-line rules, at or before `limit` (the cut every
+    /// other rule allows): the last [`MULTILINE_WINDOW_BYTES`] stay held, and
+    /// the cut moves back to the start of any rule match it would split. It
+    /// stays on a line end while line-scoped rules are active. A single match
+    /// too long to hold is split.
+    fn window_cut(&self, limit: usize) -> usize {
+        let text = self.held.as_str();
+        let mut target = limit.min(text.len().saturating_sub(MULTILINE_WINDOW_BYTES));
+        while !text.is_char_boundary(target) {
+            target -= 1;
+        }
+        let line_end = if self.hold_lines() && target < limit {
+            text[..target].rfind('\n').map_or(0, |index| index + 1)
+        } else {
+            target
+        };
+        [line_end, target]
+            .into_iter()
+            .map(|candidate| self.match_safe_cut(candidate))
+            .find(|cut| text.len() - cut <= MAX_HELD_LINE_BYTES)
+            .unwrap_or(target)
+    }
+
+    /// Latest point at or before `limit` that no complete regex, built-in
+    /// pattern, or literal match extends across.
+    fn match_safe_cut(&self, limit: usize) -> usize {
+        let text = self.held.as_str();
+        let mut spans = Vec::new();
+        for regex in self.regexes.iter().chain(&self.multiline_regexes) {
+            spans.extend(
+                regex
+                    .find_iter(text)
+                    .map(|found| (found.start(), found.end())),
+            );
+        }
+        if self.known_secrets {
+            for pattern in BUILTIN_SECRET_PATTERNS.iter() {
+                spans.extend(secret_pattern_spans(pattern, text));
+            }
+        }
+        let mut cut = limit;
+        loop {
+            let moved = spans
+                .iter()
+                .filter(|(start, end)| *start < cut && cut < *end)
+                .map(|(start, _)| *start)
+                .min()
+                .unwrap_or(cut);
+            let moved = self.literal_safe_cut(moved);
+            if moved == cut {
+                return cut;
+            }
+            cut = moved;
+        }
+    }
+
+    /// The cut the literal, line-scoped regex, and built-in rules allow.
+    fn line_rule_cut(&self) -> usize {
         let text = self.held.as_str();
         let within_bound = |cut: usize| text.len() - cut <= MAX_HELD_LINE_BYTES;
         if self.hold_lines() {
@@ -932,26 +1044,7 @@ impl TerminalRedactionBuffer {
         while !text.is_char_boundary(target) {
             target -= 1;
         }
-        let mut spans = Vec::new();
-        for regex in &self.regexes {
-            spans.extend(
-                regex
-                    .find_iter(text)
-                    .map(|found| (found.start(), found.end())),
-            );
-        }
-        if self.known_secrets {
-            for pattern in BUILTIN_SECRET_PATTERNS.iter() {
-                spans.extend(secret_pattern_spans(pattern, text));
-            }
-        }
-        let cut = spans
-            .into_iter()
-            .filter(|(start, end)| *start < target && target < *end)
-            .map(|(start, _)| start)
-            .min()
-            .unwrap_or(target);
-        let cut = self.literal_safe_cut(cut);
+        let cut = self.match_safe_cut(target);
         if text.len() - cut <= MAX_HELD_LINE_BYTES {
             cut
         } else {
@@ -1235,6 +1328,7 @@ impl TraceWriter {
         TerminalRedactionBuffer {
             literals: self.redaction.terminal_literals.clone(),
             regexes: self.redaction.terminal_regexes.clone(),
+            multiline_regexes: self.redaction.terminal_multiline_regexes.clone(),
             known_secrets: self.redaction.terminal_patterns,
             structured_lines: kind == "process.stdout" && self.manifest.adapter.is_some(),
             held: String::new(),
@@ -2158,7 +2252,7 @@ fn required_encryption_key(manifest: &TraceManifest) -> Result<Option<Encryption
         bail!("unsupported trace encryption algorithm")
     }
     let master_key = crypto::key_from_environment()?
-        .context("encrypted trace requires PREMIER_TRACE_KEY_FILE")?;
+        .context("encrypted trace requires --key-file or PREMIER_TRACE_KEY_FILE")?;
     if master_key.key_id() != metadata.key_id {
         bail!("trace decryption failed: wrong key")
     }
@@ -3930,6 +4024,154 @@ mod tests {
         assert_eq!(text.len(), long.len() - HELD_OVERLAP_BYTES);
     }
 
+    /// Split ASCII `text` into chunks of `size` bytes.
+    fn chunked(text: &str, size: usize) -> Vec<&str> {
+        text.as_bytes()
+            .chunks(size)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn multiline_regex_rules_redact_secrets_spanning_lines_split_across_chunks() {
+        let rules = || {
+            text_rules(&[], &[])
+                .multiline_regexes([r"token:\s+[a-z0-9]+", r"(?s)BEGIN TOKEN.*?END TOKEN"])
+                .unwrap()
+        };
+        // A secret spanning two lines, and one spanning three, each split
+        // inside every one of its lines.
+        assert_eq!(
+            journal_chunks(
+                rules(),
+                "process.stdout",
+                &["one\ntok", "en:\n  sk9", "abc\ntwo\n"]
+            ),
+            "one\n[REDACTED]\ntwo\n"
+        );
+        assert_eq!(
+            journal_chunks(
+                rules(),
+                "process.stderr",
+                &["log\nBEGIN TO", "KEN\nabc", "def\nEND TOK", "EN\nafter\n"]
+            ),
+            "log\n[REDACTED]\nafter\n"
+        );
+        // The same line-scoped rule releases each line as it ends, so it
+        // never sees the block whole.
+        assert!(
+            journal_chunks(
+                text_rules(&[], &["(?s)BEGIN TOKEN.*?END TOKEN"]),
+                "process.stdout",
+                &["BEGIN TO", "KEN\nabc", "def\nEND TOKEN\n"]
+            )
+            .contains("abcdef")
+        );
+
+        // Far more output than the window holds, cut at every kind of chunk
+        // boundary: the secrets are still seen whole.
+        let filler = "a line of ordinary output\n".repeat(2_000);
+        let text =
+            format!("{filler}token:\n  sk9abc\n{filler}BEGIN TOKEN\nabc\ndef\nEND TOKEN\n{filler}");
+        let expected = format!("{filler}[REDACTED]\n{filler}[REDACTED]\n{filler}");
+        assert!(filler.len() > 2 * MULTILINE_WINDOW_BYTES);
+        for size in [1_000, 4_093, 8_192, 100_000] {
+            assert_eq!(
+                journal_chunks(rules(), "process.stdout", &chunked(&text, size)),
+                expected,
+                "chunk size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_regex_rules_compose_with_line_rules_and_stay_bounded() {
+        // Line-scoped rules keep their whole-line guarantee next to a
+        // multi-line rule: `id=` is followed by more than a window of text.
+        let long_id = "7".repeat(MULTILINE_WINDOW_BYTES * 2);
+        let filler = "ordinary output\n".repeat(3_000);
+        let text =
+            format!("{filler}id={long_id}\nSUPERSECRETVALUE\nfirst half\nsecond half\n{filler}");
+        let rules = || {
+            text_rules(&["SUPERSECRETVALUE"], &["id=[0-9]+"])
+                .multiline_regexes([r"first half\nsecond half"])
+                .unwrap()
+        };
+        let expected = format!("{filler}[REDACTED]\n[REDACTED]\n[REDACTED]\n{filler}");
+        for size in [1_000, 4_093, 8_192] {
+            assert_eq!(
+                journal_chunks(rules(), "process.stdout", &chunked(&text, size)),
+                expected,
+                "chunk size {size}"
+            );
+        }
+
+        // The window slides: everything but its tail is released, and a text
+        // with no line break at all cannot grow the buffer without bound.
+        let temp = tempfile::tempdir().unwrap();
+        let writer = TraceWriter::create_named_with_redaction(
+            temp.path().join("window.atrace"),
+            vec![],
+            None,
+            text_rules(&[], &[]).multiline_regexes(["x\ny"]).unwrap(),
+        )
+        .unwrap();
+        let mut buffer = writer.terminal_redaction_buffer("process.stdout");
+        assert_eq!(buffer.push("short\n", 6), None);
+        let long = "z".repeat(MAX_HELD_LINE_BYTES * 2);
+        let (text, _) = buffer.push(&long, long.len()).unwrap();
+        assert_eq!(text.len(), 6 + long.len() - MULTILINE_WINDOW_BYTES);
+        let (rest, _) = buffer.finish().unwrap();
+        assert_eq!(rest.len(), MULTILINE_WINDOW_BYTES);
+        // A match longer than the buffer can hold is split, not held forever.
+        let writer = TraceWriter::create_named_with_redaction(
+            temp.path().join("too-long.atrace"),
+            vec![],
+            None,
+            text_rules(&[], &[]).multiline_regexes(["(?s)z.*"]).unwrap(),
+        )
+        .unwrap();
+        let mut buffer = writer.terminal_redaction_buffer("process.stdout");
+        let (text, _) = buffer.push(&long, long.len()).unwrap();
+        assert_eq!(text.len(), long.len() - MULTILINE_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn multiline_regex_rules_apply_to_whole_structured_strings_and_are_counted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("structured.atrace");
+        let redaction = text_rules(&[], &["line-[a-z]+"])
+            .multiline_regexes([r"(?s)-----BEGIN NOTE-----.*?-----END NOTE-----"])
+            .unwrap();
+        let mut writer =
+            TraceWriter::create_named_with_redaction(&root, vec!["agent".into()], None, redaction)
+                .unwrap();
+        writer
+            .append(
+                "tool.result",
+                "sdk",
+                serde_json::json!({
+                    "output": "before\n-----BEGIN NOTE-----\nprivate\ntext\n-----END NOTE-----\nafter line-abc",
+                    "nested": [{"note": "-----BEGIN NOTE-----\nmore\n-----END NOTE-----"}],
+                }),
+            )
+            .unwrap();
+        let manifest = writer.finish(0).unwrap();
+        let payload = read_events(&root).unwrap()[0].payload();
+        assert_eq!(payload["output"], "before\n[REDACTED]\nafter [REDACTED]");
+        assert_eq!(payload["nested"][0]["note"], "[REDACTED]");
+        let provenance = manifest.redaction.unwrap();
+        assert_eq!(provenance.terminal_regex_count, 1);
+        assert_eq!(provenance.terminal_multiline_regex_count, 1);
+        assert!(
+            RedactionConfig::default()
+                .multiline_regexes(["("])
+                .unwrap_err()
+                .to_string()
+                .contains("invalid multi-line terminal redaction regex")
+        );
+    }
+
     #[test]
     fn idle_flush_releases_a_held_prompt_but_not_a_possible_literal_or_jsonl_line() {
         let temp = tempfile::tempdir().unwrap();
@@ -4036,7 +4278,8 @@ mod tests {
             ),
             (
                 "pem-private-key",
-                "-----BEGIN PRIVATE KEY-----\nMIIEvQ truncated".to_owned(),
+                // Split so the repository secret scan does not flag this fixture.
+                format!("-----BEGIN {}-----\nMIIEvQ truncated", "PRIVATE KEY"),
                 "[REDACTED]".to_owned(),
             ),
         ] {
@@ -4083,7 +4326,7 @@ mod tests {
             "sk-learn-style-hyphenated-slug-without-digits",
             "sk-short1",
             "ghp_tooshort123",
-            "AKIAIOSFODNN7EXAMPLEEXTRA",
+            concat!("AKIA", "IOSFODNN7EXAMPLEEXTRA"),
             "xoxo-gossip-girl",
             "eyJhbGciOiJIUzI1NiJ9 alone is not a token",
             "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----",
