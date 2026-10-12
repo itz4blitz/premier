@@ -14,7 +14,7 @@ Commands:
   demo     Generate a rich local multi-agent trace for product evaluation and onboarding
   emit     Emit a typed agent event to the active local collector (`PREMIER_COLLECTOR_*`)
   verify   Verify a finalized trace's digest, event chain, manifest seal, and signature. Without a signature a trace is only internally consistent (docs/trace-format.md)
-  keygen   Generate an Ed25519 signing key: writes the private key (mode 0600) and `<output>.pub`, and prints the public key
+  keygen   Generate an Ed25519 signing key: writes the private key (mode 0600) and `<output>.pub`, and prints the public key. With --encryption, generate a trace encryption key file for --key-file instead
   sign     Sign (or re-sign) the manifest seal of an already finalized trace
   recover  Safely finalize an abandoned active trace, discarding only a torn trailing frame
   claim    Atomically claim a legacy/local trace for a tenant
@@ -29,7 +29,7 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
   -h, --help             Print help
   -V, --version          Print version
 ```
@@ -81,7 +81,7 @@ trace encryption key file:
   or others.
 
 ```sh
-( umask 077 && openssl rand -hex 32 > ~/.premier-trace.key )
+premier keygen --encryption ~/.premier-trace.key
 premier --key-file ~/.premier-trace.key record -- ./agent run
 premier verify run.atrace --key-file ~/.premier-trace.key
 ```
@@ -126,7 +126,7 @@ Arguments:
 
 Options:
       --key-file <PATH>
-          Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+          Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
   -o, --output <OUTPUT>
           
       --name <NAME>
@@ -171,7 +171,7 @@ Everything after `--` is the command. Options must come before it.
 
 | Option | Notes |
 | --- | --- |
-| `-o, --output` | Trace directory to create. Default `.premier/traces/trace-<unix-milliseconds>.atrace`. Parent directories are created. Recording fails if the path already exists. |
+| `-o, --output` | Trace directory to create. Default `.premier/traces/trace-<unix-milliseconds>-<8 random hex digits>.atrace`. Parent directories are created. The directory is created exclusively: recording fails if the path already exists, and recorders started at the same instant never share one (a default name that is taken is drawn again). |
 | `--name` | Run name. The redaction rules apply to it. |
 | `--tenant` | 1-128 ASCII letters, digits, `.`, `_`, or `-`. Default `local`. `--open` is rejected for any tenant other than `local`. |
 | `--open` | After the trace is finalized, serve the viewer for this one trace on `--bind` and open a browser. Skipped when the recorder received a stop signal. `--viewer-dir` and `--bind` only matter with `--open`. |
@@ -197,7 +197,21 @@ What `record` does:
 4. When the command exits, appends `process.exit`, stops the collector,
    finalizes the trace (journal digest, event chain head, manifest seal, and
    the signature when a signing key is configured), and prints the trace id and
-   path to stderr.
+   path to stderr, followed by how the trace is protected.
+
+The end-of-run summary on stderr states whether the trace was written
+encrypted and whether it was signed, so a mistyped key variable cannot pass
+for an encrypted recording:
+
+```text
+trace 01a130f4-155e-7a93-be43-f59312098b92 → a.atrace
+protection: NOT encrypted (plaintext on disk; pass --key-file to encrypt); unsigned (pass --sign-key for tamper evidence)
+next: premier open a.atrace
+```
+
+With both keys the line reads
+`protection: encrypted at rest (key sha256:...); signed (key sha256:...)`,
+naming the trace key id and the signing key fingerprint.
 
 A descendant that keeps the output pipe open does not block finalization.
 After the command exits, the recorder keeps reading until the stream has been
@@ -265,6 +279,10 @@ them to the command, waits for it to exit, and finalizes the trace.
   command. A recorder that is not in the foreground (a background job, a
   supervisor, CI) relays `kill -INT` normally.
 
+With `--open`, the viewer that starts after the recording stops on Ctrl-C or
+SIGTERM like `premier serve` does (see [`serve`](#serve)); SIGHUP and Ctrl-\
+end it.
+
 The npm launcher adds its own forwarding layer; see
 [packages/premier-cli/README.md](../packages/premier-cli/README.md).
 
@@ -311,10 +329,23 @@ that need a terminal.
   (`stream: "pty"`). The manifest gains the `terminal.pty` and
   `terminal.merged-output` capabilities, and `session.start` records
   `capture_mode: "pty"` and the terminal size.
-- The terminal size is read once at start from the recorder's terminal, falling
-  back to `LINES` / `COLUMNS` and then 24x80.
+- The terminal size is read at start from the recorder's terminal, falling
+  back to `LINES` / `COLUMNS` and then 24x80. When the recorder's terminal is
+  resized (SIGWINCH), the PTY is resized to match and a `process.resize` event
+  (source `premier`) records the new `rows`, `cols`, `pixel_width`, and
+  `pixel_height`. A recorder with no terminal of its own never resizes.
 - When stdin is a terminal the recorder puts it in raw mode for the duration
   and restores it afterwards.
+- When stdin is redirected (a pipe or a file), its bytes are forwarded to the
+  command and then the end of input is signalled the way a terminal does it,
+  with the end-of-file character (Ctrl-D), so `printf 'x\n' | premier record
+  --pty -- cat` finishes. The PTY's input echo is switched off in this case,
+  so forwarded input is not copied into the captured output. Two limits come
+  from the terminal itself: a command that has put its terminal in raw mode
+  reads the end-of-file character as a byte, and a single input line longer
+  than the terminal's line buffer (1024 bytes on macOS, 4096 on Linux) is
+  not delivered whole. Use pipe capture (no `--pty`) to feed a command
+  arbitrary input.
 - Native adapters do not run under `--pty`. `--adapter auto` records terminal
   output only, and naming an adapter explicitly together with `--pty` is an
   error. When `auto` would have activated an adapter for the command, the
@@ -331,7 +362,7 @@ Generate a rich local multi-agent trace for product evaluation and onboarding
 Usage: premier demo [OPTIONS]
 
 Options:
-      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
   -o, --output <OUTPUT>  [default: .premier/traces/multi-agent-demo.atrace]
   -h, --help             Print help
 ```
@@ -343,7 +374,12 @@ join. Nothing is executed.
 `--output` replaces an existing directory only when it is recognisably a
 Premier trace: its `manifest.json` parses as a trace manifest and it contains
 nothing but trace files. Anything else, a symlink, the current directory, or
-an ancestor of the current directory is refused.
+an ancestor of the current directory is refused. A trace that is being
+recorded is refused too (`refusing to replace <path>: it is being recorded
+right now`), judged from its recorder lease as described under
+[`recover`](#abandoned-traces-and-recover); so is an unfinalized trace with no usable lease that
+was written to less than 300 seconds ago. A finalized trace, or one whose
+recorder is gone, is replaced without confirmation.
 
 ## `emit`
 
@@ -354,8 +390,8 @@ Emit a typed agent event to the active local collector (`PREMIER_COLLECTOR_*`)
 Usage: premier emit [OPTIONS]
 
 Options:
-      --json <JSON>                Full JSON event body. Use `-` to read from stdin
-      --key-file <PATH>            Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --json <JSON>                Full JSON event body. Use `-` to read from stdin. The body is sent as given, so it cannot be combined with the field options
+      --key-file <PATH>            Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --kind <KIND>                Event kind (e.g. agent.spawn, model.response, tool.execution)
       --actor <ACTOR>              Actor identity for this event
       --actor-type <ACTOR_TYPE>    [default: agent]
@@ -375,10 +411,12 @@ echo '{"kind":"agent.message","actor_id":"a","status":"ok","payload":{}}' | prem
 - Requires `PREMIER_COLLECTOR_URL` and `PREMIER_COLLECTOR_TOKEN`, which
   `premier record` sets for the recorded process. Outside a recording `emit`
   exits `1`.
-- Provide `--json` or `--kind`. With `--json` the body is sent as given and the
-  other flags are ignored. The flags cannot set `parent_event_id`,
-  `correlation_id`, `links`, `duration_ms`, or `timestamp`; use `--json` for
-  those.
+- Provide `--json` or `--kind`. With `--json` the body is sent as given, and
+  combining it with a field option (`--kind`, `--actor`, `--actor-type`,
+  `--span`, `--parent-span`, `--status`, `--payload`, `--source`) is a usage
+  error (exit `2`) rather than the option being ignored. The flags cannot set
+  `parent_event_id`, `correlation_id`, `links`, `duration_ms`, or
+  `timestamp`; use `--json` for those.
 - On success prints the new event id and exits `0`.
 - Exits `1` when the collector is unreachable, does not answer in time, or
   rejects the event. The message includes the HTTP status and response body.
@@ -407,7 +445,7 @@ Arguments:
   <TRACE>  
 
 Options:
-      --key-file <PATH>           Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>           Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --public-key <PATH-OR-HEX>  Require a valid signature by this Ed25519 public key (64 hex characters, or a file containing them)
   -h, --help                      Print help
 ```
@@ -504,7 +542,7 @@ event. See [trace-format.md](trace-format.md#signature).
 
 ```text
 $ premier keygen --help
-Generate an Ed25519 signing key: writes the private key (mode 0600) and `<output>.pub`, and prints the public key
+Generate an Ed25519 signing key: writes the private key (mode 0600) and `<output>.pub`, and prints the public key. With --encryption, generate a trace encryption key file for --key-file instead
 
 Usage: premier keygen [OPTIONS] <OUTPUT>
 
@@ -512,7 +550,8 @@ Arguments:
   <OUTPUT>  Private key file to create. Must not already exist
 
 Options:
-      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --encryption       Write a 256-bit trace encryption key (64 hex characters, mode 0600) from the system random number generator, for --key-file / PREMIER_TRACE_KEY_FILE. There is no public half
+      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
   -h, --help             Print help
 ```
 
@@ -532,6 +571,19 @@ fingerprint: sha256:6f993d9bfe2cbf04ba8e18f506675153
 - The fingerprint is `sha256:` followed by the first 16 bytes of the SHA-256
   of the raw public key, in hex. `verify`, `sign`, the API, and the viewer
   identify a signer by it.
+- `premier keygen --encryption <output>` writes a trace encryption key
+  instead: 256 bits from the system random number generator as 64 hexadecimal
+  characters, mode `0600`, for `--key-file` / `PREMIER_TRACE_KEY_FILE`. It
+  prints the key id (the `key_id` an encrypted manifest carries), never the
+  key, and also fails if the file exists. There is no public half, and a
+  trace encrypted with a key that is lost cannot be read.
+
+  ```text
+  $ premier keygen --encryption trace.key
+  wrote trace encryption key to trace.key (owner-only); keep it secret and backed up: traces encrypted with it cannot be read without it
+  key id: sha256:7c1f0d5e9a3b48626f1d2c3b4a59687a
+  use it with: premier --key-file trace.key record -- <command>
+  ```
 - A private key file that is accessible by group or others is refused by every
   command that loads it: `signing key file must not be accessible by group or
   other users`.
@@ -546,7 +598,7 @@ Arguments:
   <TRACE>  
 
 Options:
-      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --sign-key <PATH>  [env: PREMIER_SIGN_KEY_FILE=]
   -h, --help             Print help
 ```
@@ -587,7 +639,7 @@ Arguments:
 
 Options:
       --key-file <PATH>
-          Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+          Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --stale-after-seconds <STALE_AFTER_SECONDS>
           Minimum journal idle time required before recovery [default: 300]
       --force
@@ -630,7 +682,12 @@ The viewer shows it as abandoned.
 
 `premier recover <trace>` decides as follows:
 
-1. A finalized trace is refused: `trace is already finalized`.
+1. A finalized trace is never rewritten. If a finalization was interrupted
+   after it committed the manifest, its working files (`events/active.events.pb`,
+   `recorder.lease`, and temporary files) are still there: when the trace
+   verifies, `recover` removes them and says so; when it does not verify they
+   are left alone and the command fails. With nothing left over it fails with
+   `trace is already finalized`.
 2. With `--force`, recovery proceeds.
 3. If the lease names a live recorder (same rule as above), recovery is
    refused: `trace is still being recorded by process <pid>; stop that
@@ -645,14 +702,35 @@ The viewer shows it as abandoned.
 Recovery keeps every complete event, discards a torn trailing frame, and
 appends one `session.interrupted` event (source `premier-recovery`, status
 `error`) whose payload records `reason: "recorder_interrupted"`,
-`recovered_event_count`, and `discarded_trailing_bytes`. The manifest gets
-`termination.kind: "interrupted"` and `exit_code: 130`. The real exit status
-of the command is unknown and is not invented.
+`recovered_event_count`, `discarded_trailing_bytes`, `exit_recorded`, and
+`last_activity_at`.
 
-For a version 2 trace, recovery first checks the event chain over the complete
-frames and refuses a journal whose chain is broken (`cannot recover: the
-active journal failed chain verification`). The recovered trace is sealed with
+**Exit status.** A recorder journals `process.exit` (or
+`process.spawn_failed`) before it finalizes, so a recorder killed in between
+leaves the command's real exit status in the journal. When the kept events
+hold it, the manifest gets that `termination` and `exit_code`,
+`exit_recorded` is `true`, and `recover` prints `the command's exit was
+already recorded (process.exit); the trace keeps that exit status`.
+Otherwise the exit status is unknown and is not invented: the manifest gets
+`termination.kind: "interrupted"` and `exit_code: 130`.
+
+**Times.** The manifest's `ended_at` is when the abandoned recording was last
+written to (the newer of the journal's and the lease's modification time),
+also stored as `last_activity_at`, not when it was recovered. The time of the
+recovery is the timestamp of the `session.interrupted` event.
+
+**Repeating a recovery.** `recover` can be run again after it was itself
+interrupted. If it had already rewritten the journal, the
+`session.interrupted` event it appended is reused rather than a second one
+being added. If the active journal is gone but the compressed journal of an
+interrupted finalization is there, recovery continues from that.
+
+For a version 2 trace the event chain is checked over the complete frames (see
+[Damaged journals](#damaged-journals)). The recovered trace is sealed with
 `seal.recovered: true`, and signed when `PREMIER_SIGN_KEY_FILE` is set.
+`premier verify` adds a note to such a trace: it was finalized by `premier
+recover`, and an unfinalized journal does not commit to its length (see
+[security.md](security.md#what-verification-proves)).
 
 ```text
 $ premier list --trace-dir .
@@ -700,13 +778,18 @@ Arguments:
   <TRACE>  
 
 Options:
-      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>  Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --tenant <TENANT>  
   -h, --help             Print help
 ```
 
 Changes the manifest's `tenant_id` from `local` to `--tenant`. Only a trace
-owned by `local` can be claimed, so a trace can be claimed once. Tenant ids
+owned by `local` can be claimed, so a trace can be claimed once. Only a
+finalized trace can be claimed: a recorder writes its own copy of the manifest
+when it finalizes, which would undo a claim made underneath it, so a trace
+that is still being recorded or was interrupted is refused (`only a finalized
+trace may be claimed`). Let the recorder finish, or run `premier recover`,
+then claim it. Tenant ids
 are 1-128 ASCII letters, digits, `.`, `_`, or `-`. Tenants matter to
 `premier serve --auth-config`; see [security.md](security.md#authentication-and-scopes).
 
@@ -735,7 +818,7 @@ Arguments:
   <TRACE>  
 
 Options:
-      --key-file <PATH>      Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>      Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --new-key-file <PATH>  
       --sign-key <PATH>      Re-sign the re-sealed trace. Without a key an existing signature is dropped [env: PREMIER_SIGN_KEY_FILE=]
   -h, --help                 Print help
@@ -761,6 +844,15 @@ re-sealed and signed with the configured signing key
 (`enc1.atrace` and `enc2.atrace` are two copies of the same signed trace.)
 Both result lines go to stdout.
 
+`encrypt` writes the new copy in a hidden directory beside the trace
+(`.<name>.encrypt-<id>.tmp`), verifies it, and swaps it in, holding the
+previous copy as `.<name>.encrypt-<id>.backup` until the swap is done. If it
+is killed during the swap, run the same `encrypt` command again: it first
+moves the trace back when nothing is at its path, removes the previous copy
+when the swap had completed (that copy may be plaintext), and removes
+unfinished working copies. A backup that is not a copy of the trace now at the
+path is never deleted; the command stops and names it.
+
 The rest is in [security.md](security.md#premier-encrypt).
 
 ## `query`
@@ -775,7 +867,7 @@ Arguments:
   <TRACE>  
 
 Options:
-      --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --kind <KIND>       Exact event kind, matched case-insensitively
       --actor <ACTOR>     Exact actor id, matched case-insensitively
       --status <STATUS>   Exact event status, matched case-insensitively
@@ -821,7 +913,7 @@ Arguments:
   <TRACE>  
 
 Options:
-      --key-file <PATH>             Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>             Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
   -o, --output <OUTPUT>             Destination JSON file. Omit to write JSON to stdout
       --no-default-secret-patterns  Do not apply the built-in secret value patterns (API keys, bearer credentials, URL passwords, private key blocks, JWTs) to structured event payloads and the recorded command line
       --redact-known-secrets        Also apply the built-in secret value patterns to captured terminal output, which is otherwise exported as recorded
@@ -865,7 +957,7 @@ Arguments:
 
 Options:
       --json              Emit the complete structural comparison as JSON
-      --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --allow-unverified  Compare finalized traces even though one fails `premier verify`
   -h, --help              Print help
 ```
@@ -895,8 +987,8 @@ Arguments:
   <TRACE>  
 
 Options:
-      --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
-      --speed <SPEED>     Playback speed multiplier (for example 2 replays twice as fast) [default: 1]
+      --key-file <PATH>   Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --speed <SPEED>     Playback speed multiplier (for example 2 replays twice as fast), at least 0.001 [default: 1]
       --no-sleep          Emit evidence immediately while preserving recorded order
       --allow-unverified  Replay a finalized trace even though it fails `premier verify`
   -h, --help              Print help
@@ -904,7 +996,8 @@ Options:
 
 Prints each recorded event as one JSON line on stdout, in sequence order,
 sleeping between events for the recorded gap divided by `--speed`. It runs no
-command, tool, or model. `--speed` must be a positive finite number.
+command, tool, or model. `--speed` must be a finite number of at least
+`0.001`; anything smaller, zero, or negative is a usage error (exit `2`).
 
 **Gap cap.** A recorded gap longer than 10 seconds is replayed as 10 seconds.
 The cap is applied before `--speed`, so at `--speed 2` the longest wait is 5
@@ -935,7 +1028,7 @@ List traces in a directory
 Usage: premier list [OPTIONS]
 
 Options:
-      --key-file <PATH>        Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>        Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --trace-dir <TRACE_DIR>  [default: .premier/traces]
   -h, --help                   Print help
 ```
@@ -945,20 +1038,29 @@ name (or the command line when there is no name), followed by `[recording]`
 or `[abandoned: ...]` for a trace that is not finalized. A missing directory
 prints nothing and exits `0`.
 
-An encrypted trace that cannot be opened is still listed, after the readable
-ones, from the public part of its manifest. Its name and command are
-encrypted, so the directory name stands in for them:
+A trace that cannot be opened is still listed, after the readable ones, from
+whatever its manifest shows. Its name and command are encrypted or
+unreadable, so the directory name stands in for them, and the bracket says
+why it could not be opened. Start times are printed the same way in every
+row:
 
 ```text
 $ premier list --trace-dir traces
 01a130a6-5150-7631-b059-e864addfee77  2026-10-12 15:06:08.597934 UTC  sh -c echo hi
-01a130a6-51e5-7a93-bfc3-9903396ca127  2026-10-12T15:06:08.744965Z  enc2.atrace  [encrypted: key required]
+01a130a6-51e5-7a93-bfc3-9903396ca127  2026-10-12 15:06:08.744965 UTC  enc2.atrace  [encrypted: key required]
+0196f000-0000-7000-8000-00000000f009  2026-05-04 03:02:01 UTC  future.atrace  [needs a newer premier: format version 9]
+unknown  unknown  torn.atrace  [unreadable: EOF while parsing a string at line 1 column 28]
 ```
 
-`[encrypted: key required]` means no key file was configured. When one was
-configured but does not open the trace, the bracket holds the reason instead,
-for example `[encrypted: trace decryption failed: wrong key]`. Other
-directories whose manifest cannot be read are skipped.
+| Bracket | Meaning |
+| --- | --- |
+| `[encrypted: key required]` | The trace is encrypted and no key file was configured. When one was configured but does not open the trace, the bracket holds the reason instead, for example `[encrypted: trace decryption failed: wrong key]`. |
+| `[needs a newer premier: format version N]` | The trace was written in a later format than this build reads. It is not damaged. |
+| `[unreadable: ...]` | `manifest.json` exists but cannot be read as a trace manifest; the error follows. |
+
+A directory with no `manifest.json` is not a trace and is not listed. `list`
+shows the traces of every tenant: it reads the directory, and whoever can do
+that can read the manifests.
 
 ## `open`
 
@@ -972,7 +1074,7 @@ Arguments:
   [TRACE]  
 
 Options:
-      --key-file <PATH>          Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>          Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --trace-dir <TRACE_DIR>    [default: .premier/traces]
       --viewer-dir <VIEWER_DIR>  Optional disk viewer (for local UI development). Default: embedded viewer
       --bind <BIND>              [default: 127.0.0.1:4317]
@@ -981,7 +1083,11 @@ Options:
 ```
 
 Starts the viewer server, prints its URL, and opens a browser. It runs until
-interrupted.
+it is asked to stop: on Ctrl-C (SIGINT) or SIGTERM it stops accepting
+connections, lets requests in flight finish, drops whatever is still open
+after 2 seconds (an event stream of a live trace, for example), prints
+`premier: viewer stopped` to stderr, and exits `0`. The same applies to
+`serve` and to the viewer `record --open` starts.
 
 - `premier open` serves every trace in `--trace-dir`.
 - `premier open <trace>` serves only that trace. Other traces in the same
@@ -1003,7 +1109,7 @@ Serve the viewer locally or to an authenticated team
 Usage: premier serve [OPTIONS]
 
 Options:
-      --key-file <PATH>            Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (for example from `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
+      --key-file <PATH>            Trace encryption key file, used to write new traces encrypted and to read encrypted ones. The file holds one 256-bit key as exactly 64 hex characters (from `premier keygen --encryption`, or for example `openssl rand -hex 32`) and must be readable only by its owner (mode 0600) [env: PREMIER_TRACE_KEY_FILE=]
       --trace-dir <TRACE_DIR>      [default: .premier/traces]
       --viewer-dir <VIEWER_DIR>    Optional disk viewer (for local UI development). Default: embedded viewer
       --bind <BIND>                [default: 127.0.0.1:4317]
@@ -1046,8 +1152,8 @@ Every trace entry carries:
 
 | Field | Values |
 | --- | --- |
-| `integrity` | `live` (being recorded), `abandoned` (not finalized and the recorder is gone), `verified` (finalized and passed every check its format version supports), `invalid` (failed verification, or its manifest cannot be read), `locked` (encrypted and the server has no key that opens it). |
-| `integrity_detail` | A sentence for `abandoned`, `invalid`, and `locked`. Absent otherwise. |
+| `integrity` | `live` (being recorded), `abandoned` (not finalized and the recorder is gone), `verified` (finalized and passed every check its format version supports), `invalid` (failed verification, or its manifest cannot be read), `locked` (encrypted and the server has no key that opens it), `unsupported` (written in a later trace format than this server reads; it needs a newer Premier and nothing says it is damaged). |
+| `integrity_detail` | A sentence for `abandoned`, `invalid`, `locked`, and `unsupported`. Absent otherwise. |
 | `integrity_protection` | Present for `verified` only: `digest_only` (version 1), `sealed` (version 2, unsigned), or `signed`. |
 | `integrity_signer` | Present for `signed` only: the fingerprint of the public key stored in the trace. |
 
@@ -1066,6 +1172,17 @@ real path.
 A locked trace is listed with `trace_id` `locked:<directory name>`, the public
 `encryption` envelope, and an `integrity_detail` that says whether no key was
 configured or the configured key does not open it.
+
+A trace in a later format is listed with `trace_id`
+`unsupported:<directory name>` and an `integrity_detail` that names its format
+version and the versions this build reads. Like a locked or damaged entry it
+is shown to the `local` tenant only, and has no events to fetch.
+
+The `diagnostics` of a finalized trace are computed from its events by the
+server's own validator each time the trace is read, so an older trace is
+judged by the current rules. Only the entries a validator cannot derive
+(`journal.write_failed`, `journal.recovery_discarded`) are taken from the
+manifest. `premier verify` does the same.
 
 ### Paged events
 
@@ -1087,7 +1204,7 @@ being recorded).
 | Event | Data | Sent |
 | --- | --- | --- |
 | `trace.event` | One event. | For each event in the journal, then for each new event as it is recorded. |
-| `trace.complete` | The trace entry, as `GET /api/traces/{trace_id}` returns it. | Once, when the trace is finalized by its recorder or by `premier recover`. The stream then closes. |
+| `trace.complete` | The trace entry, as `GET /api/traces/{trace_id}` returns it. | Once, when the trace is finalized by its recorder or by `premier recover`. The stream then closes. If the finalized trace cannot be read back at that moment, the entry is still sent, with `integrity: "invalid"`, so the stream never closes without a terminal event once the trace is finalized. |
 | `trace.abandoned` | The trace entry, with `integrity: "abandoned"`. | Once, when the recorder is gone and the trace is not finalized. The stream then closes. |
 
 - `?after_sequence=<n>` skips events whose sequence is `n` or lower, so a
@@ -1105,7 +1222,7 @@ being recorded).
 | --- | --- |
 | `400` | The trace id contains `/` or `\`, or is `.` or `..`; or `limit` is out of range. |
 | `404` | No served trace has that id, the trace belongs to another tenant, or the trace directory does not exist. |
-| `500` | The trace directory exists but cannot be read. The error message is `cannot read the trace directory`; the path is logged on the server and not sent to the client. |
+| `500` | The trace directory exists but cannot be read (`cannot read the trace directory`), or anything else failed inside the server (`internal error; see the premier server log`). The detail, which can name server-side paths, is logged on the server and never sent to the client. |
 
 Error bodies are `{"error": "<message>"}`.
 
@@ -1119,6 +1236,7 @@ Error bodies are `{"error": "<message>"}`.
 | `integrity failed` | `integrity` is `invalid`. |
 | An abandoned state with the recover command | `integrity` is `abandoned`, in the list or from a `trace.abandoned` event while the trace is open. |
 | `Encrypted · key required` and a `Locked` badge in the trace list | `integrity` is `locked`. |
+| `Needs a newer Premier` and a `Newer format` badge in the trace list | `integrity` is `unsupported`. |
 
 When the listed state of the open trace changes (it was recovered, finalized,
 or is being recorded again), the viewer reloads its manifest and events and

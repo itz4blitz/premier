@@ -352,9 +352,10 @@ own `agent.result`:
   `permission_denials`, because the event is derived from a list rather than
   from a line of its own; `payload.native` is the list entry.
 
-No `approval.request` is invented for it. The trace's diagnostics therefore
-include `missing_lifecycle_start` for such a decision: the request really is
-absent from the stream.
+No `approval.request` is invented for it: the request really is absent from
+the stream. Because the decision is marked `synthesized`, the validator does
+not report the missing request as `missing_lifecycle_start`; a decision that
+is not marked as inferred and has no request still is.
 
 ### Tool pairing
 

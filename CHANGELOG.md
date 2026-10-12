@@ -8,6 +8,42 @@ integrations may depend on.
 
 ### Added
 
+- `premier record` ends with a `protection:` line on stderr saying whether
+  the trace was written encrypted (with the key id) and whether it was signed
+  (with the signer's fingerprint), so a mistyped key variable no longer
+  passes for an encrypted recording.
+- `premier keygen --encryption <path>` writes a trace encryption key file
+  (256 bits from the system random number generator, mode `0600`) for
+  `--key-file`.
+- `premier record --pty` follows resizes of the recorder's terminal: the PTY
+  is resized on SIGWINCH and a `process.resize` event records the new size.
+- `premier record --pty` with redirected stdin now ends the command's input
+  when the pipe or file ends (and no longer echoes forwarded input into the
+  captured output), so `printf 'x\n' | premier record --pty -- cat` finishes.
+- Captured output that is not valid UTF-8 is marked: the event gets
+  `lossy: true` and `replaced_sequences`. The stored text still has U+FFFD
+  in place of each invalid sequence, and the raw bytes are not kept.
+- `premier open`, `premier serve`, and the viewer of `record --open` stop on
+  Ctrl-C and SIGTERM: in-flight requests finish, open connections are dropped
+  after 2 seconds, and the exit status is `0`.
+- `premier list` shows every trace it cannot open, with the reason:
+  `[needs a newer premier: format version N]` or `[unreadable: ...]`, beside
+  the existing `[encrypted: ...]`. The viewer API reports a trace in a later
+  format as `integrity: "unsupported"` instead of as damaged.
+- `premier recover` on an already finalized trace removes the working files
+  an interrupted finalization left behind, once the trace verifies. It can
+  also be repeated after being interrupted itself, and continues from the
+  compressed journal when the active journal is gone.
+- `premier encrypt` puts right what an earlier `encrypt` killed during its
+  final swap left behind: it moves the trace back when nothing is at its
+  path and removes the superseded (possibly plaintext) copy.
+- The collector records the first request of a recording that arrives
+  without its token as a `collector.unauthorized` event, and delays each
+  further refusal in a row (100 ms steps, at most 1 second).
+- `premier verify` notes when a trace was finalized by `premier recover`.
+- Manifest fields a build does not know are kept when a command rewrites the
+  manifest, and are covered by the seal.
+
 - `premier verify --live` checks an unfinalized trace's frames and hash chain
   without modifying it.
 - `premier recover --sign-key` signs a recovered trace.
@@ -153,6 +189,50 @@ integrations may depend on.
 - Reference documentation under `docs/`.
 
 ### Changed
+
+- **Default trace directory name.** `premier record` without `--output` now
+  writes `.premier/traces/trace-<unix-milliseconds>-<8 random hex digits>.atrace`
+  (was `trace-<unix-milliseconds>.atrace`), and every trace directory is
+  created exclusively, so recorders started in the same instant can no
+  longer end up in one directory.
+- **Collector request bodies are checked more strictly.** A body that is not
+  a JSON object is rejected with `400` (an array used to be read
+  positionally), and so is an unknown top-level field (it used to be
+  ignored). `trace_id` and `run`, which the SDKs send, are accepted; a
+  `trace_id` naming another trace is rejected with `409`.
+- The collector token is 256 bits from the system random number generator
+  (64 hex characters), no longer a time-ordered UUID from the generator that
+  also produces the public event ids.
+- `premier emit --json` together with `--kind`, `--actor`, or another field
+  option is a usage error. The options used to be ignored.
+- `premier recover` uses the exit status the recorder journaled
+  (`process.exit`) when the kept events hold it, instead of always stamping
+  `interrupted` / `130`. The manifest's `ended_at` is the time the abandoned
+  recording was last written to, not the time of the recovery; the
+  `session.interrupted` payload gains `exit_recorded` and
+  `last_activity_at`.
+- `premier claim` refuses a trace that is not finalized. A claim made while
+  the recorder was running reported success and was undone when the recorder
+  finalized.
+- `premier demo --output` refuses to replace a trace that is being recorded.
+- `premier verify` and the viewer API report the diagnostics of the reading
+  build's validator over the events, keeping only the `journal.*` entries
+  from the manifest, instead of the list stored at finalization.
+- Lifecycle validation pairs a finish with the start it names
+  (`parent_event_id`, `links`), never with a start recorded after it, and
+  otherwise with the most recent start still open rather than the first
+  one. A synthesized `approval.decision` (`payload.synthesized: true`) no
+  longer raises `missing_lifecycle_start`. A status is compared without
+  surrounding whitespace.
+- `premier replay --speed` must be at least `0.001`.
+- `premier list` prints the start time of a trace it cannot open in the same
+  form as every other row.
+- A bearer credential's `tenant_id` may no longer contain `@`, matching the
+  rule for trace tenants.
+- Viewer API: an unclassified server error is answered with
+  `{"error": "internal error; see the premier server log"}`; the detail is
+  logged, not sent. A collector journal failure is answered with
+  `the event could not be recorded`.
 
 - **Breaking:** in `premier export` output the `redaction` block now follows
   `events`.
@@ -318,6 +398,15 @@ integrations may depend on.
 
 ### Fixed
 
+- `premier replay` no longer panics on a very small `--speed`.
+- The viewer event stream of a finalized trace always ends with
+  `trace.complete`, also when the trace cannot be read back at that moment.
+- A recorder that loses the race for a trace directory fails before it
+  writes anything, instead of overwriting the winner's manifest.
+- Finalization, recovery, and `encrypt` sync the containing directory after
+  each rename, and the durability of a trace is documented in
+  [docs/trace-format.md](docs/trace-format.md#layout).
+
 - A collector client that left a request half-sent could keep `premier
   record` from finalizing its trace.
 - `premier replay` slept for the full length of any recorded gap, however
@@ -350,6 +439,13 @@ integrations may depend on.
   matches the release workflow.
 
 ### Security
+
+- The local assistant CLI no longer inherits `PREMIER_SIGN_KEY_FILE`.
+- Documented a limit of encrypted traces: someone without the key who kept
+  a copy of a manifest written during recording can roll a finalized trace
+  back to what looks like an interrupted recording, which `premier recover`
+  then finalizes, marked `seal.recovered`. See
+  [docs/security.md](docs/security.md#encrypted-traces).
 
 - An edit to a manifest field, or to the order or content of events, now
   fails `premier verify`. Detecting a deliberate rewrite still requires a

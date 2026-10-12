@@ -120,6 +120,20 @@ impl EncryptionKey {
     }
 }
 
+/// 256 bits from the operating system's random number generator, as 64
+/// lowercase hexadecimal characters: the content of a trace key file, and
+/// the form of the collector token.
+pub fn random_secret_hex() -> Result<String> {
+    use rand::TryRngCore;
+    let mut bytes = [0_u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("the system random number generator failed: {error}"))?;
+    let hex = hex_prefix(&bytes, bytes.len());
+    bytes.zeroize();
+    Ok(hex)
+}
+
 pub(crate) fn key_from_environment() -> Result<Option<EncryptionKey>> {
     KEY_FILE_OVERRIDE
         .get()

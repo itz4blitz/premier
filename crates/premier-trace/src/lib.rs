@@ -6,7 +6,9 @@ mod seal;
 mod structured;
 mod utf8;
 
-pub use crypto::{EncryptionKey, KEY_FILE_ENV, key_file_configured, set_key_file};
+pub use crypto::{
+    EncryptionKey, KEY_FILE_ENV, key_file_configured, random_secret_hex, set_key_file,
+};
 pub use integrity::{IntegrityReport, IntegrityStatus, assess_integrity};
 pub use journal::{ActiveCursor, EventStream, JournalEnd, JournalIndex};
 pub use output::prepare_trace_output;
@@ -15,7 +17,7 @@ pub use seal::{
     SigningKey, verify_tamper_evidence,
 };
 pub use structured::{RedactionCounts, SecretRedactor};
-pub use utf8::{decode_utf8_chunk, finish_utf8};
+pub use utf8::{decode_utf8_chunk, decode_utf8_chunk_lossy, finish_utf8, finish_utf8_lossy};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -255,6 +257,13 @@ pub struct TraceManifest {
     /// every event frame are XChaCha20-Poly1305 ciphertext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<EncryptionMetadata>,
+    /// Manifest fields this build does not know, kept so that a command that
+    /// rewrites the manifest (claim, sign, encrypt, recover) does not drop
+    /// what a later build of the same format version added. They are part
+    /// of the seal input like every other field. In an encrypted trace they
+    /// are written back inside the ciphertext.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -283,6 +292,9 @@ struct PrivateManifest {
     /// inside the ciphertext. Absent in version 1 envelopes.
     #[serde(default)]
     seal: Option<ManifestSeal>,
+    /// Fields this build does not know; see [`TraceManifest::extra`].
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_tenant_id() -> String {
@@ -1333,20 +1345,12 @@ impl TraceWriter {
         master_key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let tenant_id = tenant_id.trim();
-        if tenant_id.is_empty()
-            || tenant_id.len() > 128
-            || !tenant_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            bail!("tenant id must be 1-128 ASCII letters, digits, '.', '_' or '-'")
-        }
+        validate_tenant_id(tenant_id)?;
         let signing_key = seal::signing_key_from_environment()?;
         let root = root.as_ref().to_path_buf();
-        if root.exists() {
-            bail!("trace path already exists: {}", root.display());
-        }
-        create_private_dir(&root)?;
+        // Exclusive: of two recorders given one path, exactly one gets the
+        // directory and the other fails before it has written anything.
+        create_new_private_dir(&root)?;
         create_private_dir(&root.join("events"))?;
         create_private_dir(&root.join("blobs"))?;
         create_private_dir(&root.join("blobs/sha256"))?;
@@ -1393,9 +1397,14 @@ impl TraceWriter {
                 key_id: master_key.as_ref().expect("master key exists").key_id(),
                 private_manifest: String::new(),
             }),
+            extra: serde_json::Map::new(),
         };
         write_manifest(&root, &manifest, encryption_key.as_ref())?;
         let journal = private_new_file(&root.join("events").join(ACTIVE_JOURNAL))?;
+        sync_dir(&root.join("events"));
+        if let Some(parent) = root.parent() {
+            sync_dir(parent);
+        }
         let chain_head = seal::chain_genesis(&manifest.trace_id);
         Ok(Self {
             root,
@@ -1594,14 +1603,24 @@ pub struct RecoveryReport {
     pub discarded_frames: Option<u64>,
     /// Why the journal was cut where it was; `None` when all of it was kept.
     pub reason: Option<String>,
+    /// The journal already held the recorded command's `process.exit` (or
+    /// `process.spawn_failed`), so the manifest carries that exit status
+    /// instead of the interrupted default.
+    pub journaled_exit: bool,
+    /// Names of the files removed when the trace was already finalized and
+    /// only held what an interrupted finalization left behind. Empty for an
+    /// ordinary recovery.
+    pub removed_leftovers: Vec<String>,
 }
 
-/// What recovery discarded, as it is recorded in the manifest.
+/// What recovery found, as it is recorded in the manifest.
 struct Discarded {
     bytes: u64,
     frames: Option<u64>,
     after_sequence: u64,
     reason: Option<String>,
+    /// When the abandoned recording was last written to.
+    last_activity: Option<DateTime<Utc>>,
 }
 
 /// Finalize an abandoned active trace, keeping the longest prefix of frames
@@ -1616,6 +1635,117 @@ pub fn recover_interrupted_trace(
     Ok(recover_interrupted_trace_with(root, options, signing_key.as_ref())?.manifest)
 }
 
+/// Kind and source of the event recovery appends.
+const RECOVERY_EVENT_KIND: &str = "session.interrupted";
+const RECOVERY_EVENT_SOURCE: &str = "premier-recovery";
+
+/// The exit status a recorder journaled for its command, read back from a
+/// `process.exit` or `process.spawn_failed` event. Both kinds are reserved
+/// for the recorder, so a collector client cannot have written them.
+fn journaled_termination(event: &TraceEvent) -> Option<ProcessTermination> {
+    if !matches!(event.source.as_str(), "command" | "premier") {
+        return None;
+    }
+    let payload = event.payload();
+    let exit_code = payload["exit_code"]
+        .as_i64()
+        .and_then(|code| i32::try_from(code).ok());
+    let signal = payload["signal"]
+        .as_i64()
+        .and_then(|signal| i32::try_from(signal).ok());
+    match (event.kind.as_str(), payload["termination"].as_str()) {
+        ("process.exit", Some("signal")) => Some(ProcessTermination::signaled(
+            signal?,
+            payload["signal_name"].as_str().map(str::to_owned),
+        )),
+        ("process.exit", Some("interrupted")) => Some(ProcessTermination::interrupted()),
+        ("process.exit" | "process.spawn_failed", _) => {
+            Some(ProcessTermination::exited(exit_code?))
+        }
+        _ => None,
+    }
+}
+
+/// Files a finalization (or a recovery) creates on the way and removes once
+/// the manifest is committed, relative to the trace root.
+fn finalization_leftovers() -> [String; 5] {
+    [
+        format!("events/{ACTIVE_JOURNAL}"),
+        format!("events/{ACTIVE_JOURNAL}.recovery.tmp"),
+        format!("events/{FINAL_JOURNAL}.tmp"),
+        RECORDER_LEASE.to_owned(),
+        "manifest.json.tmp".to_owned(),
+    ]
+}
+
+/// Recovery of a trace whose manifest is already committed: nothing is
+/// rewritten. When the finalization that committed it was interrupted before
+/// it removed its working files, and the trace verifies, they are removed.
+fn remove_finalization_leftovers(
+    root: &Path,
+    manifest: TraceManifest,
+    encryption_key: Option<EncryptionKey>,
+) -> Result<RecoveryReport> {
+    let leftovers: Vec<String> = finalization_leftovers()
+        .into_iter()
+        .filter(|name| root.join(name).is_file())
+        .collect();
+    if leftovers.is_empty() {
+        bail!("trace is already finalized")
+    }
+    verify_journal_stream(root, &manifest, encryption_key, |_| {})
+        .status
+        .context(
+            "trace is already finalized but does not verify; the files an interrupted finalization left behind were not removed",
+        )?;
+    for name in &leftovers {
+        fs::remove_file(root.join(name))?;
+    }
+    sync_dir(&root.join("events"));
+    sync_dir(root);
+    let salvaged_events = manifest
+        .journal
+        .as_ref()
+        .map_or(0, |journal| journal.event_count);
+    Ok(RecoveryReport {
+        manifest,
+        salvaged_events,
+        discarded_bytes: 0,
+        discarded_frames: None,
+        reason: None,
+        journaled_exit: false,
+        removed_leftovers: leftovers,
+    })
+}
+
+/// Rebuild the active journal of an unfinalized trace from its compressed
+/// journal. That state is left by a finalization interrupted after it wrote
+/// the compressed journal, when the active journal has since been lost. The
+/// compressed journal holds the same frames, byte for byte.
+fn restore_active_journal(root: &Path) -> Result<()> {
+    let events = root.join("events");
+    let active = events.join(ACTIVE_JOURNAL);
+    let temporary = active.with_extension("pb.recovery.tmp");
+    let restored = (|| -> Result<()> {
+        let mut output = BufWriter::new(private_truncate_file(&temporary)?);
+        zstd::stream::copy_decode(
+            BufReader::new(File::open(events.join(FINAL_JOURNAL))?),
+            &mut output,
+        )?;
+        output.flush()?;
+        output.get_ref().sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = restored {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.context(
+            "trace has no active journal to recover, and its compressed journal cannot be read",
+        ));
+    }
+    fs::rename(&temporary, &active)?;
+    Ok(())
+}
+
 /// [`recover_interrupted_trace`] with an explicit signing key choice, reporting
 /// what was salvaged.
 ///
@@ -1626,6 +1756,18 @@ pub fn recover_interrupted_trace(
 /// The kept frames are copied byte for byte, a `session.interrupted` event
 /// that continues the chain is appended, and what was discarded is recorded
 /// in the seal and as a manifest diagnostic. No event is ever reconstructed.
+///
+/// The manifest's exit status is the one the recorder journaled
+/// (`process.exit`) when the kept frames hold it, and the interrupted default
+/// otherwise. `ended_at` is when the abandoned recording was last written to,
+/// not when it was recovered; the `session.interrupted` event carries the
+/// recovery time as its timestamp.
+///
+/// Recovery can be repeated. A recovery interrupted after it rewrote the
+/// journal is resumed without appending a second `session.interrupted`, and
+/// on a trace that is already finalized it only removes the working files an
+/// interrupted finalization left behind (see
+/// [`RecoveryReport::removed_leftovers`]).
 pub fn recover_interrupted_trace_with(
     root: impl AsRef<Path>,
     options: RecoveryOptions,
@@ -1635,18 +1777,24 @@ pub fn recover_interrupted_trace_with(
     let mut manifest = read_manifest(root)?;
     let encryption_key = required_encryption_key(&manifest)?;
     if manifest.journal.is_some() {
-        bail!("trace is already finalized")
+        return remove_finalization_leftovers(root, manifest, encryption_key);
     }
     let active = root.join("events").join(ACTIVE_JOURNAL);
-    if !active.is_file() {
+    let orphaned_final = root.join("events").join(FINAL_JOURNAL);
+    let journal = if active.is_file() {
+        &active
+    } else if orphaned_final.is_file() {
+        &orphaned_final
+    } else {
         bail!("trace has no active journal to recover")
+    };
+    let mut modified = fs::metadata(journal)?.modified()?;
+    if let Ok(lease_modified) =
+        fs::metadata(root.join(RECORDER_LEASE)).and_then(|metadata| metadata.modified())
+    {
+        modified = modified.max(lease_modified);
     }
     if !options.force {
-        let mut modified = fs::metadata(&active)?.modified()?;
-        let lease = root.join(RECORDER_LEASE);
-        if let Ok(lease_modified) = fs::metadata(lease).and_then(|metadata| metadata.modified()) {
-            modified = modified.max(lease_modified);
-        }
         let idle = SystemTime::now()
             .duration_since(modified)
             .unwrap_or(StdDuration::ZERO);
@@ -1658,6 +1806,10 @@ pub fn recover_interrupted_trace_with(
             )
         }
     }
+    let mut last_activity = Some(DateTime::<Utc>::from(modified));
+    if !active.is_file() {
+        restore_active_journal(root)?;
+    }
     let total_bytes = fs::metadata(&active)?.len();
     let mut stream = EventStream::active(
         &active,
@@ -1665,13 +1817,22 @@ pub fn recover_interrupted_trace_with(
         encryption_key.clone(),
         &ActiveCursor::start(),
     )?;
+    let mut journaled_exit = None;
+    let mut earlier_recovery = None;
     for event in &mut stream {
-        event?;
+        let event = event?;
+        if matches!(event.kind.as_str(), "process.exit" | "process.spawn_failed") {
+            if let Some(termination) = journaled_termination(&event) {
+                journaled_exit = Some((event.sequence, termination));
+            }
+        } else if event.kind == RECOVERY_EVENT_KIND && event.source == RECOVERY_EVENT_SOURCE {
+            earlier_recovery = Some((event.sequence, event.payload()));
+        }
     }
     let mut salvaged_events = stream.events_read();
     let mut valid_bytes = stream.byte_offset();
     let mut chain_head = stream.chain_head().map(str::to_owned);
-    let reason = match stream.end() {
+    let mut reason = match stream.end() {
         Some(JournalEnd::Clean) | None => None,
         Some(JournalEnd::TornTail) => Some("the journal ends inside a frame".to_owned()),
         Some(JournalEnd::Invalid {
@@ -1687,8 +1848,8 @@ pub fn recover_interrupted_trace_with(
         }
     };
     drop(stream);
-    let discarded_bytes = total_bytes.saturating_sub(valid_bytes);
-    let discarded_frames = if discarded_bytes == 0 {
+    let mut discarded_bytes = total_bytes.saturating_sub(valid_bytes);
+    let mut discarded_frames = if discarded_bytes == 0 {
         None
     } else {
         journal::count_discarded_frames(
@@ -1698,67 +1859,99 @@ pub fn recover_interrupted_trace_with(
             &manifest.trace_id,
         )?
     };
-    let mut payload = serde_json::json!({
-        "reason": "recorder_interrupted",
-        "recovered_event_count": salvaged_events,
-        "discarded_trailing_bytes": discarded_bytes,
-    });
-    if let Some(frames) = discarded_frames {
-        payload["discarded_frames"] = frames.into();
-    }
-    if let Some(reason) = reason.as_deref() {
-        payload["discard_reason"] = reason.into();
-    }
-    let recovery_event = TraceEvent {
-        event_id: Uuid::now_v7().to_string(),
-        trace_id: manifest.trace_id.clone(),
-        sequence: salvaged_events + 1,
-        timestamp: Utc::now().to_rfc3339(),
-        kind: "session.interrupted".into(),
-        source: "premier-recovery".into(),
-        payload_json: serde_json::to_string(&payload)?,
-        actor_id: "root".into(),
-        actor_type: "process".into(),
-        parent_event_id: String::new(),
-        span_id: "session".into(),
-        parent_span_id: String::new(),
-        correlation_id: String::new(),
-        status: "error".into(),
-        duration_ms: 0,
-        links: Vec::new(),
-        prev_hash: chain_head.unwrap_or_default(),
+    // An earlier recovery that was interrupted after it rewrote the journal
+    // left its `session.interrupted` as the last frame of an intact journal.
+    // That event already states what was kept and discarded: finalize with
+    // it instead of appending another.
+    let resumed = earlier_recovery
+        .filter(|(sequence, _)| discarded_bytes == 0 && *sequence == salvaged_events);
+    let append_marker = resumed.is_none();
+    let event_count = match resumed {
+        Some((sequence, payload)) => {
+            salvaged_events = sequence - 1;
+            discarded_bytes = payload["discarded_trailing_bytes"].as_u64().unwrap_or(0);
+            discarded_frames = payload["discarded_frames"].as_u64();
+            reason = payload["discard_reason"].as_str().map(str::to_owned);
+            // The journal's own modification time is now that earlier recovery.
+            last_activity = payload["last_activity_at"]
+                .as_str()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc));
+            sequence
+        }
+        None => salvaged_events + 1,
     };
+    let termination = journaled_exit
+        .filter(|(sequence, _)| *sequence <= salvaged_events)
+        .map(|(_, termination)| termination);
 
     // A prior finalization may have crashed after publishing the compressed
     // journal but before committing the manifest. Do not remove that orphan
     // until the authoritative active journal has passed validation.
-    let orphaned_final = root.join("events").join(FINAL_JOURNAL);
     if orphaned_final.exists() {
-        fs::remove_file(orphaned_final)?;
+        fs::remove_file(&orphaned_final)?;
     }
 
-    // The kept frames are copied as stored: recovery never re-encodes them.
-    let replacement = active.with_extension("pb.recovery.tmp");
-    {
-        let file = private_truncate_file(&replacement)?;
-        let mut writer = BufWriter::new(file);
-        std::io::copy(&mut File::open(&active)?.take(valid_bytes), &mut writer)?;
-        write_frame(
-            &mut writer,
-            &recovery_event,
-            encryption_key.as_ref(),
-            &manifest.trace_id,
-        )?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+    if append_marker {
+        let mut payload = serde_json::json!({
+            "reason": "recorder_interrupted",
+            "recovered_event_count": salvaged_events,
+            "discarded_trailing_bytes": discarded_bytes,
+            "exit_recorded": termination.is_some(),
+        });
+        if let Some(frames) = discarded_frames {
+            payload["discarded_frames"] = frames.into();
+        }
+        if let Some(reason) = reason.as_deref() {
+            payload["discard_reason"] = reason.into();
+        }
+        if let Some(last_activity) = last_activity {
+            payload["last_activity_at"] = last_activity.to_rfc3339().into();
+        }
+        let recovery_event = TraceEvent {
+            event_id: Uuid::now_v7().to_string(),
+            trace_id: manifest.trace_id.clone(),
+            sequence: salvaged_events + 1,
+            timestamp: Utc::now().to_rfc3339(),
+            kind: RECOVERY_EVENT_KIND.into(),
+            source: RECOVERY_EVENT_SOURCE.into(),
+            payload_json: serde_json::to_string(&payload)?,
+            actor_id: "root".into(),
+            actor_type: "process".into(),
+            parent_event_id: String::new(),
+            span_id: "session".into(),
+            parent_span_id: String::new(),
+            correlation_id: String::new(),
+            status: "error".into(),
+            duration_ms: 0,
+            links: Vec::new(),
+            prev_hash: chain_head.unwrap_or_default(),
+        };
+        // The kept frames are copied as stored: recovery never re-encodes them.
+        let replacement = active.with_extension("pb.recovery.tmp");
+        {
+            let file = private_truncate_file(&replacement)?;
+            let mut writer = BufWriter::new(file);
+            std::io::copy(&mut File::open(&active)?.take(valid_bytes), &mut writer)?;
+            write_frame(
+                &mut writer,
+                &recovery_event,
+                encryption_key.as_ref(),
+                &manifest.trace_id,
+            )?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        fs::rename(&replacement, &active)?;
+        sync_dir(&root.join("events"));
     }
-    fs::rename(&replacement, &active)?;
     manifest.termination = None;
+    let journaled_exit = termination.is_some();
     let manifest = finalize_active_journal(
         root,
         manifest,
-        salvaged_events + 1,
-        ProcessTermination::interrupted(),
+        event_count,
+        termination.unwrap_or_else(ProcessTermination::interrupted),
         encryption_key.as_ref(),
         0,
         signing_key,
@@ -1767,6 +1960,7 @@ pub fn recover_interrupted_trace_with(
             frames: discarded_frames,
             after_sequence: salvaged_events,
             reason: reason.clone(),
+            last_activity,
         }),
     )?;
     Ok(RecoveryReport {
@@ -1775,6 +1969,8 @@ pub fn recover_interrupted_trace_with(
         discarded_bytes,
         discarded_frames,
         reason,
+        journaled_exit,
+        removed_leftovers: Vec::new(),
     })
 }
 
@@ -1831,6 +2027,7 @@ fn finalize_active_journal(
     }
     compressor.finish()?.into_inner()?.sync_all()?;
     fs::rename(&temporary_final, &final_path)?;
+    sync_dir(&root.join("events"));
 
     manifest.diagnostics = validator.finish();
     if dropped_events > 0 {
@@ -1865,7 +2062,12 @@ fn finalize_active_journal(
             sequence: Some(discarded.after_sequence),
         });
     }
-    manifest.ended_at = Some(Utc::now());
+    // A recovered recording ended when it was last written to, not now.
+    manifest.ended_at = Some(
+        recovered
+            .and_then(|discarded| discarded.last_activity)
+            .map_or_else(Utc::now, |ended| ended.max(manifest.started_at)),
+    );
     manifest.exit_code = Some(termination.shell_exit_code());
     manifest.termination = Some(termination);
     manifest.journal = Some(JournalFile {
@@ -1891,11 +2093,17 @@ fn finalize_active_journal(
     }
     drop(stream);
     write_manifest(root, &manifest, encryption_key)?;
-    fs::remove_file(active)?;
-    let lease = root.join(RECORDER_LEASE);
-    if lease.exists() {
-        fs::remove_file(lease)?;
+    // The trace is finalized from here on. Something else may already have
+    // removed these (`premier recover` cleans up after an interrupted
+    // finalization), which is not a failure.
+    for leftover in [active, root.join(RECORDER_LEASE)] {
+        match fs::remove_file(leftover) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
     }
+    sync_dir(&root.join("events"));
+    sync_dir(root);
     Ok(manifest)
 }
 
@@ -1942,6 +2150,8 @@ pub struct EventValidator {
     parent_diagnostics: Vec<TraceDiagnostic>,
     kind_diagnostics: Vec<TraceDiagnostic>,
     lifecycle_events: Vec<TraceEvent>,
+    /// Lifecycle events an adapter inferred (`payload.synthesized: true`).
+    synthesized: IdSet,
 }
 
 impl EventValidator {
@@ -1962,20 +2172,22 @@ impl EventValidator {
         if !KNOWN_KINDS.contains(&event.kind.as_str()) {
             return;
         }
-        if event.status.trim().is_empty() {
+        let status = event.status.trim();
+        if status.is_empty() {
             self.kind_diagnostics.push(diagnostic(
                 event,
                 "missing_status",
                 format!("{} must declare a status", event.kind),
             ));
-        } else if !KNOWN_STATUSES.contains(&event.status.to_ascii_lowercase().as_str()) {
+        } else if !KNOWN_STATUSES.contains(&status.to_ascii_lowercase().as_str()) {
             self.kind_diagnostics.push(diagnostic(
                 event,
                 "invalid_status",
                 format!("{} uses unknown status '{}'", event.kind, event.status),
             ));
         }
-        if !event.payload().is_object() {
+        let payload = event.payload();
+        if !payload.is_object() {
             self.kind_diagnostics.push(diagnostic(
                 event,
                 "payload_not_object",
@@ -1986,6 +2198,9 @@ impl EventValidator {
             lifecycle.finish == event.kind || lifecycle.starts.contains(&event.kind.as_str())
         });
         if in_lifecycle {
+            if payload["synthesized"] == true {
+                self.synthesized.insert(event.event_id.as_str());
+            }
             // Only what pairing a start with its finish looks at.
             self.lifecycle_events.push(TraceEvent {
                 event_id: event.event_id.clone(),
@@ -2006,7 +2221,12 @@ impl EventValidator {
         let mut diagnostics = self.parent_diagnostics;
         diagnostics.extend(self.kind_diagnostics);
         for lifecycle in &LIFECYCLES {
-            validate_pair(&self.lifecycle_events, lifecycle, &mut diagnostics);
+            validate_pair(
+                &self.lifecycle_events,
+                lifecycle,
+                &self.synthesized,
+                &mut diagnostics,
+            );
         }
         diagnostics
     }
@@ -2111,51 +2331,84 @@ fn diagnostic(event: &TraceEvent, code: &str, message: String) -> TraceDiagnosti
     }
 }
 
+/// Pair every finish of `lifecycle` with the start it closes and report the
+/// gaps. `events` are in journal order.
+///
+/// A finish names its start most directly through `parent_event_id` or
+/// `links`; failing that it is matched by correlation id, and without one by
+/// span, parent span, then actor. A start recorded after a finish is never
+/// its antecedent. Where several starts qualify (one actor making call after
+/// call), the finish closes the most recent one that is still open, and
+/// only when all are closed is it taken as a further record of the most
+/// recent.
 fn validate_pair(
     events: &[TraceEvent],
     lifecycle: &Lifecycle,
+    synthesized: &IdSet,
     diagnostics: &mut Vec<TraceDiagnostic>,
 ) {
     let start_kind = lifecycle.starts[0];
     let finish_kind = lifecycle.finish;
-    let starts: Vec<_> = events
+    // Journal position and event of every start, in order.
+    let starts: Vec<(usize, &TraceEvent)> = events
         .iter()
-        .filter(|event| lifecycle.starts.contains(&event.kind.as_str()))
+        .enumerate()
+        .filter(|(_, event)| lifecycle.starts.contains(&event.kind.as_str()))
         .collect();
-    let finishes: Vec<_> = events
-        .iter()
-        .filter(|event| event.kind == finish_kind)
-        .collect();
-    let mut by_correlation = HashMap::new();
-    let mut by_span = HashMap::new();
-    let mut by_actor = HashMap::new();
-    for start in &starts {
-        if !start.correlation_id.is_empty() {
-            by_correlation
-                .entry(start.correlation_id.as_str())
-                .or_insert(*start);
-        }
-        if !start.span_id.is_empty() {
-            by_span.entry(start.span_id.as_str()).or_insert(*start);
-        }
-        if !start.actor_id.is_empty() {
-            by_actor.entry(start.actor_id.as_str()).or_insert(*start);
+    let mut by_id: HashMap<&str, usize> = HashMap::new();
+    let mut by_correlation: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_span: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_actor: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, (_, start)) in starts.iter().enumerate() {
+        by_id.entry(start.event_id.as_str()).or_insert(index);
+        for (key, map) in [
+            (&start.correlation_id, &mut by_correlation),
+            (&start.span_id, &mut by_span),
+            (&start.actor_id, &mut by_actor),
+        ] {
+            if !key.is_empty() {
+                map.entry(key.as_str()).or_default().push(index);
+            }
         }
     }
-    let mut matched_starts = HashSet::new();
+    let mut matched = vec![false; starts.len()];
     let mut matched_correlations = HashSet::new();
-    for finish in finishes {
-        let antecedent = if !finish.correlation_id.is_empty() {
-            by_correlation.get(finish.correlation_id.as_str()).copied()
-        } else {
-            by_span
-                .get(finish.span_id.as_str())
-                .or_else(|| by_span.get(finish.parent_span_id.as_str()))
-                .or_else(|| by_actor.get(finish.actor_id.as_str()))
+    for (position, finish) in events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind == finish_kind)
+    {
+        let earlier = |index: &usize| starts[*index].0 < position;
+        // The most recent earlier start that is still open, else the most
+        // recent earlier one.
+        let pick = |candidates: Option<&Vec<usize>>, matched: &[bool]| {
+            let candidates = candidates?;
+            candidates
+                .iter()
+                .rev()
+                .filter(|index| earlier(index))
+                .find(|index| !matched[**index])
+                .or_else(|| candidates.iter().rev().find(|index| earlier(index)))
                 .copied()
         };
-        let Some(start) = antecedent else {
-            if lifecycle.start_required {
+        let named = std::iter::once(&finish.parent_event_id)
+            .chain(&finish.links)
+            .filter_map(|id| by_id.get(id.as_str()))
+            .find(|index| earlier(index))
+            .copied();
+        let antecedent = named.or_else(|| {
+            if finish.correlation_id.is_empty() {
+                pick(by_span.get(finish.span_id.as_str()), &matched)
+                    .or_else(|| pick(by_span.get(finish.parent_span_id.as_str()), &matched))
+                    .or_else(|| pick(by_actor.get(finish.actor_id.as_str()), &matched))
+            } else {
+                pick(by_correlation.get(finish.correlation_id.as_str()), &matched)
+            }
+        });
+        let Some(index) = antecedent else {
+            // An inferred finish (a denial an adapter derived from a summary)
+            // has no start to point at by construction.
+            if lifecycle.start_required && !synthesized.contains(finish.event_id.as_str()) {
                 diagnostics.push(diagnostic(
                     finish,
                     "missing_lifecycle_start",
@@ -2164,7 +2417,8 @@ fn validate_pair(
             }
             continue;
         };
-        matched_starts.insert(start.event_id.as_str());
+        let start = starts[index].1;
+        matched[index] = true;
         if !start.correlation_id.is_empty() {
             // Several records of one call (a hook and the call itself) share its correlation.
             matched_correlations.insert(start.correlation_id.as_str());
@@ -2187,10 +2441,8 @@ fn validate_pair(
     if !lifecycle.finish_required {
         return;
     }
-    for start in starts {
-        if !matched_starts.contains(start.event_id.as_str())
-            && !matched_correlations.contains(start.correlation_id.as_str())
-        {
+    for (index, (_, start)) in starts.iter().enumerate() {
+        if !matched[index] && !matched_correlations.contains(start.correlation_id.as_str()) {
             diagnostics.push(diagnostic(
                 start,
                 "missing_lifecycle_finish",
@@ -2198,6 +2450,26 @@ fn validate_pair(
             ));
         }
     }
+}
+
+/// The diagnostics to report for a finalized trace: what the validator of
+/// this build finds in its events (`recomputed`), plus the stored entries
+/// only the recorder or `premier recover` could have known (`journal.*`:
+/// events lost to write failures, frames recovery discarded). The stored
+/// semantic diagnostics are those of the build that finalized the trace and
+/// are superseded, so a trace is judged by the same rules as any other.
+pub fn current_diagnostics(
+    stored: &[TraceDiagnostic],
+    recomputed: Vec<TraceDiagnostic>,
+) -> Vec<TraceDiagnostic> {
+    let mut diagnostics = recomputed;
+    diagnostics.extend(
+        stored
+            .iter()
+            .filter(|diagnostic| diagnostic.code.starts_with("journal."))
+            .cloned(),
+    );
+    diagnostics
 }
 
 /// Read `limit` events after `after_sequence`, decoding the journal from its
@@ -2383,6 +2655,45 @@ pub fn inspect_active_journal(root: impl AsRef<Path>) -> Result<ActiveJournalRep
     })
 }
 
+/// A manifest written in a format version this build does not read. Reported
+/// as an error by every reader; callers that list traces can tell it apart
+/// from a damaged manifest with `error.downcast_ref::<UnsupportedFormatVersion>()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedFormatVersion {
+    /// The `format_version` the manifest declares.
+    pub found: u64,
+}
+
+impl UnsupportedFormatVersion {
+    /// Whether the trace was written by a later build rather than an
+    /// earlier, no longer supported one.
+    pub fn is_newer(&self) -> bool {
+        self.found > u64::from(FORMAT_VERSION)
+    }
+}
+
+impl std::fmt::Display for UnsupportedFormatVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported trace format version {}: this build reads versions {MIN_FORMAT_VERSION} to {FORMAT_VERSION}; a newer premier is needed for later versions",
+            self.found
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedFormatVersion {}
+
+/// The format version a trace's manifest declares, read without decoding
+/// anything else. `None` when there is no readable manifest or no version.
+pub fn declared_format_version(root: impl AsRef<Path>) -> Option<u64> {
+    let bytes = fs::read(root.as_ref().join("manifest.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("format_version")?
+        .as_u64()
+}
+
 pub fn read_manifest(root: impl AsRef<Path>) -> Result<TraceManifest> {
     read_manifest_with_optional_key(root.as_ref(), None)
 }
@@ -2399,13 +2710,16 @@ fn read_manifest_with_optional_key(
     master_key: Option<&EncryptionKey>,
 ) -> Result<TraceManifest> {
     let bytes = fs::read(root.join("manifest.json"))?;
-    let mut manifest: TraceManifest = serde_json::from_slice(&bytes)?;
-    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&manifest.format_version) {
-        bail!(
-            "unsupported trace format version {}: this build reads versions {MIN_FORMAT_VERSION} to {FORMAT_VERSION}; a newer premier is needed for later versions",
-            manifest.format_version
-        );
+    // The version is checked before the manifest is decoded as this build's
+    // structure: a later version may have changed the shape of any field,
+    // and that must read as "needs a newer premier", not as damage.
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if let Some(found) = value.get("format_version").and_then(|v| v.as_u64())
+        && !(u64::from(MIN_FORMAT_VERSION)..=u64::from(FORMAT_VERSION)).contains(&found)
+    {
+        return Err(UnsupportedFormatVersion { found }.into());
     }
+    let mut manifest: TraceManifest = serde_json::from_value(value)?;
     if let Some(metadata) = manifest.encryption.as_ref() {
         let key = if let Some(master_key) = master_key {
             if master_key.key_id() != metadata.key_id {
@@ -2429,6 +2743,7 @@ fn read_manifest_with_optional_key(
         manifest.redaction = private.redaction;
         manifest.adapter = private.adapter;
         manifest.seal = private.seal;
+        manifest.extra.extend(private.extra);
     }
     Ok(manifest)
 }
@@ -2798,6 +3113,7 @@ fn write_manifest(
             redaction: stored.redaction.take(),
             adapter: stored.adapter.take(),
             seal: stored.seal.take(),
+            extra: std::mem::take(&mut stored.extra),
         };
         let aad = manifest_aad(&stored);
         let encrypted = key.encrypt(&serde_json::to_vec(&private)?, aad.as_bytes())?;
@@ -2818,6 +3134,7 @@ fn write_manifest(
     file.write_all(&serde_json::to_vec_pretty(&stored)?)?;
     file.sync_all()?;
     fs::rename(temporary, root.join("manifest.json"))?;
+    sync_dir(root);
     Ok(())
 }
 
@@ -2852,6 +3169,13 @@ pub fn claim_local_trace(root: impl AsRef<Path>, tenant_id: &str) -> Result<Trac
     let mut manifest = read_manifest(root)?;
     if manifest.tenant_id != LOCAL_TENANT {
         bail!("only a local trace may be claimed")
+    }
+    // A recorder keeps its own copy of the manifest and writes it back when
+    // it finalizes, so an owner written underneath it would be lost.
+    if manifest.journal.is_none() {
+        bail!(
+            "only a finalized trace may be claimed: this one is still being recorded or was interrupted; let its recorder finish or run `premier recover`, then claim it"
+        )
     }
     let key = required_encryption_key(&manifest)?;
     manifest.tenant_id = tenant_id.to_owned();
@@ -2899,6 +3223,7 @@ pub fn reencrypt_finalized_trace_with_signing_key(
     signing_key: Option<&SigningKey>,
 ) -> Result<TraceManifest> {
     let root = root.as_ref();
+    settle_interrupted_encryption(root)?;
     let mut manifest = read_manifest(root)?;
     let source_key = required_encryption_key(&manifest)?;
     if manifest.journal.is_none() {
@@ -2915,8 +3240,8 @@ pub fn reencrypt_finalized_trace_with_signing_key(
         .and_then(|name| name.to_str())
         .unwrap_or("trace");
     let nonce = Uuid::now_v7();
-    let staging = parent.join(format!(".{name}.encrypt-{nonce}.tmp"));
-    let backup = parent.join(format!(".{name}.encrypt-{nonce}.backup"));
+    let staging = parent.join(format!(".{name}{ENCRYPT_WORK_INFIX}{nonce}.tmp"));
+    let backup = parent.join(format!(".{name}{ENCRYPT_WORK_INFIX}{nonce}.backup"));
     create_private_dir(&staging)?;
     create_private_dir(&staging.join("events"))?;
     create_private_dir(&staging.join("blobs"))?;
@@ -2975,14 +3300,116 @@ pub fn reencrypt_finalized_trace_with_signing_key(
         bail!("encrypted trace verification changed event evidence")
     }
 
+    // A crash between these two renames leaves no directory at the trace
+    // path and a crash after them leaves the previous copy beside it; the
+    // next `encrypt` of this trace puts either right before doing anything
+    // else (`settle_interrupted_encryption`).
     fs::rename(root, &backup)?;
     if let Err(error) = fs::rename(&staging, root) {
         let _ = fs::rename(&backup, root);
         let _ = fs::remove_dir_all(&staging);
         return Err(error.into());
     }
-    fs::remove_dir_all(&backup)?;
+    sync_dir(parent);
+    fs::remove_dir_all(&backup).with_context(|| {
+        format!(
+            "the trace was encrypted, but its previous copy could not be removed; delete {} by hand",
+            backup.display()
+        )
+    })?;
+    sync_dir(parent);
     Ok(verified_manifest)
+}
+
+/// Marks the hidden working directories `encrypt` creates beside a trace:
+/// `.<name>.encrypt-<id>.tmp` (the copy being written) and
+/// `.<name>.encrypt-<id>.backup` (the previous trace during the swap).
+const ENCRYPT_WORK_INFIX: &str = ".encrypt-";
+
+/// Put right what an `encrypt` of `root` left behind when it was interrupted
+/// during its final swap, so that neither a missing trace nor a stray copy of
+/// the previous (possibly plaintext) trace survives the next run:
+/// - no directory at the trace path and one backup: the backup is the trace
+///   and is moved back;
+/// - a trace at its path and a backup beside it: the swap had completed, so
+///   the backup is the superseded copy and is removed;
+/// - unfinished working copies are removed.
+fn settle_interrupted_encryption(root: &Path) -> Result<()> {
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let parent = match root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Ok(());
+    };
+    let prefix = format!(".{name}{ENCRYPT_WORK_INFIX}");
+    let mut backups = Vec::new();
+    let mut unfinished = Vec::new();
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        let entry_name = entry_name.to_string_lossy();
+        if !entry_name.starts_with(&prefix) || !entry.path().is_dir() {
+            continue;
+        }
+        if entry_name.ends_with(".backup") {
+            backups.push(entry.path());
+        } else if entry_name.ends_with(".tmp") {
+            unfinished.push(entry.path());
+        }
+    }
+    if fs::symlink_metadata(root).is_err() {
+        match backups.as_slice() {
+            [] => {}
+            [backup] => {
+                fs::rename(backup, root).with_context(|| {
+                    format!(
+                        "an interrupted encrypt left the trace at {}; it could not be moved back to {}",
+                        backup.display(),
+                        root.display()
+                    )
+                })?;
+                backups.clear();
+            }
+            _ => bail!(
+                "interrupted encrypt runs left several copies of {} ({}); move the one to keep back to that path",
+                root.display(),
+                backups
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+    // A backup is only superseded by the trace it was a copy of.
+    let trace_id = |path: &Path| {
+        let bytes = fs::read(path.join("manifest.json")).ok()?;
+        let manifest = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        Some(manifest.get("trace_id")?.as_str()?.to_owned())
+    };
+    if let Some(backup) = backups
+        .iter()
+        .find(|backup| trace_id(backup).is_none() || trace_id(backup) != trace_id(root))
+    {
+        bail!(
+            "{} was left behind by an interrupted encrypt and is not a copy of the trace now at {}; move or delete it by hand",
+            backup.display(),
+            root.display()
+        )
+    }
+    for leftover in backups.iter().chain(&unfinished) {
+        fs::remove_dir_all(leftover).with_context(|| {
+            format!(
+                "cannot remove {}, left behind by an interrupted encrypt",
+                leftover.display()
+            )
+        })?;
+    }
+    sync_dir(parent);
+    Ok(())
 }
 
 fn ensure_no_unencrypted_auxiliary_files(root: &Path) -> Result<()> {
@@ -3019,6 +3446,56 @@ fn validate_tenant_id(tenant_id: &str) -> Result<()> {
         bail!("tenant id must be 1-128 ASCII letters, digits, '.', '_' or '-'")
     }
     Ok(())
+}
+
+/// Create `path` as a new owner-only directory, failing when anything is
+/// already there. Missing parents are created with default permissions.
+fn create_new_private_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::Error::new(error)
+                .context(format!("trace path already exists: {}", path.display()))
+        } else {
+            anyhow::Error::new(error)
+                .context(format!("cannot create trace directory {}", path.display()))
+        }
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Flush a directory entry change (a create, rename or removal inside
+/// `path`) to stable storage. Best effort: not every platform or filesystem
+/// can sync a directory, and the change itself has already happened.
+fn sync_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        if let Ok(directory) = File::open(path) {
+            let _ = directory.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {

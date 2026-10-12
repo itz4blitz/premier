@@ -19,6 +19,9 @@ pub enum IntegrityStatus {
     Invalid,
     /// Encrypted, and no usable key was supplied: the evidence is sealed, not damaged.
     Locked,
+    /// Written in a later trace format than this build reads: it needs a
+    /// newer Premier, and nothing here says it is damaged.
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

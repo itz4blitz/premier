@@ -6,7 +6,16 @@
 /// Incomplete sequences at the end of a chunk are held until more bytes arrive or
 /// [`finish_utf8`] is called.
 pub fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
+    decode_utf8_chunk_lossy(pending, chunk).0
+}
+
+/// [`decode_utf8_chunk`], also returning how many invalid sequences were
+/// replaced with U+FFFD. The replacement cannot be undone, and a U+FFFD the
+/// stream really contained looks the same, so a caller that stores the text
+/// as evidence needs this count to say that it is not byte-exact.
+pub fn decode_utf8_chunk_lossy(pending: &mut Vec<u8>, chunk: &[u8]) -> (String, usize) {
     pending.extend_from_slice(chunk);
+    let mut replaced = 0_usize;
     let mut output = String::new();
     // Consume via an offset and compact once at the end so a run of invalid
     // bytes stays linear instead of shifting the buffer per replacement.
@@ -30,6 +39,7 @@ pub fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
                 }
                 match error.error_len() {
                     Some(len) => {
+                        replaced += 1;
                         output.push('\u{FFFD}');
                         offset = offset.saturating_add(len).min(pending.len());
                     }
@@ -39,19 +49,27 @@ pub fn decode_utf8_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
         }
     }
     pending.drain(..offset);
-    output
+    (output, replaced)
 }
 
 /// Flush any remaining bytes in `pending` after the stream ends.
 ///
 /// Incomplete sequences become U+FFFD via lossy conversion.
 pub fn finish_utf8(pending: &mut Vec<u8>) -> String {
+    finish_utf8_lossy(pending).0
+}
+
+/// [`finish_utf8`], also returning how many invalid sequences were replaced.
+pub fn finish_utf8_lossy(pending: &mut Vec<u8>) -> (String, usize) {
     if pending.is_empty() {
-        return String::new();
+        return (String::new(), 0);
     }
     let text = String::from_utf8_lossy(pending).into_owned();
+    // What is left at the end of a stream is an incomplete sequence, so
+    // every U+FFFD in it is a replacement.
+    let replaced = text.matches('\u{FFFD}').count();
     pending.clear();
-    text
+    (text, replaced)
 }
 
 #[cfg(test)]

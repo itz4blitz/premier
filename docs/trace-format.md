@@ -20,9 +20,37 @@ A trace is a directory, conventionally named `<name>.atrace`:
 | `recorder.lease` | while recording | `<pid> start=<n>`: the recorder's process id and process start time (the id alone where the platform cannot report a start time), rewritten every 2 seconds as a heartbeat. See [cli.md](cli.md#abandoned-traces-and-recover). |
 | `blobs/sha256/`, `indexes/` | always | Reserved, empty. |
 
-Directories are created `0700` and files `0600`. A trace is *finalized* when
+Directories are created `0700` and files `0600`. The trace directory itself
+is created exclusively: a recorder never adopts a directory that already
+exists. A trace is *finalized* when
 `manifest.json` has a `journal` object; finalization compresses the active
 journal, writes the manifest, then removes the active journal and the lease.
+A finalization interrupted after the manifest was written leaves those two
+files (and possibly `events/*.tmp`, `manifest.json.tmp`) beside a finalized
+trace; readers ignore them and `premier recover` removes them once the trace
+verifies.
+
+**Durability.** What survives a crash of the recorder and what survives a
+power loss are different things:
+
+- An appended event is handed to the operating system with one write and is
+  not followed by an `fsync`. It survives the recorder being killed (it is in
+  the page cache), and `premier recover` finds it. It is not guaranteed to
+  survive a power loss or kernel crash until the trace is finalized; what is
+  lost is the tail of the journal, and a frame cut short is discarded by
+  recovery as a torn tail.
+- At finalization the active journal is synced, the compressed journal is
+  written to a temporary file, synced, and renamed into place, and the
+  manifest is written the same way. After each rename the containing
+  directory is synced as well (on Unix; best effort, since not every
+  filesystem can sync a directory). A finalized trace whose command has
+  returned is therefore on stable storage, to the extent the storage honours
+  `fsync`.
+- `recover` and `encrypt` follow the same write, sync, rename, sync-directory
+  order.
+
+Syncing every append would bound the loss to one event at the cost of a disk
+flush per line of output; the recorder does not do it.
 
 The finalized journal is a series of concatenated zstd frames, which is one
 valid zstd stream and decompresses with any zstd decoder. The writer starts a
@@ -228,6 +256,19 @@ over the decrypted events and the decrypted manifest. Verifying, signing or
 checking a signature on an encrypted trace therefore needs the encryption key
 (`--key-file` or `PREMIER_TRACE_KEY_FILE`).
 
+Every manifest the recorder writes while recording is encrypted the same way,
+with `journal` and `seal` absent. The associated data does not say how far a
+recording had got, so an earlier manifest of the same trace still decrypts
+later. What that allows, and what it does not, is in
+[security.md](security.md#encrypted-traces).
+
+**Size.** An encrypted trace is much larger than the same trace in plaintext,
+by a factor of tens for repetitive output. Each event frame is encrypted on
+its own and stored as base64 text (the envelope is unchanged from version 1),
+and the zstd pass at finalization then runs over ciphertext, which does not
+compress: it only recovers part of the base64 overhead. Compressing before
+encrypting would need a new frame envelope, that is, a new format version.
+
 ## Verification
 
 `premier verify` on a finalized trace checks, in order:
@@ -292,7 +333,15 @@ server has no usable key for. The server has no list of trusted keys, so
   prefixes, into frames that decode as events of this trace (the first
   excepted, being the one that failed), with at most one incomplete frame at
   the end; padding or other garbage has no frame count. The cut bytes
-  themselves are not kept. It signs with `--sign-key` or
+  themselves are not kept. The manifest's `termination` and `exit_code` are
+  those of the `process.exit` (or `process.spawn_failed`) event when the kept
+  frames hold one, and `interrupted` / `130` otherwise; `ended_at` is the
+  last modification time of the abandoned journal or lease, which the
+  `session.interrupted` payload repeats as `last_activity_at` next to
+  `exit_recorded`. A recovery that is repeated after being interrupted reuses
+  the `session.interrupted` event it had already appended. On a finalized
+  trace `recover` rewrites nothing; it only removes working files an
+  interrupted finalization left. It signs with `--sign-key` or
   `PREMIER_SIGN_KEY_FILE`; that signature is the recovering party's statement
   about what it found, not the recorder's.
 - **`premier encrypt`** (encrypt or rotate) re-encrypts the events unchanged,
@@ -310,6 +359,24 @@ server has no usable key for. The server has no list of trusted keys, so
   `public_key_fingerprint`. The export itself is not covered by the seal or the
   signature, because redaction changes the events. It is written in one pass,
   so its `redaction` summary follows the `events` it counts.
+
+## Compatibility
+
+A reader checks `format_version` before it decodes anything else in the
+manifest. A version outside the range it supports is reported as exactly
+that (`unsupported trace format version N: this build reads versions 1 to 2;
+a newer premier is needed for later versions`), whatever the rest of the
+manifest looks like. `premier list` shows such a trace as
+`[needs a newer premier: format version N]` and the viewer API as
+`integrity: "unsupported"`; it is not treated as damaged.
+
+Within a supported version, a manifest may hold fields this build does not
+know (a later build of the same version may add optional ones). They are
+kept: every command that rewrites the manifest (`recover`, `claim`, `sign`,
+`encrypt`) writes them back, and they are part of the seal input like any
+other field, so a seal computed by the build that added them still verifies.
+In an encrypted trace, unknown fields found in either part of the manifest
+are written back inside the encrypted part.
 
 ## Version 1 compatibility
 

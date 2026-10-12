@@ -13,7 +13,7 @@ use premier_cli::{
 };
 use premier_trace::{
     EventInput, ProcessTermination, RECORDER_LEASE, RecoveryOptions, RedactionConfig,
-    TerminationKind, TraceWriter, decode_utf8_chunk, finish_utf8, prepare_trace_output,
+    TerminationKind, TraceWriter, decode_utf8_chunk_lossy, finish_utf8_lossy, prepare_trace_output,
     read_events, read_manifest, recover_interrupted_trace_with, stream_events, verify,
     verify_trace_visiting,
 };
@@ -43,8 +43,9 @@ use adapters::{ADAPTER_SCHEMA_VERSION, AdapterChoice, AdapterEvent, NativeAdapte
 struct Cli {
     /// Trace encryption key file, used to write new traces encrypted and to
     /// read encrypted ones. The file holds one 256-bit key as exactly 64 hex
-    /// characters (for example from `openssl rand -hex 32`) and must be
-    /// readable only by its owner (mode 0600).
+    /// characters (from `premier keygen --encryption`, or for example
+    /// `openssl rand -hex 32`) and must be readable only by its owner (mode
+    /// 0600).
     #[arg(long, global = true, value_name = "PATH", env = premier_trace::KEY_FILE_ENV)]
     key_file: Option<PathBuf>,
     #[command(subcommand)]
@@ -134,8 +135,14 @@ enum Commands {
     },
     /// Emit a typed agent event to the active local collector (`PREMIER_COLLECTOR_*`).
     Emit {
-        /// Full JSON event body. Use `-` to read from stdin.
-        #[arg(long)]
+        /// Full JSON event body. Use `-` to read from stdin. The body is
+        /// sent as given, so it cannot be combined with the field options.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "kind", "actor", "actor_type", "span", "parent_span", "status", "payload", "source"
+            ]
+        )]
         json: Option<String>,
         /// Event kind (e.g. agent.spawn, model.response, tool.execution).
         #[arg(long)]
@@ -174,10 +181,16 @@ enum Commands {
         live: bool,
     },
     /// Generate an Ed25519 signing key: writes the private key (mode 0600) and
-    /// `<output>.pub`, and prints the public key.
+    /// `<output>.pub`, and prints the public key. With --encryption, generate
+    /// a trace encryption key file for --key-file instead.
     Keygen {
         /// Private key file to create. Must not already exist.
         output: PathBuf,
+        /// Write a 256-bit trace encryption key (64 hex characters, mode
+        /// 0600) from the system random number generator, for --key-file /
+        /// PREMIER_TRACE_KEY_FILE. There is no public half.
+        #[arg(long)]
+        encryption: bool,
     },
     /// Sign (or re-sign) the manifest seal of an already finalized trace.
     Sign {
@@ -275,7 +288,8 @@ enum Commands {
     /// A recorded gap longer than 10 seconds is replayed as 10 seconds.
     Replay {
         trace: PathBuf,
-        /// Playback speed multiplier (for example 2 replays twice as fast).
+        /// Playback speed multiplier (for example 2 replays twice as fast),
+        /// at least 0.001.
         #[arg(long, default_value_t = 1.0, value_parser = parse_replay_speed)]
         speed: f64,
         /// Emit evidence immediately while preserving recorded order.
@@ -447,9 +461,10 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("invalid: {} failed verification", trace.display()))?;
             let (outcome, note) = verification_outcome(&verified);
             let mut manifest = verified.manifest;
-            if manifest.diagnostics.is_empty() {
-                manifest.diagnostics = validator.finish();
-            }
+            // Judged by this build's rules, not by those of whichever build
+            // finalized the trace; what only the recorder knew is kept.
+            manifest.diagnostics =
+                premier_trace::current_diagnostics(&manifest.diagnostics, validator.finish());
             println!(
                 "{outcome} {} ({} events, {} semantic diagnostics)",
                 manifest.trace_id,
@@ -461,6 +476,11 @@ async fn main() -> Result<()> {
             );
             if let Some(note) = note {
                 println!("note: {note}");
+            }
+            if manifest.seal.as_ref().is_some_and(|seal| seal.recovered) {
+                println!(
+                    "note: finalized by `premier recover`, not by its recorder. An unfinalized journal does not commit to its length, so this shows the kept events are genuine and in order, not that none were recorded after them"
+                );
             }
             for diagnostic in &manifest.diagnostics {
                 println!(
@@ -501,6 +521,15 @@ async fn main() -> Result<()> {
                 sign_key.as_ref(),
             )?;
             let manifest = &report.manifest;
+            if !report.removed_leftovers.is_empty() {
+                println!(
+                    "{} is already finalized ({} events); removed what an interrupted finalization left behind: {}",
+                    manifest.trace_id,
+                    report.salvaged_events,
+                    report.removed_leftovers.join(", ")
+                );
+                return Ok(());
+            }
             println!(
                 "recovered {} ({} events, exit {})",
                 manifest.trace_id,
@@ -514,6 +543,11 @@ async fn main() -> Result<()> {
                 "kept {} recorded event(s) and appended session.interrupted",
                 report.salvaged_events
             );
+            if report.journaled_exit {
+                println!(
+                    "the command's exit was already recorded (process.exit); the trace keeps that exit status"
+                );
+            }
             if report.discarded_bytes > 0 {
                 println!(
                     "discarded {} byte(s) ({}) after sequence {}: {}",
@@ -539,7 +573,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Keygen { output } => keygen(&output),
+        Commands::Keygen { output, encryption } => {
+            if encryption {
+                keygen_encryption(&output)
+            } else {
+                keygen(&output)
+            }
+        }
         Commands::Sign { trace, sign_key } => {
             let key = premier_trace::SigningKey::from_file(&sign_key)
                 .with_context(|| format!("cannot load signing key {}", sign_key.display()))?;
@@ -747,6 +787,37 @@ fn keygen(output: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Create a trace encryption key file: one 256-bit key as 64 hex characters,
+/// created exclusively and readable only by its owner.
+fn keygen_encryption(output: &std::path::Path) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(output)
+        .with_context(|| format!("cannot create trace key file {}", output.display()))?;
+    let key = premier_trace::random_secret_hex()?;
+    writeln!(file, "{key}")?;
+    file.sync_all()?;
+    println!(
+        "wrote trace encryption key to {} (owner-only); keep it secret and backed up: traces encrypted with it cannot be read without it",
+        output.display()
+    );
+    println!(
+        "key id: {}",
+        premier_trace::EncryptionKey::from_hex(&key)?.key_id()
+    );
+    println!(
+        "use it with: premier --key-file {} record -- <command>",
+        output.display()
+    );
+    Ok(())
+}
+
 /// `premier verify --live`: check an unfinalized trace's active journal up to
 /// its last complete frame. Read-only.
 fn verify_live(trace: &std::path::Path, state: UnfinalizedState) -> Result<()> {
@@ -882,6 +953,10 @@ fn parse_replay_speed(value: &str) -> std::result::Result<f64, String> {
         .map_err(|_| "speed must be a positive finite number".to_owned())?;
     if !speed.is_finite() || speed <= 0.0 {
         return Err("speed must be a positive finite number".into());
+    }
+    // Slower than this turns the 10 second gap cap into hours per event.
+    if speed < MIN_REPLAY_SPEED {
+        return Err(format!("speed must be at least {MIN_REPLAY_SPEED}"));
     }
     Ok(speed)
 }
@@ -1105,6 +1180,8 @@ fn diff_traces(baseline: PathBuf, current: PathBuf, json_output: bool) -> Result
 /// `--speed` scaling). Timestamps are recorded evidence, not trusted input: a
 /// wrong clock or a forged timestamp must not make replay sleep for years.
 const MAX_REPLAY_GAP: StdDuration = StdDuration::from_secs(10);
+/// Slowest accepted `--speed`.
+const MIN_REPLAY_SPEED: f64 = 0.001;
 
 fn replay_trace(trace: PathBuf, speed: f64, no_sleep: bool) -> Result<()> {
     let manifest =
@@ -1139,7 +1216,13 @@ fn replay_trace(trace: PathBuf, speed: f64, no_sleep: bool) -> Result<()> {
                     let delay = delay.min(MAX_REPLAY_GAP);
                     // Everything emitted so far is visible while waiting.
                     output.flush()?;
-                    thread::sleep(StdDuration::from_secs_f64(delay.as_secs_f64() / speed));
+                    // Never the panicking conversion: the quotient is
+                    // bounded by the speed limit, but it is still arithmetic
+                    // on recorded input.
+                    thread::sleep(
+                        StdDuration::try_from_secs_f64(delay.as_secs_f64() / speed)
+                            .unwrap_or(MAX_REPLAY_GAP),
+                    );
                 }
             }
             previous = Some(timestamp);
@@ -1203,17 +1286,79 @@ async fn serve_viewer(
         tracing::warn!("could not open browser: {error}");
     }
     let router = app_with_options(trace_dir, viewer, auth, options);
-    if let Some(tls) = tls {
-        let config =
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(tls.cert, tls.key).await?;
-        axum_server::bind_rustls(bind, config)
-            .serve(router.into_make_service())
-            .await?;
-    } else {
-        let listener = tokio::net::TcpListener::bind(bind).await?;
-        axum::serve(listener, router).await?;
+    // Ctrl-C and SIGTERM stop the server: it stops accepting, lets requests
+    // in flight finish, and gives up on the rest (an open event stream)
+    // after `VIEWER_SHUTDOWN_DEADLINE`.
+    let (stop_sender, stop) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        stop_requested().await;
+        let _ = stop_sender.send(true);
+    });
+    let stopped = |mut stop: tokio::sync::watch::Receiver<bool>| async move {
+        if stop.wait_for(|stop| *stop).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let serving = async {
+        if let Some(tls) = tls {
+            let config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(tls.cert, tls.key).await?;
+            let handle = axum_server::Handle::new();
+            let shutdown = handle.clone();
+            let requested = stopped(stop.clone());
+            tokio::spawn(async move {
+                requested.await;
+                shutdown.graceful_shutdown(Some(VIEWER_SHUTDOWN_DEADLINE));
+            });
+            axum_server::bind_rustls(bind, config)
+                .handle(handle)
+                .serve(router.into_make_service())
+                .await?;
+        } else {
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(stopped(stop.clone()))
+                .await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        served = serving => served?,
+        () = async {
+            stopped(stop.clone()).await;
+            tokio::time::sleep(VIEWER_SHUTDOWN_DEADLINE).await;
+        } => {}
+    }
+    if *stop.borrow() {
+        eprintln!("premier: viewer stopped");
     }
     Ok(())
+}
+
+/// How long the viewer server waits for open connections after it was asked
+/// to stop.
+const VIEWER_SHUTDOWN_DEADLINE: StdDuration = StdDuration::from_secs(2);
+
+/// Completes when the process is asked to stop: Ctrl-C (SIGINT) or SIGTERM.
+async fn stop_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 struct TlsFiles {
@@ -1370,7 +1515,29 @@ fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// `demo` replaces a trace already at its output path, but not one that is
+/// being recorded: deleting the directory under a running recorder destroys
+/// its evidence and leaves it writing to files nobody can open.
+fn refuse_to_replace_a_recording(output: &std::path::Path) -> Result<()> {
+    let Ok(manifest) = read_manifest(output) else {
+        return Ok(());
+    };
+    match unfinalized_state(output, &manifest) {
+        Some(UnfinalizedState::Recording) => bail!(
+            "refusing to replace {}: it is being recorded right now; choose another --output or wait for that recording to finish",
+            output.display()
+        ),
+        Some(UnfinalizedState::Abandoned { needs_force: true }) => bail!(
+            "refusing to replace {}: it is an unfinalized recording that was written to moments ago and may still be running; choose another --output, or finalize it with `premier recover --force {}`",
+            output.display(),
+            output.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn demo(output: PathBuf) -> Result<()> {
+    refuse_to_replace_a_recording(&output)?;
     prepare_trace_output(&output)?;
     let mut writer = TraceWriter::create_named(
         &output,
@@ -1693,24 +1860,51 @@ async fn record(options: RecordOptions) -> Result<()> {
             provider.id()
         );
     }
-    let output = output.unwrap_or_else(|| {
-        let id = uuid_like_timestamp();
-        PathBuf::from(format!(".premier/traces/{id}.atrace"))
-    });
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     // The child receives this token in its environment and may print it
-    // (`env`), so the recorder redacts it from everything it stores.
-    let collector_token = uuid::Uuid::now_v7().to_string();
-    let mut trace_writer = TraceWriter::create_named_for_tenant_with_redaction(
-        &output,
-        command.clone(),
-        name,
-        &tenant,
-        redaction.implicit_literal("collector-token", &collector_token),
-    )?;
+    // (`env`), so the recorder redacts it from everything it stores. It is
+    // 256 bits from the system random number generator and shares nothing
+    // with the (time-ordered, public) event ids.
+    let collector_token = premier_trace::random_secret_hex()?;
+    let redaction = redaction.implicit_literal("collector-token", &collector_token);
+    let (output, mut trace_writer) = match output {
+        Some(output) => {
+            let writer = TraceWriter::create_named_for_tenant_with_redaction(
+                &output,
+                command.clone(),
+                name,
+                &tenant,
+                redaction,
+            )?;
+            (output, writer)
+        }
+        // The trace directory is created exclusively, so recorders started
+        // in the same instant can never share one; a name that is already
+        // taken is simply drawn again.
+        None => {
+            let mut attempts = 0;
+            loop {
+                let output = default_trace_path();
+                match TraceWriter::create_named_for_tenant_with_redaction(
+                    &output,
+                    command.clone(),
+                    name.clone(),
+                    &tenant,
+                    redaction.clone(),
+                ) {
+                    Ok(writer) => break (output, writer),
+                    Err(error)
+                        if attempts < 16
+                            && error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                                io.kind() == std::io::ErrorKind::AlreadyExists
+                            }) =>
+                    {
+                        attempts += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    };
     if let Some(key) = sign_key {
         trace_writer.set_signing_key(key);
     }
@@ -1861,6 +2055,7 @@ async fn record(options: RecordOptions) -> Result<()> {
             match finalized {
                 Ok(manifest) => {
                     eprintln!("trace {} → {}", manifest.trace_id, output.display());
+                    eprintln!("{}", protection_summary(&manifest));
                 }
                 Err(error) => eprintln!(
                     "premier: the trace of the failed start could not be finalized: {error:#}\npremier: finalize it with `premier recover --force {}`",
@@ -1930,7 +2125,10 @@ async fn record(options: RecordOptions) -> Result<()> {
     // exit status, so finalization errors are reported instead of returned.
     let finalized = finalize_recording(writer, collector, termination.clone()).await;
     match &finalized {
-        Ok(manifest) => eprintln!("\ntrace {} → {}", manifest.trace_id, output.display()),
+        Ok(manifest) => {
+            eprintln!("\ntrace {} → {}", manifest.trace_id, output.display());
+            eprintln!("{}", protection_summary(manifest));
+        }
         Err(error) => eprintln!(
             "\npremier: recording failed: the trace could not be finalized: {error:#}\npremier: salvage what was captured with `premier recover --force {}`",
             output.display()
@@ -1965,6 +2163,18 @@ async fn record(options: RecordOptions) -> Result<()> {
             let (trace_dir, only_artifact) = single_trace_scope(&output)?;
             let mut options = server_options(false);
             options.only_artifact = Some(only_artifact);
+            // The recorder's forwarding handlers are still installed and now
+            // do nothing. The viewer handles SIGINT and SIGTERM itself; a
+            // closed terminal (SIGHUP) or Ctrl-\ must end it as they would
+            // any other program.
+            #[cfg(unix)]
+            for signal in [libc::SIGHUP, libc::SIGQUIT] {
+                // SAFETY: restoring a default disposition has no
+                // preconditions; no forwarder is running any more.
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                }
+            }
             return serve_viewer(
                 trace_dir,
                 viewer_dir,
@@ -1983,6 +2193,28 @@ async fn record(options: RecordOptions) -> Result<()> {
     } else {
         std::process::exit(code.clamp(1, 255))
     }
+}
+
+/// How the trace just written is protected, for the end-of-run summary: a
+/// mistyped key variable must not pass for an encrypted recording.
+fn protection_summary(manifest: &premier_trace::TraceManifest) -> String {
+    let encryption = match manifest.encryption.as_ref() {
+        Some(metadata) => format!("encrypted at rest (key {})", metadata.key_id),
+        None => "NOT encrypted (plaintext on disk; pass --key-file to encrypt)".to_owned(),
+    };
+    let signer = manifest
+        .seal
+        .as_ref()
+        .and_then(|seal| seal.signature.as_ref())
+        .map(|signature| {
+            premier_trace::PublicKey::from_hex(&signature.public_key)
+                .map_or_else(|_| "unknown".to_owned(), |key| key.fingerprint())
+        });
+    let signature = match signer {
+        Some(fingerprint) => format!("signed (key {fingerprint})"),
+        None => "unsigned (pass --sign-key for tamper evidence)".to_owned(),
+    };
+    format!("protection: {encryption}; {signature}")
 }
 
 /// The local collector server and the runtime that owns its connections.
@@ -2357,6 +2589,14 @@ fn capture_pty(
     let pair = native_pty_system()
         .openpty(size)
         .context("failed to allocate pseudo-terminal")?;
+    // SAFETY: isatty only inspects the descriptor.
+    let stdin_is_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    if !stdin_is_terminal && let Some(master) = pair.master.as_raw_fd() {
+        // Redirected input is forwarded as data, not typed: without a
+        // terminal in front, the PTY's echo would copy every input byte
+        // (and the end-of-input character) into the captured output.
+        disable_pty_echo(master);
+    }
     let mut command = CommandBuilder::new(executable);
     command.args(args);
     // portable-pty starts children in $HOME unless told otherwise.
@@ -2389,12 +2629,24 @@ fn capture_pty(
     let (release_stdin, wait_for_release) = mpsc::channel::<()>();
     thread::spawn(move || {
         let mut input = std::io::stdin();
-        let _ = std::io::copy(&mut input, &mut terminal_writer);
-        // portable-pty deliberately sends EOT when its writer is dropped.
-        // Keep the writer alive after redirected stdin reaches EOF so that EOT
-        // is not echoed into the captured stream ahead of the child output.
+        if stdin_is_terminal {
+            let _ = std::io::copy(&mut input, &mut terminal_writer);
+        } else {
+            // A file or pipe ends; the child must see that end, or a
+            // command that reads its input to completion never finishes.
+            let _ = forward_redirected_stdin(&mut input, &mut terminal_writer);
+        }
+        // portable-pty sends a newline and EOT when its writer is dropped.
+        // Keep the writer alive until the child is gone so nothing more is
+        // typed into the terminal behind the input that was forwarded.
         let _ = wait_for_release.recv();
     });
+    // A resize of the recorder's terminal is passed on to the PTY and
+    // recorded, so full-screen programs redraw for the size that is shown.
+    let resized = Arc::new(AtomicBool::new(false));
+    let resize_hook = signal_hook::flag::register(libc::SIGWINCH, resized.clone())
+        .context("cannot watch for terminal resizes")?;
+    let mut current_size = size;
 
     // The reader runs on its own thread so a descendant that keeps the
     // terminal open cannot block finalization after the child has exited.
@@ -2417,6 +2669,14 @@ fn capture_pty(
         |captured| {
             let Captured::Output(_, bytes) = captured else {
                 faults.note(append_idle_output(writer, "process.terminal", &mut pending));
+                if resized.swap(false, Ordering::SeqCst)
+                    && let Some(new_size) = tty_size()
+                    && new_size != current_size
+                    && pair.master.resize(new_size).is_ok()
+                {
+                    current_size = new_size;
+                    faults.note(append_resize_event(writer, new_size));
+                }
                 return;
             };
             if mirror {
@@ -2449,6 +2709,7 @@ fn capture_pty(
         },
     };
     signal_forwarder.child_exited();
+    signal_hook::low_level::unregister(resize_hook);
     let _ = release_stdin.send(());
     let recorder_signals = signal_forwarder.finish()?;
     Ok(CaptureOutcome {
@@ -2458,6 +2719,80 @@ fn capture_pty(
         output_open_at_exit,
         faults,
     })
+}
+
+/// Forward redirected (non-terminal) standard input to the PTY, then signal
+/// end of input the way a terminal does: the end-of-file character (Ctrl-D),
+/// which ends input only at the start of a line, so it is sent twice when the
+/// input did not end with a newline (the first then delivers the unfinished
+/// line). A child that has put its terminal into raw mode reads the
+/// character as data instead; that is what a terminal would give it too.
+#[cfg(unix)]
+fn forward_redirected_stdin(
+    input: &mut impl Read,
+    terminal: &mut impl Write,
+) -> std::io::Result<()> {
+    const END_OF_FILE: u8 = 0x04;
+    let mut buffer = [0_u8; 8192];
+    let mut at_line_start = true;
+    loop {
+        match input.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                terminal.write_all(&buffer[..count])?;
+                at_line_start = buffer[count - 1] == b'\n';
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let end: &[u8] = if at_line_start {
+        &[END_OF_FILE]
+    } else {
+        &[END_OF_FILE, END_OF_FILE]
+    };
+    terminal.write_all(end)?;
+    terminal.flush()
+}
+
+/// Turn off input echo on a PTY, given its master side.
+#[cfg(unix)]
+fn disable_pty_echo(master: std::os::fd::RawFd) {
+    // SAFETY: termios is a plain C structure filled in by tcgetattr; both
+    // calls only touch the terminal behind a descriptor this process owns.
+    unsafe {
+        let mut attributes: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(master, &mut attributes) == 0 {
+            attributes.c_lflag &=
+                !(libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ECHONL | libc::ECHOCTL);
+            libc::tcsetattr(master, libc::TCSANOW, &attributes);
+        }
+    }
+}
+
+/// Record that the PTY was resized to follow the recorder's terminal.
+#[cfg(unix)]
+fn append_resize_event(
+    writer: &Arc<Mutex<TraceWriter>>,
+    size: portable_pty::PtySize,
+) -> Result<()> {
+    writer.lock().unwrap().append_input(EventInput {
+        kind: "process.resize".into(),
+        source: "premier".into(),
+        actor_id: "root".into(),
+        actor_type: "process".into(),
+        span_id: "command".into(),
+        parent_span_id: "session".into(),
+        status: "running".into(),
+        payload: json!({
+            "rows": size.rows,
+            "cols": size.cols,
+            "pixel_width": size.pixel_width,
+            "pixel_height": size.pixel_height,
+        }),
+        ..EventInput::default()
+    })?;
+    Ok(())
 }
 
 /// Whether `executable` names an existing file, looked up the way a spawn
@@ -2507,6 +2842,9 @@ struct PendingOutput {
     redaction: premier_trace::TerminalRedactionBuffer,
     /// When this stream last produced output.
     last_output: Instant,
+    /// Invalid UTF-8 sequences replaced with U+FFFD and not yet reported on
+    /// a stored event.
+    replaced_sequences: usize,
 }
 
 impl PendingOutput {
@@ -2515,6 +2853,7 @@ impl PendingOutput {
             utf8: Vec::new(),
             redaction: writer.lock().unwrap().terminal_redaction_buffer(kind),
             last_output: Instant::now(),
+            replaced_sequences: 0,
         }
     }
 }
@@ -2530,7 +2869,7 @@ fn append_idle_output(
         return Ok(());
     }
     match pending.redaction.flush_idle() {
-        Some((text, byte_length)) => append_process_event(writer, kind, text, byte_length),
+        Some((text, byte_length)) => append_process_event(writer, kind, text, byte_length, pending),
         None => Ok(()),
     }
 }
@@ -2542,19 +2881,38 @@ fn append_process_bytes(
     bytes: &[u8],
 ) -> Result<()> {
     pending.last_output = Instant::now();
-    let text = decode_utf8_chunk(&mut pending.utf8, bytes);
+    let (text, replaced) = decode_utf8_chunk_lossy(&mut pending.utf8, bytes);
+    pending.replaced_sequences += replaced;
     match pending.redaction.push(&text, bytes.len()) {
-        Some((text, byte_length)) => append_process_event(writer, kind, text, byte_length),
+        Some((text, byte_length)) => append_process_event(writer, kind, text, byte_length, pending),
         None => Ok(()),
     }
 }
 
+/// Journal one piece of captured output. The stored `text` is not always
+/// the bytes the command wrote: output that is not valid UTF-8 has each
+/// invalid sequence replaced with U+FFFD, which cannot be undone. Such an
+/// event is marked `lossy: true` with the number of replaced sequences, so a
+/// reader can tell a replacement from a U+FFFD the command really printed.
+/// (When a redaction rule holds text back, the mark lands on the first event
+/// stored after the replacement that contains a U+FFFD.)
 fn append_process_event(
     writer: &Arc<Mutex<TraceWriter>>,
     kind: &str,
     text: String,
     byte_length: usize,
+    pending: &mut PendingOutput,
 ) -> Result<()> {
+    let mut payload = json!({
+        "byte_length": byte_length,
+        "stream": if kind == "process.terminal" { "pty" } else { kind.trim_start_matches("process.") },
+    });
+    if pending.replaced_sequences > 0 && text.contains('\u{FFFD}') {
+        payload["lossy"] = json!(true);
+        payload["replaced_sequences"] = json!(pending.replaced_sequences);
+        pending.replaced_sequences = 0;
+    }
+    payload["text"] = json!(text);
     writer.lock().unwrap().append_input(EventInput {
         kind: kind.into(),
         source: "command".into(),
@@ -2563,11 +2921,7 @@ fn append_process_event(
         span_id: "command".into(),
         parent_span_id: "session".into(),
         status: "running".into(),
-        payload: json!({
-            "text": text,
-            "byte_length": byte_length,
-            "stream": if kind == "process.terminal" { "pty" } else { kind.trim_start_matches("process.") },
-        }),
+        payload,
         ..EventInput::default()
     })?;
     Ok(())
@@ -2579,10 +2933,12 @@ fn append_pending_utf8(
     pending: &mut PendingOutput,
 ) -> Result<()> {
     let byte_length = pending.utf8.len();
-    let text = finish_utf8(&mut pending.utf8);
+    let (text, replaced) = finish_utf8_lossy(&mut pending.utf8);
+    pending.replaced_sequences += replaced;
     let released = pending.redaction.push(&text, byte_length);
-    for (text, byte_length) in released.into_iter().chain(pending.redaction.finish()) {
-        append_process_event(writer, kind, text, byte_length)?;
+    let finished = pending.redaction.finish();
+    for (text, byte_length) in released.into_iter().chain(finished) {
+        append_process_event(writer, kind, text, byte_length, pending)?;
     }
     Ok(())
 }
@@ -2603,8 +2959,10 @@ fn append_adapter_events(
     })
 }
 
+/// The size of the terminal the recorder itself runs in, when one of its
+/// standard streams is a terminal.
 #[cfg(unix)]
-fn terminal_size() -> portable_pty::PtySize {
+fn tty_size() -> Option<portable_pty::PtySize> {
     for file_descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
         // SAFETY: winsize is a plain C data structure and each descriptor is a
         // process-owned standard stream. ioctl only writes to this local value.
@@ -2613,13 +2971,21 @@ fn terminal_size() -> portable_pty::PtySize {
             && size.ws_row > 0
             && size.ws_col > 0
         {
-            return portable_pty::PtySize {
+            return Some(portable_pty::PtySize {
                 rows: size.ws_row,
                 cols: size.ws_col,
                 pixel_width: size.ws_xpixel,
                 pixel_height: size.ws_ypixel,
-            };
+            });
         }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn terminal_size() -> portable_pty::PtySize {
+    if let Some(size) = tty_size() {
+        return size;
     }
     let rows = std::env::var("LINES")
         .ok()
@@ -3003,9 +3369,10 @@ fn list(trace_dir: PathBuf) -> Result<()> {
         return Ok(());
     }
     let mut manifests = Vec::new();
-    // An encrypted trace that cannot be opened is still listed, from the
-    // public part of its manifest, instead of silently vanishing.
-    let mut sealed = Vec::new();
+    // A trace that cannot be opened (encrypted without its key, written in
+    // a later format, or with a damaged manifest) is still listed, from
+    // whatever its manifest shows, instead of silently vanishing.
+    let mut unopened = Vec::new();
     for entry in std::fs::read_dir(trace_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -3013,10 +3380,9 @@ fn list(trace_dir: PathBuf) -> Result<()> {
         }
         match read_manifest(entry.path()) {
             Ok(manifest) => manifests.push((entry.path(), manifest)),
-            Err(error) if premier_trace::trace_is_encrypted(entry.path()).unwrap_or(false) => {
-                sealed.push(encrypted_list_line(&entry.path(), &error));
-            }
-            Err(_) => {}
+            // A directory without a manifest is not a trace.
+            Err(_) if !entry.path().join("manifest.json").is_file() => {}
+            Err(error) => unopened.push(unopened_list_line(&entry.path(), &error)),
         }
     }
     manifests.sort_by_key(|(_, manifest)| std::cmp::Reverse(manifest.started_at));
@@ -3034,32 +3400,55 @@ fn list(trace_dir: PathBuf) -> Result<()> {
             printable(&state)
         );
     }
-    sealed.sort();
-    for line in sealed.iter().rev() {
+    unopened.sort();
+    for (_, line) in unopened.iter().rev() {
         println!("{line}");
     }
     Ok(())
 }
 
-/// The `list` line for an encrypted trace that could not be opened. Its name
-/// and command are sealed, so the directory name stands in for them.
-fn encrypted_list_line(path: &std::path::Path, error: &anyhow::Error) -> String {
+/// The `list` line for a trace whose manifest could not be read, with its
+/// start time (when known) as the sort key. Its name and command are sealed
+/// or unreadable, so the directory name stands in for them.
+fn unopened_list_line(
+    path: &std::path::Path,
+    error: &anyhow::Error,
+) -> (Option<chrono::DateTime<Utc>>, String) {
     let public = fs::read(path.join("manifest.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .unwrap_or_default();
-    let reason = if premier_trace::key_file_configured() {
-        format!("{error:#}")
+    let unsupported = error.downcast_ref::<premier_trace::UnsupportedFormatVersion>();
+    let reason = if let Some(unsupported) = unsupported.filter(|unsupported| unsupported.is_newer())
+    {
+        format!(
+            "needs a newer premier: format version {}",
+            unsupported.found
+        )
+    } else if unsupported.is_some() {
+        format!("unreadable: {error:#}")
+    } else if premier_trace::trace_is_encrypted(path).unwrap_or(false) {
+        if premier_trace::key_file_configured() {
+            format!("encrypted: {error:#}")
+        } else {
+            "encrypted: key required".to_owned()
+        }
     } else {
-        "key required".to_owned()
+        format!("unreadable: {error:#}")
     };
-    format!(
-        "{}  {}  {}  [encrypted: {}]",
+    // The same rendering as a readable trace's start time.
+    let started_at = public["started_at"]
+        .as_str()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let line = format!(
+        "{}  {}  {}  [{}]",
         printable(public["trace_id"].as_str().unwrap_or("unknown")),
-        printable(public["started_at"].as_str().unwrap_or("unknown")),
+        started_at.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
         printable(&path.file_name().unwrap_or_default().to_string_lossy()),
         printable(&reason)
-    )
+    );
+    (started_at, line)
 }
 
 /// Directory that contains `trace`, treating the empty parent of a bare
@@ -3072,13 +3461,19 @@ fn trace_parent_dir(trace: &std::path::Path) -> PathBuf {
     }
 }
 
-fn uuid_like_timestamp() -> String {
+/// Default output of `premier record`:
+/// `.premier/traces/trace-<unix milliseconds>-<8 random hex digits>.atrace`.
+/// The timestamp keeps a directory listing in recording order; the suffix
+/// keeps recorders started in the same millisecond apart.
+fn default_trace_path() -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
-    format!(
-        "trace-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    )
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    // The low 32 bits of a version 7 UUID are random.
+    let suffix = uuid::Uuid::now_v7().as_u128() as u32;
+    PathBuf::from(format!(
+        ".premier/traces/trace-{millis}-{suffix:08x}.atrace"
+    ))
 }

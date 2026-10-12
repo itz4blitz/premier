@@ -15,7 +15,7 @@ Child processes inherit them in the usual way.
 | Variable | Value |
 | --- | --- |
 | `PREMIER_COLLECTOR_URL` | `http://127.0.0.1:<port>/v1/events`. The port is chosen by the OS for each recording. |
-| `PREMIER_COLLECTOR_TOKEN` | A bearer token generated for this recording. |
+| `PREMIER_COLLECTOR_TOKEN` | A bearer token generated for this recording: 256 bits from the system random number generator, as 64 hexadecimal characters. It is unrelated to the trace and event ids. |
 | `PREMIER_TRACE_ID` | The id of the trace being recorded. |
 
 If `PREMIER_COLLECTOR_URL` and `PREMIER_COLLECTOR_TOKEN` are not set, the
@@ -31,7 +31,9 @@ Content-Type: application/json
 <one JSON event>
 ```
 
-One request carries one event. There is no batch form.
+One request carries one event. There is no batch form, and an event that does
+not fit the [size limit](#size-limit) is rejected whole: nothing is truncated
+or stored elsewhere. Split large content across several events.
 
 ```sh
 curl -sS -X POST "$PREMIER_COLLECTOR_URL" \
@@ -58,13 +60,31 @@ The `Authorization` header must be `Bearer ` followed by the exact token. The
 comparison is constant-time. A missing or wrong token is rejected with `401`
 before the body is read.
 
+Requests without the token are slowed down and leave a mark:
+
+- Each further refusal in a row is answered 100 ms later than the one before
+  (100 ms, 200 ms, ...), up to 1 second. An accepted request resets this. Only
+  the refused requests wait; requests with the token are never delayed.
+- The first refusal of a recording appends one `collector.unauthorized` event
+  (source `premier`, actor `root`, status `denied`) to the trace. Later ones
+  are not recorded, so the trace cannot be filled this way; they are counted
+  in the recorder's log (`RUST_LOG=warn`).
+
 The collector listens on `127.0.0.1` only, and the token is the only
 credential. Any local process that learns the port and token can append events
 to the trace while it is being recorded. See [security.md](security.md#the-collector).
 
 ## Request body
 
-A JSON object. Unknown fields are ignored.
+One JSON object. Anything else (an array, a string, a number, `null`) is
+rejected with `400` `event body must be a JSON object`.
+
+Only the fields below are accepted. An unknown top-level field is rejected
+with `400` and a message naming it, so a misspelt field (`actor` for
+`actor_id`) is reported instead of being dropped. Two more fields are accepted
+because the SDKs send them: `trace_id`, which must be absent, `null`, empty,
+or the id of the trace being recorded (anything else is `409`), and `run`,
+which the local collector ignores.
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -189,16 +209,18 @@ Errors have the body `{"error": "<message>"}`.
 | Status | When |
 | --- | --- |
 | `200` | The event was stored. |
-| `400` | The body is not valid JSON, `kind` is missing, a field has the wrong type, a field breaks the [field rules](#field-rules) (empty `kind` or `source`, a disallowed character, too long), or `timestamp` is not RFC 3339 or comes with a non-object payload. |
-| `401` | The bearer token is missing or wrong. Checked before the body is read. |
+| `400` | The body is not valid JSON or not a JSON object, it has an unknown top-level field, `kind` is missing, a field has the wrong type, a field breaks the [field rules](#field-rules) (empty `kind` or `source`, a disallowed character, too long), or `timestamp` is not RFC 3339 or comes with a non-object payload. |
+| `401` | The bearer token is missing or wrong. Checked before the body is read, and answered after a delay; see [Authentication](#authentication). |
 | `405` | Any method other than `POST` on `/v1/events`. |
 | `408` | The body did not arrive within 10 seconds. `{"error":"event body was not received in time"}`. |
+| `409` | `trace_id` names a different trace than the one this collector records. |
 | `413` | The body is larger than the size limit. |
 | `422` | The event claims a kind or source that only the recorder may write. |
-| `500` | The journal write failed. |
+| `500` | The journal write failed. The body is `{"error":"the event could not be recorded"}`; the cause is reported by the recorder itself, on its stderr and in the trace's `journal.write_failed` diagnostic. |
 
 The checks run in this order: token (`401`), declared size (`413`), body read
-(`408`, `413`), JSON (`400`), reserved names (`422`), field rules and
+(`408`, `413`), JSON, object shape, and unknown fields (`400`), `trace_id`
+(`409`), field types (`400`), reserved names (`422`), field rules and
 timestamp (`400`).
 
 ### Size limit
@@ -270,8 +292,9 @@ jq -n '{kind:"tool.execution",actor_id:"coder",status:"ok",payload:{tool:"rg"}}'
   `--source` to `premier-emit`. `--payload` must be valid JSON. If `--status`
   or `--payload` is omitted the field is not sent, which triggers the
   diagnostics described above for the validated kinds.
-- `--json` sends the given body unchanged; the other flags are ignored. The
-  collector's default `source` (`sdk`) applies if the body has none.
+- `--json` sends the given body unchanged and cannot be combined with the
+  field flags (a usage error, exit `2`). The collector's default `source`
+  (`sdk`) applies if the body has none.
 - On success it prints the new `event_id` and exits `0`.
 - It exits `1` when the collector variables are not set, the collector cannot
   be reached, it does not answer within `PREMIER_EMIT_TIMEOUT` seconds

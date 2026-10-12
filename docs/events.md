@@ -38,11 +38,25 @@ Only the recorder can write these. Their `actor_id` is `root` and their
 | Kind | Source | Status | When | Payload |
 | --- | --- | --- | --- | --- |
 | `session.start` | `premier` | `running` | First event of every recording. Span `session`. | `cwd`, `command`, `instrumentation` (collector URL), `capture_mode` (`pipes` or `pty`), `adapter` (provider, schema version, transport, completeness, or `null`), and `terminal` (rows, cols, pixel size) under `--pty` |
-| `process.stdout`, `process.stderr` | `command` | `running` | Captured output without `--pty`. Span `command`, parent span `session`. | `text`, `byte_length`, `stream` |
-| `process.terminal` | `command` | `running` | Captured output with `--pty` (stdout and stderr merged). | `text`, `byte_length`, `stream: "pty"` |
+| `process.stdout`, `process.stderr` | `command` | `running` | Captured output without `--pty`. Span `command`, parent span `session`. | `text`, `byte_length`, `stream`, and `lossy`, `replaced_sequences` when the output was not valid UTF-8 (see below) |
+| `process.terminal` | `command` | `running` | Captured output with `--pty` (stdout and stderr merged). | `text`, `byte_length`, `stream: "pty"`, and `lossy`, `replaced_sequences` as above |
+| `process.resize` | `premier` | `running` | With `--pty`: the recorder's terminal was resized and the PTY was resized to match. | `rows`, `cols`, `pixel_width`, `pixel_height` |
 | `process.exit` | `command` | `ok` if the exit code is 0, otherwise `error` | The command ended. | `exit_code`, `success`, `termination` (`exit` or `signal`), and when applicable `signal`, `signal_name`, `forwarded_by_recorder`, `recorder_signal`, `recorder_signal_name`, `killed_by_recorder`, `core_dumped`, `output_open_at_exit` |
 | `process.spawn_failed` | `premier` | `error` | The command could not be started. Replaces `process.exit`. | `executable`, `error`, `exit_code` (127 or 126), `success: false` |
-| `session.interrupted` | `premier-recovery` | `error` | Appended by `premier recover` to an abandoned trace. | `reason`, `recovered_event_count`, `discarded_trailing_bytes` |
+| `session.interrupted` | `premier-recovery` | `error` | Appended by `premier recover` to an abandoned trace. Its timestamp is the time of the recovery. | `reason`, `recovered_event_count`, `discarded_trailing_bytes`, `exit_recorded` (whether the kept events hold the command's `process.exit`), `last_activity_at` (when the abandoned recording was last written to), and `discarded_frames`, `discard_reason` when something was discarded |
+| `collector.unauthorized` | `premier` | `denied` | The first request of a recording that reached the collector without its token. Later ones are not recorded. Span `session`. | `reason`, `note` |
+
+**Captured output is text, not bytes.** `text` is the output decoded as UTF-8.
+Each invalid sequence is replaced with U+FFFD, and the original bytes are not
+kept anywhere in the trace (the output mirrored to the recorder's own stdout
+and stderr is exact). An event whose text contains such a replacement has
+`lossy: true` and `replaced_sequences`, the number of sequences replaced
+since the last marked event of that stream, so a replacement can be told from
+a U+FFFD the command really printed. When a redaction rule holds text back,
+the mark is on the first event stored after the replacement that contains a
+U+FFFD. `byte_length` counts the bytes read from the command for the event,
+before decoding and before redaction, so it can differ from the length of
+`text`.
 
 The `process.exit` fields are explained in [cli.md](cli.md#exit-status).
 
@@ -86,7 +100,7 @@ Native adapters (see [adapters.md](adapters.md)) write these with source
 | `agent.message` | A line spoken by the user rather than the model (`role`, or `message.role`, is `user`), with status `ok` and `payload.role: "user"`. A user line that carries tool results is a `tool.result` instead. |
 | `tool.invocation` / `tool.result` | A tool call and its outcome, including Codex `file_change` and `web_search` items. A result the provider marks `denied`, `rejected`, `declined`, or `blocked` has status `denied`; other failures have status `error`. |
 | `approval.request` / `approval.decision` | A permission or approval event and its outcome. |
-| `approval.decision` with `payload.synthesized: true` | One per entry of Claude Code's `permission_denials`, status `denied`. No `approval.request` precedes it, so the trace gets a `missing_lifecycle_start` diagnostic for it. See [adapters.md](adapters.md#approvals). |
+| `approval.decision` with `payload.synthesized: true` | One per entry of Claude Code's `permission_denials`, status `denied`. No `approval.request` precedes it; because it is marked as inferred, the validator does not report that as `missing_lifecycle_start`. See [adapters.md](adapters.md#approvals). |
 | `provider.event` | A provider line that fits none of the above. |
 | `adapter.diagnostic` | A line the adapter could not use (malformed, not an object, or too large). Status `warning`. Payload: `provider`, `adapter_schema_version`, `line`, `message`, and `line_bytes` for oversized lines. |
 
@@ -159,8 +173,13 @@ Notes:
 ## Lifecycle validation
 
 When a trace is finalized, Premier validates its events and stores the
-findings as `diagnostics` in the manifest. `premier verify` prints them, and
-the viewer lists them under missing evidence. Every diagnostic has severity
+findings as `diagnostics` in the manifest. `premier verify` and the viewer
+server do not report that stored list as it is: they run the validator of the
+build that is reading the trace over its events, and take from the manifest
+only the [recorder diagnostics](#recorder-diagnostics), which cannot be
+derived from the events. An older trace is therefore judged by the current
+rules. `premier verify` prints the result, and the viewer lists it under
+missing evidence. Every diagnostic has severity
 `warning`, a `code`, a `message`, and usually the `event_id` and `sequence` it
 refers to.
 
@@ -184,7 +203,7 @@ trace they are covered by the manifest seal.
 | Code | Raised when |
 | --- | --- |
 | `missing_status` | `status` is empty. |
-| `invalid_status` | `status` is not one of the statuses listed above (compared case-insensitively). |
+| `invalid_status` | `status` is not one of the statuses listed above (compared case-insensitively, ignoring surrounding whitespace). |
 | `payload_not_object` | The payload is not a JSON object. An omitted payload is `null` and raises this. |
 
 **Lifecycles**, pairing a start with its finish:
@@ -204,13 +223,24 @@ open or be closed by an `agent.join`. `tool.execution`, `tool.error`, and
 for a message between agents (the SDK's `premier.message`) and, by the native
 adapters, for a provider line spoken by the user (`payload.role: "user"`).
 
-A finish is matched to a start like this:
+A finish is matched to a start recorded before it. A start that comes later
+in the journal is never its match.
 
-1. If the finish has a `correlation_id`: the first start with the same
+1. If the finish's `parent_event_id`, or one of its `links`, is the id of a
+   start: that start.
+2. Otherwise, if the finish has a `correlation_id`: a start with the same
    `correlation_id`. Nothing else is tried.
-2. Otherwise: the first start with the same `span_id`; failing that, the first
-   start whose `span_id` is the finish's `parent_span_id`; failing that, the
-   first start with the same `actor_id`.
+3. Otherwise: a start with the same `span_id`; failing that, a start whose
+   `span_id` is the finish's `parent_span_id`; failing that, a start with the
+   same `actor_id`.
+
+Where rule 2 or 3 finds several starts, the finish closes the most recent one
+that no finish has closed yet. When all of them are closed it counts as a
+further record of the most recent one.
+
+A finish with `payload.synthesized: true` (one an adapter inferred, such as a
+denial taken from a summary) is not reported as `missing_lifecycle_start`:
+there is no start it could name.
 
 | Code | Raised when |
 | --- | --- |
@@ -218,16 +248,19 @@ A finish is matched to a start like this:
 | `missing_lifecycle_finish` | A start is matched by no finish, in a lifecycle where that is flagged. A start that shares its `correlation_id` with a matched start is not flagged, so a hook and the call it wraps count as one. |
 | `missing_causal_link` | A finish matches a start but nothing links the two. A link is any of: the finish's `parent_event_id` is the start; its `links` contain the start; both have the same non-empty `span_id`; the finish's `parent_span_id` is the start's `span_id` or `parent_span_id`; both have the same non-empty `correlation_id`. |
 
-In practice: give each request/decision, delegation/join, and
-invocation/result pair its own `correlation_id` or `span_id`. Two open
-requests from the same actor with neither are both matched to the first one,
-and the second is reported as unfinished.
+In practice: set `parent_event_id` on the finish, or give each
+request/decision, delegation/join, and invocation/result pair its own
+`correlation_id` or `span_id`. Pairs that only share an actor are closed in
+order, most recent first, which is right for calls made one after another and
+for nested ones, but can cross the pairs of calls that overlap; they also get
+a `missing_causal_link` diagnostic each.
 
 ### Recorder diagnostics
 
 | Code | Raised when |
 | --- | --- |
 | `journal.write_failed` | The recorder could not write one or more events to the journal. The message gives the count. See [cli.md](cli.md#journal-write-failure). |
+| `journal.recovery_discarded` | `premier recover` could not keep part of the abandoned journal. The message gives the bytes, the frames when known, the sequence after which the cut was made, and the reason. See [cli.md](cli.md#damaged-journals). |
 
 `adapter.diagnostic` is different: it is an event in the journal, written by a
 native adapter about one provider line, not a manifest diagnostic.

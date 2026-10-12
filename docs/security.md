@@ -47,7 +47,9 @@ public key file with your default umask.
 - It binds `127.0.0.1` on a port chosen by the OS. It is not reachable from
   another machine and cannot be configured to be.
 - It is plain HTTP.
-- Every recording gets a new bearer token. The token is passed to the
+- Every recording gets a new bearer token: 256 bits from the system random
+  number generator, unrelated to the trace and event ids (which are
+  time-ordered and stored in the trace). The token is passed to the
   recorded command in `PREMIER_COLLECTOR_TOKEN`, is compared in constant time,
   and stops working when the recording ends. The collector URL, without the
   token, is stored in the trace's `session.start` event. The recorder
@@ -56,7 +58,12 @@ public key file with your default umask.
   environment does not leave it in the trace; the manifest notes this as
   `redaction.implicit_rules: ["collector-token"]`.
 - Request bodies are limited to 2 MiB (`413` above that) and must arrive
-  within 10 seconds (`408`). There is no rate limit.
+  within 10 seconds (`408`). There is no rate limit on accepted requests.
+- A request without the token gets its `401` after a delay that grows with
+  each refusal in a row (100 ms steps, at most 1 second), and the first one
+  of a recording is written to the trace as a `collector.unauthorized` event.
+  The delay is not what keeps a guesser out, the size of the token is; it
+  bounds what a process hammering the collector costs the recorder.
 - When the recorded command has exited, requests in flight get 2 seconds to
   finish and are then dropped, so a client that holds a connection open
   cannot keep a recording from being finalized.
@@ -182,8 +189,10 @@ file:
   constant time.
 - On Unix the file must not be readable by group or others, or `serve`
   refuses to start. It must contain at least one token.
-- `subject` and `tenant_id` are 1-128 ASCII letters, digits, `-`, `_`, `.`,
-  or `@`.
+- `subject` is 1-128 ASCII letters, digits, `-`, `_`, `.`, or `@`.
+  `tenant_id` is 1-128 ASCII letters, digits, `-`, `_`, or `.`: the same rule
+  as `premier record --tenant` and `premier claim --tenant`, since a
+  credential for a tenant no trace can carry would never read anything.
 - `scopes` may contain `trace:read` and `assistant:use`. Any other value is an
   error. The default is no scopes.
 
@@ -313,10 +322,8 @@ window.
   directory `premier` was started from.
 - Standard input is closed.
 - `PREMIER_PASSWORD`, `PREMIER_AUTH_CONFIG`, `PREMIER_TLS_KEY`,
-  `PREMIER_TRACE_KEY_FILE`, `PREMIER_COLLECTOR_URL`, and
-  `PREMIER_COLLECTOR_TOKEN` are removed from its environment.
-  `PREMIER_SIGN_KEY_FILE` is not on that list: if it is set for the server,
-  the CLI inherits it.
+  `PREMIER_TRACE_KEY_FILE`, `PREMIER_SIGN_KEY_FILE`, `PREMIER_COLLECTOR_URL`,
+  and `PREMIER_COLLECTOR_TOKEN` are removed from its environment.
 - The flags above turn off tools, or restrict the CLI to read-only operation,
   and turn off session persistence where the CLI supports it.
 - One request runs at a time; a second gets `429`. The CLI is killed after 45
@@ -594,9 +601,12 @@ Generating keys and signing are described in
   was abandoned has no digest and no seal. Its event chain exposes a careless
   edit among complete events, but trailing events can be removed at an event
   boundary without trace, exactly as a crash would leave it. `premier
-  recover` refuses a journal whose chain is broken, finalizes whatever
-  complete events are on disk, marks the trace interrupted, and records
-  `seal.recovered: true`.
+  recover` keeps the events before the first one that fails its checks,
+  finalizes them, marks the trace interrupted, and records
+  `seal.recovered: true`. `premier verify` says so for such a trace: it shows
+  that the kept events are genuine and in order, not that none were recorded
+  after them. This holds for encrypted traces too; see
+  [Encrypted traces](#encrypted-traces).
 - **That a trace was not deleted or swapped** for a different one that
   verifies.
 
@@ -605,11 +615,43 @@ Generating keys and signing are described in
 In an encrypted trace the seal, the journal digest, and the event count are
 inside the authenticated, encrypted part of the manifest, and every event
 frame is authenticated and bound to its trace and sequence number. Someone
-without the encryption key cannot read or edit events, drop trailing ones, or
-change the format version, and still produce a trace that decrypts and
-verifies. Someone with the encryption key has the same power over an unsigned
+without the encryption key cannot read or edit events, reorder them, change
+the format version, or shorten the journal under the finalized manifest, and
+still produce a trace that decrypts and verifies as finalized by its
+recorder. Someone with the encryption key has the same power over an unsigned
 encrypted trace as over an unsigned plaintext one; only a signature
 constrains them.
+
+**Limit: rollback to an unfinalized state.** Encryption does not stop someone
+without the key from turning a finalized trace back into what looks like an
+interrupted recording that ended earlier. The conditions are specific:
+
+1. They kept a copy of `manifest.json` from while the trace was being
+   recorded. Every manifest a recorder writes is valid ciphertext under the
+   same key, and the manifest's associated data binds only the format
+   version, the trace id, and the tenant, not how far the recording had got.
+   A manifest of that kind cannot be made without the key; it has to have
+   been copied at the time.
+2. They put that manifest back and replace the journal with a prefix of it
+   cut at a frame boundary, as `events/active.events.pb`. The zstd layer of
+   the finalized journal is outside the encryption, so frames can be
+   separated without the key; the frames themselves stay authentic.
+3. Someone who holds the key then runs `premier recover` on what is, by every
+   check available, an abandoned recording.
+
+The result verifies. It is not presented as the original: it is sealed with
+`seal.recovered: true`, ends with a `session.interrupted` event stamped with
+the time of the recovery, has the interrupted exit status unless the kept
+events include `process.exit`, and `premier verify` prints the note described
+above. Nothing in the trace format can do better without state kept outside
+the trace, because a recording that really was interrupted at that point
+leaves exactly these files. What does detect it:
+
+- A signature made at finalization and checked with `verify --public-key`.
+  The rolled-back trace carries no signature, or the recovering party's.
+- Treating every `seal.recovered` trace as proof of the events it holds and
+  not of where the run ended.
+- Storage that does not let a reader of the trace directory write to it.
 
 Verifying, signing, and checking a signature on an encrypted trace all need
 the encryption key.

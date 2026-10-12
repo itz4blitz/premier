@@ -136,6 +136,11 @@ fn load_bearer_config(path: &Path) -> Result<Vec<BearerCredential>> {
 fn parse_bearer_credential(entry: BearerConfigEntry) -> Result<BearerCredential> {
     validate_identity(&entry.subject, "subject")?;
     validate_identity(&entry.tenant_id, "tenant_id")?;
+    // A trace's tenant never holds `@` (see `premier record --tenant`), so a
+    // credential for such a tenant could never read anything.
+    if entry.tenant_id.contains('@') {
+        bail!("tenant_id must be 1-128 ASCII letters, digits, '.', '_' or '-'")
+    }
     let token_sha256 = decode_sha256(&entry.token_sha256)?;
     let scopes = entry.scopes.into_iter().collect::<HashSet<_>>();
     if !scopes
@@ -273,8 +278,11 @@ fn compute_trace_snapshot(path: &Path) -> Result<TraceSnapshot> {
         validator.push(event);
     })?;
     let mut manifest = scan.manifest;
-    if manifest.diagnostics.is_empty() && scan.complete {
-        manifest.diagnostics = validator.finish();
+    // Reported diagnostics are those of this build's validator, not the
+    // ones frozen into the manifest by whichever build finalized the trace.
+    if scan.complete {
+        manifest.diagnostics =
+            premier_trace::current_diagnostics(&manifest.diagnostics, validator.finish());
     }
     let summary = scan.complete.then(|| summary.finish(&manifest));
     let integrity = match scan.verified {
@@ -577,17 +585,143 @@ fn embedded_file_response(path: &str, data: &[u8]) -> Response {
         .into_response()
 }
 
-#[derive(Clone)]
 struct InstrumentationState {
     writer: Arc<Mutex<TraceWriter>>,
     token: String,
+    /// The trace this collector records; a body addressed to another is refused.
+    trace_id: String,
+    /// Requests refused for a missing or wrong token since the last accepted one.
+    rejected_tokens: std::sync::atomic::AtomicU32,
+    /// Whether the first such request has been written to the trace.
+    rejection_recorded: std::sync::atomic::AtomicBool,
 }
 
 pub fn instrumentation_app(writer: Arc<Mutex<TraceWriter>>, token: String) -> Router {
+    let trace_id = writer
+        .lock()
+        .map(|writer| writer.trace_id().to_owned())
+        .unwrap_or_default();
     Router::new()
         .route("/v1/events", post(capture_event))
         .route("/health", get(collector_health))
-        .with_state(Arc::new(InstrumentationState { writer, token }))
+        .with_state(Arc::new(InstrumentationState {
+            writer,
+            token,
+            trace_id,
+            rejected_tokens: std::sync::atomic::AtomicU32::new(0),
+            rejection_recorded: std::sync::atomic::AtomicBool::new(false),
+        }))
+}
+
+/// How much longer each further wrong token in a row has to wait for its
+/// `401`, and the most any one waits. The token is 256 random bits, so this
+/// is not what keeps a guesser out; it keeps a process that hammers the
+/// collector from costing the recorder much, and makes the attempt visible.
+const REJECTED_TOKEN_DELAY_STEP: Duration = Duration::from_millis(100);
+const REJECTED_TOKEN_DELAY_LIMIT: Duration = Duration::from_secs(1);
+
+/// Refuse a request that did not present the collector token: after a delay
+/// that grows with consecutive refusals, and leaving one
+/// `collector.unauthorized` event in the trace (the first refusal only, so
+/// the trace cannot be filled this way).
+async fn reject_collector_token(state: &InstrumentationState) -> ApiResponseError {
+    use std::sync::atomic::Ordering;
+    let rejected = state.rejected_tokens.fetch_add(1, Ordering::SeqCst) + 1;
+    if rejected.is_power_of_two() {
+        tracing::warn!(
+            "collector refused a request without the collector token ({rejected} in a row)"
+        );
+    }
+    if !state.rejection_recorded.swap(true, Ordering::SeqCst)
+        && let Ok(mut writer) = state.writer.lock()
+    {
+        let _ = writer.append_input(EventInput {
+            kind: "collector.unauthorized".into(),
+            source: "premier".into(),
+            actor_id: "root".into(),
+            actor_type: "process".into(),
+            span_id: "session".into(),
+            status: "denied".into(),
+            payload: serde_json::json!({
+                "reason": "a request to the collector did not present the collector token",
+                "note": "only the first such request of a recording is recorded",
+            }),
+            ..EventInput::default()
+        });
+    }
+    tokio::time::sleep(
+        REJECTED_TOKEN_DELAY_STEP
+            .saturating_mul(rejected)
+            .min(REJECTED_TOKEN_DELAY_LIMIT),
+    )
+    .await;
+    ApiResponseError {
+        status: StatusCode::UNAUTHORIZED,
+        message: "invalid collector token".into(),
+    }
+}
+
+/// Top-level fields of a collector request body. `trace_id` and `run` are
+/// sent by the SDKs to address a hosted collector; the local one checks the
+/// first and ignores the second.
+const COLLECTOR_EVENT_FIELDS: [&str; 15] = [
+    "kind",
+    "source",
+    "actor_id",
+    "actor_type",
+    "parent_event_id",
+    "span_id",
+    "parent_span_id",
+    "correlation_id",
+    "status",
+    "duration_ms",
+    "links",
+    "payload",
+    "timestamp",
+    "trace_id",
+    "run",
+];
+
+/// Decode a collector request body. It must be one JSON object holding only
+/// known fields: an array would otherwise be read positionally, and a
+/// misspelt field (`actor` for `actor_id`) would be dropped without a word.
+fn parse_collector_event(bytes: &[u8], trace_id: &str) -> Result<EventInput, ApiResponseError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| ApiResponseError::bad_request(&error.to_string()))?;
+    let Some(object) = value.as_object() else {
+        return Err(ApiResponseError::bad_request(
+            "event body must be a JSON object",
+        ));
+    };
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !COLLECTOR_EVENT_FIELDS.contains(&key.as_str()))
+    {
+        // The name is the client's own text: keep the answer short and printable.
+        let shown: String = unknown
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect();
+        return Err(ApiResponseError::bad_request(&format!(
+            "unknown event field `{shown}`; the fields are {}",
+            COLLECTOR_EVENT_FIELDS.join(", ")
+        )));
+    }
+    match object.get("trace_id") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(claimed)) if claimed.is_empty() || claimed == trace_id => {}
+        Some(serde_json::Value::String(_)) => {
+            return Err(ApiResponseError {
+                status: StatusCode::CONFLICT,
+                message: format!(
+                    "event is addressed to a different trace; this collector records {trace_id}"
+                ),
+            });
+        }
+        Some(_) => return Err(ApiResponseError::bad_request("trace_id must be a string")),
+    }
+    serde_json::from_value(value).map_err(|error| ApiResponseError::bad_request(&error.to_string()))
 }
 
 async fn collector_health() -> Json<serde_json::Value> {
@@ -605,11 +739,11 @@ async fn capture_event(
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or_default();
     if !bool::from(provided.as_bytes().ct_eq(state.token.as_bytes())) {
-        return Err(ApiResponseError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "invalid collector token".into(),
-        });
+        return Err(reject_collector_token(&state).await);
     }
+    state
+        .rejected_tokens
+        .store(0, std::sync::atomic::Ordering::SeqCst);
     let too_large = || ApiResponseError {
         status: StatusCode::PAYLOAD_TOO_LARGE,
         message: format!("event body exceeds {COLLECTOR_BODY_LIMIT} bytes"),
@@ -640,8 +774,7 @@ async fn capture_event(
             ApiResponseError::bad_request(&error.to_string())
         }
     })?;
-    let mut input: EventInput = serde_json::from_slice(&bytes)
-        .map_err(|error| ApiResponseError::bad_request(&error.to_string()))?;
+    let mut input = parse_collector_event(&bytes, &state.trace_id)?;
     if let Some(reason) = recorder_owned(&input) {
         return Err(ApiResponseError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -654,7 +787,13 @@ async fn capture_event(
         .writer
         .lock()
         .map_err(|_| ApiResponseError::internal("trace writer lock was poisoned"))?
-        .append_input(input)?;
+        .append_input(input)
+        .map_err(|error| {
+            // The recorder reports journal failures itself; the producer
+            // only needs to know the event was not stored.
+            tracing::warn!("collector could not record an event: {error:#}");
+            ApiResponseError::internal("the event could not be recorded")
+        })?;
     Ok(Json(event))
 }
 
@@ -1311,11 +1450,12 @@ impl Drop for AssistantScratchDir {
 }
 
 /// Server and recorder secrets an assistant CLI has no use for.
-const ASSISTANT_SCRUBBED_ENV: [&str; 6] = [
+const ASSISTANT_SCRUBBED_ENV: [&str; 7] = [
     "PREMIER_PASSWORD",
     "PREMIER_AUTH_CONFIG",
     "PREMIER_TLS_KEY",
     premier_trace::KEY_FILE_ENV,
+    premier_trace::SIGN_KEY_FILE_ENV,
     "PREMIER_COLLECTOR_URL",
     "PREMIER_COLLECTOR_TOKEN",
 ];
@@ -1673,6 +1813,11 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
     // Sealed evidence the server holds no usable key for is intact, not
     // damaged: say so, and keep the public envelope so the viewer can tell.
     let locked = premier_trace::trace_is_encrypted(path).unwrap_or(false);
+    // A trace in a later format is not damaged either: this build is too old for it.
+    let newer_format = error
+        .downcast_ref::<premier_trace::UnsupportedFormatVersion>()
+        .filter(|unsupported| unsupported.is_newer())
+        .map(|unsupported| unsupported.found);
     let partial = fs::read(path.join("manifest.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -1710,7 +1855,16 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
     TraceListEntry {
         manifest: TraceManifest {
             format_version: 0,
-            trace_id: format!("{}:{artifact}", if locked { "locked" } else { "damaged" }),
+            trace_id: format!(
+                "{}:{artifact}",
+                if newer_format.is_some() {
+                    "unsupported"
+                } else if locked {
+                    "locked"
+                } else {
+                    "damaged"
+                }
+            ),
             tenant_id: premier_trace::LOCAL_TENANT.into(),
             name,
             command,
@@ -1727,15 +1881,24 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
             encryption: locked
                 .then(|| serde_json::from_value(partial["encryption"].clone()).ok())
                 .flatten(),
+            extra: serde_json::Map::new(),
         },
         summary: None,
         artifact,
-        integrity: if locked {
+        integrity: if newer_format.is_some() {
+            IntegrityStatus::Unsupported
+        } else if locked {
             IntegrityStatus::Locked
         } else {
             IntegrityStatus::Invalid
         },
-        integrity_detail: Some(if !locked {
+        integrity_detail: Some(if let Some(version) = newer_format {
+            format!(
+                "needs a newer Premier: this trace is in format version {version}, and this build reads versions {} to {}. Nothing indicates it is damaged.",
+                premier_trace::MIN_FORMAT_VERSION,
+                premier_trace::FORMAT_VERSION
+            )
+        } else if !locked {
             format!(
                 "invalid manifest: {}",
                 integrity.detail.unwrap_or_else(|| error.to_string())
@@ -1955,11 +2118,29 @@ async fn stream_events(
                 let snapshot_state = state.clone();
                 let snapshot_path = trace_path.clone();
                 let snapshot = tokio::task::spawn_blocking(move || {
-                    trace_snapshot(&snapshot_state, &snapshot_path).ok()
+                    trace_snapshot(&snapshot_state, &snapshot_path)
                 })
                 .await
-                .ok()
-                .flatten();
+                .map_err(anyhow::Error::from)
+                .and_then(|snapshot| snapshot);
+                // The stream always ends with a terminal event. When the
+                // finalized trace cannot be read back (damaged since, or
+                // removed mid-read), the manifest that showed it finalized
+                // is reported as failing verification instead of the
+                // stream just closing, which a client would take for a
+                // dropped connection and retry forever.
+                let snapshot = snapshot.unwrap_or_else(|error| {
+                    tracing::warn!("cannot read back finalized trace for its event stream: {error:#}");
+                    TraceSnapshot {
+                        manifest: manifest.clone().expect("a finalized manifest was read"),
+                        summary: None,
+                        integrity: IntegrityReport::new(
+                            IntegrityStatus::Invalid,
+                            Some("the finalized trace could not be read back".into()),
+                        ),
+                        index: None,
+                    }
+                });
                 // Pages resume from the journal index the snapshot built, so
                 // the drain costs what is left to send, not the whole journal.
                 loop {
@@ -1983,13 +2164,11 @@ async fn stream_events(
                     }
                 }
                 // Terminal signal so clients transition to RECORDED without thrashing reconnects.
-                if let Some(snapshot) = snapshot {
-                    let complete = trace_detail(&trace_path, snapshot);
-                    if let Ok(message) = Event::default().event("trace.complete").json_data(complete)
-                    {
-                        yield Ok(message);
-                    }
-                }
+                let complete = trace_detail(&trace_path, snapshot);
+                yield Ok(Event::default()
+                    .event("trace.complete")
+                    .json_data(&complete)
+                    .unwrap_or_else(|_| Event::default().event("trace.complete").data("{}")));
                 break;
             }
             // Nobody is left to append to or finalize an abandoned trace, so
@@ -2009,9 +2188,10 @@ async fn stream_events(
                 // yet; only a repeated answer counts.
                 Some(snapshot) if abandoned_polls + 1 >= STREAM_ABANDONED_POLLS => {
                     let detail = trace_detail(&trace_path, snapshot);
-                    if let Ok(message) = Event::default().event("trace.abandoned").json_data(detail) {
-                        yield Ok(message);
-                    }
+                    yield Ok(Event::default()
+                        .event("trace.abandoned")
+                        .json_data(&detail)
+                        .unwrap_or_else(|_| Event::default().event("trace.abandoned").data("{}")));
                     break;
                 }
                 Some(_) => abandoned_polls += 1,
@@ -2131,14 +2311,17 @@ impl ApiResponseError {
     }
 }
 
+/// Any error a handler did not classify is an internal one. Its text can
+/// name server-side paths, key files and operating system details, so it
+/// goes to the server log and the client gets a fixed message.
 impl<E: Into<anyhow::Error>> From<E> for ApiResponseError {
     fn from(error: E) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.into().to_string(),
-        }
+        tracing::error!("internal error while serving a request: {:#}", error.into());
+        Self::internal(INTERNAL_ERROR_MESSAGE)
     }
 }
+
+const INTERNAL_ERROR_MESSAGE: &str = "internal error; see the premier server log";
 
 impl IntoResponse for ApiResponseError {
     fn into_response(self) -> Response {
@@ -4028,5 +4211,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("plaintext trace"));
+    }
+
+    #[test]
+    fn the_assistant_never_inherits_recorder_or_server_key_material() {
+        for variable in [
+            premier_trace::KEY_FILE_ENV,
+            premier_trace::SIGN_KEY_FILE_ENV,
+            "PREMIER_COLLECTOR_TOKEN",
+            "PREMIER_PASSWORD",
+            "PREMIER_TLS_KEY",
+        ] {
+            assert!(
+                ASSISTANT_SCRUBBED_ENV.contains(&variable),
+                "{variable} would reach an assistant CLI"
+            );
+        }
     }
 }
