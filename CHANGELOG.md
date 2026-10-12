@@ -8,6 +8,16 @@ integrations may depend on.
 
 ### Added
 
+- `premier verify --live` checks an unfinalized trace's frames and hash chain
+  without modifying it.
+- `premier recover --sign-key` signs a recovered trace.
+- `premier recover` salvages the valid prefix of a damaged active journal and
+  records what it discarded (`seal.discarded_bytes`, `seal.discarded_frames`,
+  a `journal.recovery_discarded` diagnostic).
+- Streaming readers: `verify`, `query`, `export`, `replay`, finalization, and
+  the viewer server no longer load a whole journal into memory. Finalized
+  journals are written as independently readable blocks, and the viewer API
+  pages through them without rescanning from the start.
 - **Trace format version 2: event hash chain, manifest seal, optional
   signature.** Every event names the hash of the event before it, and the
   manifest carries a seal over all of its fields and the chain head.
@@ -144,6 +154,12 @@ integrations may depend on.
 
 ### Changed
 
+- **Breaking:** in `premier export` output the `redaction` block now follows
+  `events`.
+- **Breaking:** a trace recovered with discarded data carries seal fields that
+  earlier builds of this branch do not accept.
+- A truncated finalized journal is an error in every reader instead of reading
+  as fewer events.
 - **Breaking: new traces are written in format version 2.** The manifest has
   `format_version: 2` and a `seal`, and every event has a `prev_hash`. This
   version reads and verifies version 1 traces (reported as `v1: digest

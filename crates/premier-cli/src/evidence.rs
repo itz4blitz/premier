@@ -1,6 +1,8 @@
 use premier_trace::{PublicKey, TraceEvent, TraceManifest};
 use serde::Serialize;
+use serde::ser::{Error as _, SerializeSeq, SerializeStruct};
 use serde_json::{Map, Value, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 pub const MAX_QUERY_LIMIT: usize = 1_000;
@@ -42,17 +44,51 @@ fn exact_filter(expected: &Option<String>, actual: &str) -> bool {
 }
 
 pub fn query_events(events: &[TraceEvent], options: &QueryOptions) -> QueryResult {
-    let query = options
-        .search
-        .as_deref()
-        .map(str::trim)
-        .filter(|query| !query.is_empty())
-        .map(str::to_lowercase);
-    let filtered = events.iter().filter(|event| {
-        exact_filter(&options.kind, &event.kind)
-            && exact_filter(&options.actor, &event.actor_id)
-            && exact_filter(&options.status, &event.status)
-            && query.as_ref().is_none_or(|query| {
+    let mut matcher = QueryMatcher::new(options);
+    for event in events {
+        if matcher.matches(event) {
+            matcher.keep(|| event.clone());
+        }
+    }
+    matcher.finish()
+}
+
+/// [`query_events`] over events arriving one at a time: only the matches up
+/// to the limit are kept.
+pub struct QueryMatcher<'a> {
+    options: &'a QueryOptions,
+    search: Option<String>,
+    matched: usize,
+    returned: Vec<TraceEvent>,
+}
+
+impl<'a> QueryMatcher<'a> {
+    pub fn new(options: &'a QueryOptions) -> Self {
+        Self {
+            options,
+            search: options
+                .search
+                .as_deref()
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
+                .map(str::to_lowercase),
+            matched: 0,
+            returned: Vec::new(),
+        }
+    }
+
+    /// Count `event` and keep it when it matches and the limit allows.
+    pub fn push(&mut self, event: TraceEvent) {
+        if self.matches(&event) {
+            self.keep(|| event);
+        }
+    }
+
+    fn matches(&self, event: &TraceEvent) -> bool {
+        exact_filter(&self.options.kind, &event.kind)
+            && exact_filter(&self.options.actor, &event.actor_id)
+            && exact_filter(&self.options.status, &event.status)
+            && self.search.as_ref().is_none_or(|query| {
                 [
                     event.kind.as_str(),
                     event.source.as_str(),
@@ -65,20 +101,22 @@ pub fn query_events(events: &[TraceEvent], options: &QueryOptions) -> QueryResul
                 .to_lowercase()
                 .contains(query)
             })
-    });
-    let mut matched = 0;
-    let mut returned = Vec::with_capacity(options.limit.min(events.len()));
-    for event in filtered {
-        matched += 1;
-        if returned.len() < options.limit {
-            returned.push(event.clone());
+    }
+
+    fn keep(&mut self, event: impl FnOnce() -> TraceEvent) {
+        self.matched += 1;
+        if self.returned.len() < self.options.limit {
+            self.returned.push(event());
         }
     }
-    QueryResult {
-        matched,
-        returned: returned.len(),
-        truncated: matched > returned.len(),
-        events: returned,
+
+    pub fn finish(self) -> QueryResult {
+        QueryResult {
+            matched: self.matched,
+            returned: self.returned.len(),
+            truncated: self.matched > self.returned.len(),
+            events: self.returned,
+        }
     }
 }
 
@@ -132,11 +170,15 @@ pub fn redact_secrets_with(value: &mut Value, value_patterns: bool) -> Redaction
 #[derive(Debug, Serialize)]
 pub struct PortableEvidence {
     pub format: &'static str,
-    pub redaction: PortableRedaction,
     pub source: PortableSource,
     pub manifest: Value,
     pub events: Vec<Value>,
+    /// Written after the events it counts, so an export can be produced in
+    /// one pass over the journal.
+    pub redaction: PortableRedaction,
 }
+
+const PORTABLE_FORMAT: &str = "premier.portable-evidence.v1";
 
 /// Tamper-evidence values of the trace an export was derived from, copied
 /// from its manifest so the package states its origin.
@@ -222,49 +264,77 @@ pub fn portable_evidence_with(
     events: &[TraceEvent],
     options: RedactionOptions,
 ) -> PortableEvidence {
-    let mut structured = SecretRedactor::new(options.default_secret_patterns);
-    // Captured terminal text is only pattern-matched when asked for.
-    let mut terminal = SecretRedactor::new(options.known_secrets_in_terminal);
+    let mut redactors = ExportRedactors::new(options);
     let source = portable_source(manifest);
-    let mut manifest = serde_json::to_value(manifest).unwrap_or(Value::Null);
-    structured.redact(&mut manifest);
-    let events = events
-        .iter()
-        .map(|event| {
-            let mut object = match serde_json::to_value(event).unwrap_or(Value::Null) {
-                Value::Object(object) => object,
-                _ => Map::new(),
-            };
-            object.remove("payload_json");
-            let mut payload = event.payload();
-            let terminal_text = matches!(
-                event.kind.as_str(),
-                "process.stdout" | "process.stderr" | "process.terminal"
-            )
-            .then(|| payload.as_object_mut()?.remove("text"))
-            .flatten();
-            object.insert("payload".into(), payload);
-            let mut event = Value::Object(object);
-            structured.redact(&mut event);
-            if let Some(mut text) = terminal_text {
-                terminal.redact(&mut text);
-                event["payload"]["text"] = text;
-            }
-            event
-        })
-        .collect();
-    let mut redacted = structured.into_counts();
-    let terminal = terminal.into_counts();
-    redacted.total += terminal.total;
-    redacted.field_names += terminal.field_names;
-    redacted.already_redacted += terminal.already_redacted;
-    for (name, count) in terminal.value_patterns {
-        *redacted.value_patterns.entry(name).or_default() += count;
-    }
-    let builtin = options.default_secret_patterns || options.known_secrets_in_terminal;
+    let manifest = redactors.manifest(manifest);
+    let events = events.iter().map(|event| redactors.event(event)).collect();
     PortableEvidence {
-        format: "premier.portable-evidence.v1",
-        redaction: PortableRedaction {
+        format: PORTABLE_FORMAT,
+        source,
+        manifest,
+        events,
+        redaction: redactors.finish(options),
+    }
+}
+
+/// The two redaction passes of an export and what they have removed so far.
+/// Both are the recorder's shared [`SecretRedactor`], so the in-memory and
+/// the streamed export apply exactly the rules a recording does.
+struct ExportRedactors {
+    structured: SecretRedactor<'static>,
+    /// Captured terminal text is only pattern-matched when asked for.
+    terminal: SecretRedactor<'static>,
+}
+
+impl ExportRedactors {
+    fn new(options: RedactionOptions) -> Self {
+        Self {
+            structured: SecretRedactor::new(options.default_secret_patterns),
+            terminal: SecretRedactor::new(options.known_secrets_in_terminal),
+        }
+    }
+
+    fn manifest(&mut self, manifest: &TraceManifest) -> Value {
+        let mut manifest = serde_json::to_value(manifest).unwrap_or(Value::Null);
+        self.structured.redact(&mut manifest);
+        manifest
+    }
+
+    fn event(&mut self, event: &TraceEvent) -> Value {
+        let mut object = match serde_json::to_value(event).unwrap_or(Value::Null) {
+            Value::Object(object) => object,
+            _ => Map::new(),
+        };
+        object.remove("payload_json");
+        let mut payload = event.payload();
+        let terminal_text = matches!(
+            event.kind.as_str(),
+            "process.stdout" | "process.stderr" | "process.terminal"
+        )
+        .then(|| payload.as_object_mut()?.remove("text"))
+        .flatten();
+        object.insert("payload".into(), payload);
+        let mut event = Value::Object(object);
+        self.structured.redact(&mut event);
+        if let Some(mut text) = terminal_text {
+            self.terminal.redact(&mut text);
+            event["payload"]["text"] = text;
+        }
+        event
+    }
+
+    /// The `redaction` block for everything redacted so far.
+    fn finish(&self, options: RedactionOptions) -> PortableRedaction {
+        let mut redacted = self.structured.counts().clone();
+        let terminal = self.terminal.counts().clone();
+        redacted.total += terminal.total;
+        redacted.field_names += terminal.field_names;
+        redacted.already_redacted += terminal.already_redacted;
+        for (name, count) in terminal.value_patterns {
+            *redacted.value_patterns.entry(name).or_default() += count;
+        }
+        let builtin = options.default_secret_patterns || options.known_secrets_in_terminal;
+        PortableRedaction {
             applied: redacted.total > 0,
             replacement: REDACTED,
             policy: "recursive common secret field names, including JSON strings and header or argument lists, plus built-in secret value patterns",
@@ -279,10 +349,91 @@ pub fn portable_evidence_with(
                 builtin_patterns_terminal: options.known_secrets_in_terminal,
             },
             redacted,
-        },
-        source,
-        manifest,
-        events,
+        }
+    }
+}
+
+/// Write the same document as [`portable_evidence_with`] to `writer`,
+/// redacting and serializing one event at a time instead of building the
+/// export in memory. Returns what was redacted.
+pub fn write_portable_evidence<W: std::io::Write>(
+    writer: W,
+    manifest: &TraceManifest,
+    events: impl Iterator<Item = anyhow::Result<TraceEvent>>,
+    options: RedactionOptions,
+) -> anyhow::Result<RedactionCounts> {
+    let mut redactors = ExportRedactors::new(options);
+    let export = StreamedEvidence {
+        source: portable_source(manifest),
+        manifest: redactors.manifest(manifest),
+        options,
+        state: RefCell::new(StreamedState {
+            events: Some(events),
+            redactors,
+            failure: None,
+            redacted: RedactionCounts::default(),
+        }),
+    };
+    let written = serde_json::to_writer_pretty(writer, &export);
+    let state = export.state.into_inner();
+    if let Some(error) = state.failure {
+        return Err(error);
+    }
+    written?;
+    Ok(state.redacted)
+}
+
+struct StreamedState<I> {
+    events: Option<I>,
+    redactors: ExportRedactors,
+    /// The journal error that ended serialization early.
+    failure: Option<anyhow::Error>,
+    redacted: RedactionCounts,
+}
+
+struct StreamedEvidence<I> {
+    source: PortableSource,
+    manifest: Value,
+    options: RedactionOptions,
+    state: RefCell<StreamedState<I>>,
+}
+
+impl<I: Iterator<Item = anyhow::Result<TraceEvent>>> Serialize for StreamedEvidence<I> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut document = serializer.serialize_struct("PortableEvidence", 5)?;
+        document.serialize_field("format", PORTABLE_FORMAT)?;
+        document.serialize_field("source", &self.source)?;
+        document.serialize_field("manifest", &self.manifest)?;
+        document.serialize_field("events", &StreamedEvents(&self.state))?;
+        // Fields are written in order, so the counts are complete by now.
+        let redaction = self.state.borrow_mut().redactors.finish(self.options);
+        document.serialize_field("redaction", &redaction)?;
+        self.state.borrow_mut().redacted = redaction.redacted;
+        document.end()
+    }
+}
+
+struct StreamedEvents<'a, I>(&'a RefCell<StreamedState<I>>);
+
+impl<I: Iterator<Item = anyhow::Result<TraceEvent>>> Serialize for StreamedEvents<'_, I> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = self.0.borrow_mut();
+        let state = &mut *state;
+        let events = state
+            .events
+            .take()
+            .ok_or_else(|| S::Error::custom("events were already written"))?;
+        let mut sequence = serializer.serialize_seq(None)?;
+        for event in events {
+            match event {
+                Ok(event) => sequence.serialize_element(&state.redactors.event(&event))?,
+                Err(error) => {
+                    state.failure = Some(error);
+                    return Err(S::Error::custom("cannot read the trace journal"));
+                }
+            }
+        }
+        sequence.end()
     }
 }
 

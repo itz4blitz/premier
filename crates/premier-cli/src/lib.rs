@@ -11,10 +11,10 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use premier_trace::{
-    ACTIVE_JOURNAL, EventInput, FINAL_JOURNAL, IntegrityReport, IntegrityStatus, Protection,
-    TraceEvent, TraceManifest, TraceWriter, assess_integrity, read_active_events_after,
-    read_events, read_events_page, read_manifest, validate_events, verify_decoded_events,
-    verify_journal_digest,
+    ACTIVE_JOURNAL, ActiveCursor, EventInput, EventValidator, FINAL_JOURNAL, IntegrityReport,
+    IntegrityStatus, JournalIndex, Protection, TraceEvent, TraceManifest, TraceWriter,
+    assess_integrity, read_active_events_from, read_events, read_events_page,
+    read_events_page_indexed, read_manifest, scan_trace,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -227,6 +227,10 @@ struct TraceSnapshot {
     manifest: TraceManifest,
     summary: Option<TraceListSummary>,
     integrity: IntegrityReport,
+    /// Resume points of the finalized journal, gathered by the pass that
+    /// verified it, so a page of events is decoded from the nearest one
+    /// instead of from the start. Shares the snapshot's freshness stamp.
+    index: Option<Arc<JournalIndex>>,
 }
 
 /// Read, validate, and verify a trace exactly once per artifact change.
@@ -258,40 +262,61 @@ fn with_recorder_liveness(path: &Path, mut snapshot: TraceSnapshot) -> TraceSnap
     snapshot
 }
 
+/// One pass over the journal, one frame in memory at a time: it verifies the
+/// trace, derives the list summary and the diagnostics, and collects the
+/// journal's resume points.
 fn compute_trace_snapshot(path: &Path) -> Result<TraceSnapshot> {
-    let mut manifest = read_manifest(path)?;
-    let events = read_events(path);
-    if manifest.diagnostics.is_empty()
-        && let Ok(events) = &events
-    {
-        manifest.diagnostics = validate_events(events);
+    let mut summary = SummaryBuilder::default();
+    let mut validator = EventValidator::default();
+    let scan = scan_trace(path, |event| {
+        summary.push(event);
+        validator.push(event);
+    })?;
+    let mut manifest = scan.manifest;
+    if manifest.diagnostics.is_empty() && scan.complete {
+        manifest.diagnostics = validator.finish();
     }
-    let summary = events
-        .as_ref()
-        .ok()
-        .map(|events| summarize_trace(&manifest, events));
-    let integrity = if manifest.journal.is_none() {
-        IntegrityReport::new(IntegrityStatus::Live, None)
-    } else {
-        let verified = verify_journal_digest(path, &manifest).and_then(|()| match &events {
-            Ok(events) => verify_decoded_events(&manifest, events),
-            Err(error) => Err(anyhow::anyhow!("{error}")),
-        });
-        match verified {
-            Ok(seal) => IntegrityReport {
-                status: IntegrityStatus::Verified,
-                detail: None,
-                protection: Some(seal.protection),
-                signer: seal.signer.map(|key| key.fingerprint()),
-            },
-            Err(error) => IntegrityReport::new(IntegrityStatus::Invalid, Some(error.to_string())),
-        }
+    let summary = scan.complete.then(|| summary.finish(&manifest));
+    let integrity = match scan.verified {
+        None => IntegrityReport::new(IntegrityStatus::Live, None),
+        Some(Ok(seal)) => IntegrityReport {
+            status: IntegrityStatus::Verified,
+            detail: None,
+            protection: Some(seal.protection),
+            signer: seal.signer.map(|key| key.fingerprint()),
+        },
+        Some(Err(error)) => IntegrityReport::new(IntegrityStatus::Invalid, Some(error.to_string())),
     };
     Ok(TraceSnapshot {
         manifest,
         summary,
         integrity,
+        index: scan.index.map(Arc::new),
     })
+}
+
+/// Resume points for paging a finalized journal, from the snapshot cache.
+/// An unfinalized trace has none: its snapshot changes with every append.
+fn journal_index(state: &AppState, path: &Path) -> Option<Arc<JournalIndex>> {
+    let events = path.join("events");
+    if events.join(ACTIVE_JOURNAL).exists() || !events.join(FINAL_JOURNAL).exists() {
+        return None;
+    }
+    trace_snapshot(state, path).ok()?.index
+}
+
+/// One page of events, decoded from the nearest resume point when the
+/// journal is finalized.
+fn read_page(
+    state: &AppState,
+    path: &Path,
+    after_sequence: u64,
+    limit: usize,
+) -> Result<Vec<TraceEvent>> {
+    match journal_index(state, path) {
+        Some(index) => read_events_page_indexed(path, &index, after_sequence, limit),
+        None => read_events_page(path, after_sequence, limit),
+    }
 }
 
 const ASSISTANT_BODY_LIMIT: usize = 24 * 1024;
@@ -1728,43 +1753,75 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
     }
 }
 
+#[cfg(test)]
 fn summarize_trace(manifest: &TraceManifest, events: &[TraceEvent]) -> TraceListSummary {
-    let actors = events
-        .iter()
-        .map(|event| {
-            let actor = event.actor_id.trim();
-            if actor.is_empty() { "root" } else { actor }
-        })
-        .collect::<HashSet<_>>();
-    TraceListSummary {
-        display_name: manifest
-            .name
-            .as_deref()
-            .and_then(human_readable_text)
-            .map(str::to_owned)
-            .or_else(|| event_display_name(events)),
-        actor_count: actors.len() as u64,
-        issue_count: events
-            .iter()
-            .filter(|event| issues::is_issue(event))
-            .count() as u64,
-        event_count: events.len() as u64,
+    let mut summary = SummaryBuilder::default();
+    for event in events {
+        summary.push(event);
     }
+    summary.finish(manifest)
 }
 
-fn event_display_name(events: &[TraceEvent]) -> Option<String> {
-    const KEYS: [&str; 5] = ["goal", "objective", "title", "name", "task"];
-    KEYS.iter().find_map(|key| {
-        events.iter().find_map(|event| {
-            event
-                .payload()
-                .as_object()?
-                .get(*key)
-                .and_then(serde_json::Value::as_str)
+/// Payload keys that can name a trace, most preferred first.
+const DISPLAY_NAME_KEYS: [&str; 5] = ["goal", "objective", "title", "name", "task"];
+
+/// The list summary of a trace, accumulated one event at a time.
+#[derive(Default)]
+struct SummaryBuilder {
+    actors: HashSet<String>,
+    issue_count: u64,
+    event_count: u64,
+    /// First readable value seen for each of [`DISPLAY_NAME_KEYS`].
+    names: [Option<String>; 5],
+}
+
+impl SummaryBuilder {
+    fn push(&mut self, event: &TraceEvent) {
+        self.event_count += 1;
+        let actor = event.actor_id.trim();
+        let actor = if actor.is_empty() { "root" } else { actor };
+        if !self.actors.contains(actor) {
+            self.actors.insert(actor.to_owned());
+        }
+        if issues::is_issue(event) {
+            self.issue_count += 1;
+        }
+        // Nothing can outrank the most preferred key once it is found, and a
+        // payload that mentions none of the missing keys cannot supply one.
+        let missing = |index: usize, names: &[Option<String>; 5]| {
+            names[index].is_none() && event.payload_json.contains(DISPLAY_NAME_KEYS[index])
+        };
+        if self.names[0].is_some() || !(0..5).any(|index| missing(index, &self.names)) {
+            return;
+        }
+        let payload = event.payload();
+        let Some(payload) = payload.as_object() else {
+            return;
+        };
+        for (index, key) in DISPLAY_NAME_KEYS.iter().enumerate() {
+            if self.names[index].is_none() {
+                self.names[index] = payload
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(human_readable_text)
+                    .map(str::to_owned);
+            }
+        }
+    }
+
+    fn finish(self, manifest: &TraceManifest) -> TraceListSummary {
+        TraceListSummary {
+            display_name: manifest
+                .name
+                .as_deref()
                 .and_then(human_readable_text)
                 .map(str::to_owned)
-        })
-    })
+                .or_else(|| self.names.into_iter().flatten().next()),
+            actor_count: self.actors.len() as u64,
+            issue_count: self.issue_count,
+            event_count: self.event_count,
+        }
+    }
 }
 
 fn human_readable_text(value: &str) -> Option<&str> {
@@ -1820,7 +1877,7 @@ async fn get_events(
                         "limit must be between 1 and 10000",
                     ));
                 }
-                Ok(read_events_page(path, after.unwrap_or(0), limit)?)
+                Ok(read_page(&state, &path, after.unwrap_or(0), limit)?)
             }
         }
     })
@@ -1838,6 +1895,10 @@ struct EventPageQuery {
 /// stream ends with `trace.abandoned`.
 const STREAM_ABANDONED_POLLS: u32 = 2;
 
+/// Most events the event stream reads from a journal at a time, so a large
+/// trace is forwarded in bounded batches instead of being loaded whole.
+const STREAM_BATCH_EVENTS: usize = 512;
+
 /// Tail a trace as server-sent events: `trace.event` for each event, then
 /// exactly one terminal event before the stream closes — `trace.complete`
 /// once the trace is finalized (by its recorder or by `premier recover`), or
@@ -1854,20 +1915,33 @@ async fn stream_events(
     // instead of receiving every recorded event a second time.
     let resume_after = query.after_sequence.unwrap_or(0);
     let stream = async_stream::stream! {
-        let mut byte_offset = 0_u64;
+        let mut cursor = ActiveCursor::start();
         let mut seen_sequence = resume_after;
         let mut abandoned_polls = 0_u32;
         loop {
-            if let Ok(tail) = read_active_events_after(&trace_path, byte_offset) {
-                byte_offset = tail.next_byte_offset;
-                for event in tail.events {
-                    if event.sequence <= resume_after {
-                        continue;
-                    }
+            // Bounded batches from where the last one ended. What the client
+            // already has is decoded once, on the first pass, to validate the
+            // journal up to the resume point; it is never collected or sent.
+            loop {
+                let tail_path = trace_path.clone();
+                let tail_cursor = cursor.clone();
+                let batch = tokio::task::spawn_blocking(move || {
+                    read_active_events_from(&tail_path, &tail_cursor, resume_after, STREAM_BATCH_EVENTS)
+                })
+                .await;
+                let Ok(Ok(batch)) = batch else {
+                    break;
+                };
+                cursor = batch.cursor;
+                let more = batch.end.is_none();
+                for event in batch.events {
                     seen_sequence = seen_sequence.max(event.sequence);
                     if let Ok(message) = Event::default().event("trace.event").json_data(event) {
                         yield Ok(message);
                     }
+                }
+                if !more {
+                    break;
                 }
             }
             let manifest = read_manifest(&trace_path).ok();
@@ -1878,31 +1952,42 @@ async fn stream_events(
                 // The active journal may have been atomically replaced between
                 // the tail read and this manifest read. Drain any unseen final
                 // events once by sequence before sending the terminal event.
-                let drain_state = state.clone();
-                let drain_path = trace_path.clone();
-                let after_sequence = seen_sequence;
-                let drained = tokio::task::spawn_blocking(move || {
-                    let events =
-                        read_events_page(&drain_path, after_sequence, usize::MAX).unwrap_or_default();
-                    let snapshot = trace_snapshot(&drain_state, &drain_path).ok();
-                    (events, snapshot)
+                let snapshot_state = state.clone();
+                let snapshot_path = trace_path.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    trace_snapshot(&snapshot_state, &snapshot_path).ok()
                 })
                 .await
-                .ok();
-                if let Some((events, snapshot)) = drained {
-                    for event in events {
+                .ok()
+                .flatten();
+                // Pages resume from the journal index the snapshot built, so
+                // the drain costs what is left to send, not the whole journal.
+                loop {
+                    let drain_state = state.clone();
+                    let drain_path = trace_path.clone();
+                    let after_sequence = seen_sequence;
+                    let page = tokio::task::spawn_blocking(move || {
+                        read_page(&drain_state, &drain_path, after_sequence, STREAM_BATCH_EVENTS)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if page.is_empty() {
+                        break;
+                    }
+                    for event in page {
                         seen_sequence = seen_sequence.max(event.sequence);
                         if let Ok(message) = Event::default().event("trace.event").json_data(event) {
                             yield Ok(message);
                         }
                     }
-                    // Terminal signal so clients transition to RECORDED without thrashing reconnects.
-                    if let Some(snapshot) = snapshot {
-                        let complete = trace_detail(&trace_path, snapshot);
-                        if let Ok(message) = Event::default().event("trace.complete").json_data(complete)
-                        {
-                            yield Ok(message);
-                        }
+                }
+                // Terminal signal so clients transition to RECORDED without thrashing reconnects.
+                if let Some(snapshot) = snapshot {
+                    let complete = trace_detail(&trace_path, snapshot);
+                    if let Ok(message) = Event::default().event("trace.complete").json_data(complete)
+                    {
+                        yield Ok(message);
                     }
                 }
                 break;
@@ -1916,6 +2001,7 @@ async fn stream_events(
                     manifest,
                     summary: None,
                     integrity,
+                    index: None,
                 })
             });
             match abandoned {

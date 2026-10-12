@@ -31,6 +31,14 @@ pub struct ManifestSeal {
     /// journal instead of the recorder that wrote it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub recovered: bool,
+    /// Bytes of the abandoned journal that recovery could not keep: a torn
+    /// trailing frame, or everything from the first frame that failed its
+    /// checks. Written only when non-zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub discarded_bytes: u64,
+    /// Number of frames in those bytes, when recovery could tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discarded_frames: Option<u64>,
     /// SHA-256 over the canonical manifest (every field except this digest,
     /// the signature and the encrypted envelope), lowercase hex.
     pub digest: String,
@@ -50,6 +58,10 @@ pub struct ManifestSignature {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// How strongly a trace that passed verification is protected.
@@ -186,17 +198,48 @@ pub(crate) fn event_hash(event: &TraceEvent) -> String {
 /// Recompute the hash chain over `events` and return its head. Fails at the
 /// first event that does not chain from its predecessor.
 pub(crate) fn chain_head(trace_id: &str, events: &[TraceEvent]) -> Result<String> {
-    let mut head = chain_genesis(trace_id);
+    let mut chain = Chain::new(trace_id);
     for event in events {
-        if event.prev_hash != head {
-            bail!(
-                "event chain is broken at sequence {}: an event was edited, inserted, removed or reordered",
-                event.sequence
-            )
-        }
-        head = event_hash(event);
+        chain.push(event);
     }
-    Ok(head)
+    chain.finish()
+}
+
+/// The hash chain walked one event at a time. It stops hashing at the first
+/// event that does not chain from its predecessor.
+pub(crate) struct Chain {
+    head: String,
+    broken_at: Option<u64>,
+}
+
+impl Chain {
+    pub(crate) fn new(trace_id: &str) -> Self {
+        Self {
+            head: chain_genesis(trace_id),
+            broken_at: None,
+        }
+    }
+
+    pub(crate) fn push(&mut self, event: &TraceEvent) {
+        if self.broken_at.is_some() {
+            return;
+        }
+        if event.prev_hash != self.head {
+            self.broken_at = Some(event.sequence);
+            return;
+        }
+        self.head = event_hash(event);
+    }
+
+    /// The chain head, or the error naming the first broken link.
+    pub(crate) fn finish(self) -> Result<String> {
+        match self.broken_at {
+            Some(sequence) => bail!(
+                "event chain is broken at sequence {sequence}: an event was edited, inserted, removed or reordered"
+            ),
+            None => Ok(self.head),
+        }
+    }
 }
 
 /// Seal digest of `manifest` as raw bytes. The input is the manifest's
@@ -263,6 +306,7 @@ fn signature_message(digest: &[u8; 32]) -> Vec<u8> {
 
 /// Seal a finalized manifest over the given chain state. Without a signing
 /// key the manifest is left unsigned.
+#[cfg(test)]
 pub(crate) fn seal_manifest(
     manifest: &mut TraceManifest,
     chain_head: String,
@@ -270,10 +314,33 @@ pub(crate) fn seal_manifest(
     recovered: bool,
     signing_key: Option<&SigningKey>,
 ) -> Result<()> {
+    seal_recovered_manifest(
+        manifest,
+        chain_head,
+        event_count,
+        recovered,
+        0,
+        None,
+        signing_key,
+    )
+}
+
+/// [`seal_manifest`] that also records what recovery had to discard.
+pub(crate) fn seal_recovered_manifest(
+    manifest: &mut TraceManifest,
+    chain_head: String,
+    event_count: u64,
+    recovered: bool,
+    discarded_bytes: u64,
+    discarded_frames: Option<u64>,
+    signing_key: Option<&SigningKey>,
+) -> Result<()> {
     manifest.seal = Some(ManifestSeal {
         chain_head,
         event_count,
         recovered,
+        discarded_bytes,
+        discarded_frames,
         digest: String::new(),
         signature: None,
     });
@@ -305,6 +372,20 @@ pub fn verify_tamper_evidence(
     manifest: &TraceManifest,
     events: &[TraceEvent],
 ) -> Result<SealStatus> {
+    verify_sealed_chain(
+        manifest,
+        chain_head(&manifest.trace_id, events),
+        events.len() as u64,
+    )
+}
+
+/// [`verify_tamper_evidence`] for a chain that was already walked: `chain` is
+/// its head, or the error of the first event that did not chain.
+pub(crate) fn verify_sealed_chain(
+    manifest: &TraceManifest,
+    chain: Result<String>,
+    event_count: u64,
+) -> Result<SealStatus> {
     if manifest.format_version < 2 {
         return Ok(SealStatus {
             protection: Protection::DigestOnly,
@@ -315,8 +396,8 @@ pub fn verify_tamper_evidence(
         .seal
         .as_ref()
         .context("version 2 manifest has no seal")?;
-    let head = chain_head(&manifest.trace_id, events)?;
-    if seal.event_count != events.len() as u64 {
+    let head = chain?;
+    if seal.event_count != event_count {
         bail!("sealed event count does not match the journal")
     }
     if head != seal.chain_head {

@@ -1,5 +1,6 @@
 mod crypto;
 mod integrity;
+mod journal;
 mod output;
 mod seal;
 mod structured;
@@ -7,6 +8,7 @@ mod utf8;
 
 pub use crypto::{EncryptionKey, KEY_FILE_ENV, key_file_configured, set_key_file};
 pub use integrity::{IntegrityReport, IntegrityStatus, assess_integrity};
+pub use journal::{ActiveCursor, EventStream, JournalEnd, JournalIndex};
 pub use output::prepare_trace_output;
 pub use seal::{
     ManifestSeal, ManifestSignature, Protection, PublicKey, SIGN_KEY_FILE_ENV, SealStatus,
@@ -17,6 +19,7 @@ pub use utf8::{decode_utf8_chunk, finish_utf8};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use journal::{JournalCompressor, write_frame, write_frame_body};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,9 +42,6 @@ pub const RECORDER_LEASE: &str = "recorder.lease";
 pub const ACTIVE_JOURNAL: &str = "active.events.pb";
 /// Finalized compressed journal file name inside a trace's `events/` directory.
 pub const FINAL_JOURNAL: &str = "000001.events.pb.zst";
-/// Hard cap on one journal frame, enforced identically by writers and readers.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-
 #[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
 pub struct TraceEvent {
     #[prost(string, tag = "1")]
@@ -1577,19 +1577,60 @@ impl TraceWriter {
             self.encryption_key.as_ref(),
             self.dropped_events,
             self.signing_key.as_ref(),
-            false,
+            None,
         )
     }
 }
 
-/// Finalize an abandoned active trace while preserving every complete frame.
-/// A torn trailing frame is discarded and represented by a terminal recovery
-/// event. Fresh traces are guarded by default so operators cannot accidentally
-/// recover a recording that is still receiving events.
+/// What [`recover_interrupted_trace_with`] kept and what it had to leave out.
+#[derive(Clone, Debug)]
+pub struct RecoveryReport {
+    pub manifest: TraceManifest,
+    /// Recorded events kept, not counting the appended `session.interrupted`.
+    pub salvaged_events: u64,
+    /// Bytes of the abandoned journal that are not in the recovered trace.
+    pub discarded_bytes: u64,
+    /// Frames in those bytes, when that could be determined.
+    pub discarded_frames: Option<u64>,
+    /// Why the journal was cut where it was; `None` when all of it was kept.
+    pub reason: Option<String>,
+}
+
+/// What recovery discarded, as it is recorded in the manifest.
+struct Discarded {
+    bytes: u64,
+    frames: Option<u64>,
+    after_sequence: u64,
+    reason: Option<String>,
+}
+
+/// Finalize an abandoned active trace, keeping the longest prefix of frames
+/// that can be genuine. Fresh traces are guarded by default so operators
+/// cannot accidentally recover a recording that is still receiving events.
+/// Signs with the `PREMIER_SIGN_KEY_FILE` key when one is configured.
 pub fn recover_interrupted_trace(
     root: impl AsRef<Path>,
     options: RecoveryOptions,
 ) -> Result<TraceManifest> {
+    let signing_key = seal::signing_key_from_environment()?;
+    Ok(recover_interrupted_trace_with(root, options, signing_key.as_ref())?.manifest)
+}
+
+/// [`recover_interrupted_trace`] with an explicit signing key choice, reporting
+/// what was salvaged.
+///
+/// The journal is read frame by frame and cut at the first frame that is
+/// incomplete or cannot be genuine (see [`EventStream`]). When that frame is
+/// complete but does not chain from its predecessor, one of the two was
+/// altered and nothing says which, so the predecessor is discarded as well.
+/// The kept frames are copied byte for byte, a `session.interrupted` event
+/// that continues the chain is appended, and what was discarded is recorded
+/// in the seal and as a manifest diagnostic. No event is ever reconstructed.
+pub fn recover_interrupted_trace_with(
+    root: impl AsRef<Path>,
+    options: RecoveryOptions,
+    signing_key: Option<&SigningKey>,
+) -> Result<RecoveryReport> {
     let root = root.as_ref();
     let mut manifest = read_manifest(root)?;
     let encryption_key = required_encryption_key(&manifest)?;
@@ -1617,43 +1658,65 @@ pub fn recover_interrupted_trace(
             )
         }
     }
-    let bytes = fs::read(&active)?;
-    let (mut events, valid_bytes) =
-        read_complete_frames(&bytes, encryption_key.as_ref(), &manifest.trace_id)?;
-    if events
-        .iter()
-        .any(|event| event.trace_id != manifest.trace_id)
-    {
-        bail!("active journal contains an event from a different trace")
+    let total_bytes = fs::metadata(&active)?.len();
+    let mut stream = EventStream::active(
+        &active,
+        &manifest,
+        encryption_key.clone(),
+        &ActiveCursor::start(),
+    )?;
+    for event in &mut stream {
+        event?;
     }
-    for (index, event) in events.iter().enumerate() {
-        if event.sequence != index as u64 + 1 {
-            bail!("active journal event sequence is not contiguous")
+    let mut salvaged_events = stream.events_read();
+    let mut valid_bytes = stream.byte_offset();
+    let mut chain_head = stream.chain_head().map(str::to_owned);
+    let reason = match stream.end() {
+        Some(JournalEnd::Clean) | None => None,
+        Some(JournalEnd::TornTail) => Some("the journal ends inside a frame".to_owned()),
+        Some(JournalEnd::Invalid {
+            reason,
+            chain_break,
+        }) => {
+            if *chain_break && let Some((offset, head)) = stream.before_last_event() {
+                salvaged_events -= 1;
+                valid_bytes = *offset;
+                chain_head = head.clone();
+            }
+            Some(reason.clone())
         }
-    }
-    // Re-derive the chain head from the complete frames. A journal whose
-    // chain is already broken was altered, so it is not sealed as recovered.
-    let chained = manifest.format_version >= 2;
-    let prev_hash = if chained {
-        seal::chain_head(&manifest.trace_id, &events)
-            .context("cannot recover: the active journal failed chain verification")?
-    } else {
-        String::new()
     };
-    let signing_key = seal::signing_key_from_environment()?;
-    let discarded_bytes = bytes.len().saturating_sub(valid_bytes);
+    drop(stream);
+    let discarded_bytes = total_bytes.saturating_sub(valid_bytes);
+    let discarded_frames = if discarded_bytes == 0 {
+        None
+    } else {
+        journal::count_discarded_frames(
+            &active,
+            valid_bytes,
+            encryption_key.as_ref(),
+            &manifest.trace_id,
+        )?
+    };
+    let mut payload = serde_json::json!({
+        "reason": "recorder_interrupted",
+        "recovered_event_count": salvaged_events,
+        "discarded_trailing_bytes": discarded_bytes,
+    });
+    if let Some(frames) = discarded_frames {
+        payload["discarded_frames"] = frames.into();
+    }
+    if let Some(reason) = reason.as_deref() {
+        payload["discard_reason"] = reason.into();
+    }
     let recovery_event = TraceEvent {
         event_id: Uuid::now_v7().to_string(),
         trace_id: manifest.trace_id.clone(),
-        sequence: events.len() as u64 + 1,
+        sequence: salvaged_events + 1,
         timestamp: Utc::now().to_rfc3339(),
         kind: "session.interrupted".into(),
         source: "premier-recovery".into(),
-        payload_json: serde_json::to_string(&serde_json::json!({
-            "reason": "recorder_interrupted",
-            "recovered_event_count": events.len(),
-            "discarded_trailing_bytes": discarded_bytes,
-        }))?,
+        payload_json: serde_json::to_string(&payload)?,
         actor_id: "root".into(),
         actor_type: "process".into(),
         parent_event_id: String::new(),
@@ -1663,9 +1726,8 @@ pub fn recover_interrupted_trace(
         status: "error".into(),
         duration_ms: 0,
         links: Vec::new(),
-        prev_hash,
+        prev_hash: chain_head.unwrap_or_default(),
     };
-    events.push(recovery_event);
 
     // A prior finalization may have crashed after publishing the compressed
     // journal but before committing the manifest. Do not remove that orphan
@@ -1675,35 +1737,50 @@ pub fn recover_interrupted_trace(
         fs::remove_file(orphaned_final)?;
     }
 
+    // The kept frames are copied as stored: recovery never re-encodes them.
     let replacement = active.with_extension("pb.recovery.tmp");
     {
         let file = private_truncate_file(&replacement)?;
         let mut writer = BufWriter::new(file);
-        for event in &events {
-            write_frame(
-                &mut writer,
-                event,
-                encryption_key.as_ref(),
-                &manifest.trace_id,
-            )?;
-        }
+        std::io::copy(&mut File::open(&active)?.take(valid_bytes), &mut writer)?;
+        write_frame(
+            &mut writer,
+            &recovery_event,
+            encryption_key.as_ref(),
+            &manifest.trace_id,
+        )?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
     }
     fs::rename(&replacement, &active)?;
     manifest.termination = None;
-    finalize_active_journal(
+    let manifest = finalize_active_journal(
         root,
         manifest,
-        events.len() as u64,
+        salvaged_events + 1,
         ProcessTermination::interrupted(),
         encryption_key.as_ref(),
         0,
-        signing_key.as_ref(),
-        true,
-    )
+        signing_key,
+        Some(&Discarded {
+            bytes: discarded_bytes,
+            frames: discarded_frames,
+            after_sequence: salvaged_events,
+            reason: reason.clone(),
+        }),
+    )?;
+    Ok(RecoveryReport {
+        manifest,
+        salvaged_events,
+        discarded_bytes,
+        discarded_frames,
+        reason,
+    })
 }
 
+/// Compress the active journal into the finalized one and commit the
+/// manifest, reading one frame at a time. `recovered` is set when the journal
+/// was rebuilt by recovery.
 #[allow(clippy::too_many_arguments)]
 fn finalize_active_journal(
     root: &Path,
@@ -1713,24 +1790,49 @@ fn finalize_active_journal(
     encryption_key: Option<&EncryptionKey>,
     dropped_events: u64,
     signing_key: Option<&SigningKey>,
-    recovered: bool,
+    recovered: Option<&Discarded>,
 ) -> Result<TraceManifest> {
     let active = root.join("events").join(ACTIVE_JOURNAL);
     let final_path = root.join("events").join(FINAL_JOURNAL);
     let temporary_final = root.join("events").join(format!("{FINAL_JOURNAL}.tmp"));
-    let mut input = BufReader::new(File::open(&active)?);
-    let output = BufWriter::new(private_truncate_file(&temporary_final)?);
-    let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
-    std::io::copy(&mut input, &mut encoder)?;
-    encoder.finish()?.into_inner()?.sync_all()?;
+    let mut stream = EventStream::active(
+        &active,
+        &manifest,
+        encryption_key.cloned(),
+        &ActiveCursor::start(),
+    )?;
+    let mut compressor =
+        JournalCompressor::new(BufWriter::new(private_truncate_file(&temporary_final)?))?;
+    let mut validator = EventValidator::default();
+    loop {
+        let event = match stream.next() {
+            Some(event) => event?,
+            None => break,
+        };
+        validator.push(&event);
+        compressor.begin_frame()?;
+        write_frame_body(&mut compressor, stream.last_frame())?;
+    }
+    if stream.end() != Some(&JournalEnd::Clean) || stream.events_read() != event_count {
+        drop(compressor);
+        let _ = fs::remove_file(&temporary_final);
+        let problem = match stream.end() {
+            Some(JournalEnd::Invalid { reason, .. }) => reason.clone(),
+            Some(JournalEnd::TornTail) => "it ends inside a frame".to_owned(),
+            _ => format!(
+                "it holds {} events where {event_count} were recorded",
+                stream.events_read()
+            ),
+        };
+        bail!(
+            "the active journal is damaged after {} valid events ({problem}); run `premier recover` to finalize what is intact",
+            stream.events_read()
+        )
+    }
+    compressor.finish()?.into_inner()?.sync_all()?;
     fs::rename(&temporary_final, &final_path)?;
 
-    let events = read_frames(
-        BufReader::new(File::open(&active)?),
-        encryption_key,
-        &manifest.trace_id,
-    )?;
-    manifest.diagnostics = validate_events(&events);
+    manifest.diagnostics = validator.finish();
     if dropped_events > 0 {
         manifest.diagnostics.push(TraceDiagnostic {
             severity: DiagnosticSeverity::Warning,
@@ -1740,6 +1842,27 @@ fn finalize_active_journal(
             ),
             event_id: None,
             sequence: None,
+        });
+    }
+    if let Some(discarded) = recovered.filter(|discarded| discarded.bytes > 0) {
+        manifest.diagnostics.push(TraceDiagnostic {
+            severity: DiagnosticSeverity::Warning,
+            code: "journal.recovery_discarded".into(),
+            message: format!(
+                "recovery discarded {} byte(s) ({}) after sequence {}: {}",
+                discarded.bytes,
+                discarded.frames.map_or_else(
+                    || "an unknown number of frames".to_owned(),
+                    |frames| format!("{frames} frame(s)")
+                ),
+                discarded.after_sequence,
+                discarded
+                    .reason
+                    .as_deref()
+                    .unwrap_or("the journal ends inside a frame"),
+            ),
+            event_id: None,
+            sequence: Some(discarded.after_sequence),
         });
     }
     manifest.ended_at = Some(Utc::now());
@@ -1752,15 +1875,21 @@ fn finalize_active_journal(
     });
     // Version 1 journals carry no chain; they finalize as digest-only traces.
     if manifest.format_version >= 2 {
-        let chain_head = seal::chain_head(&manifest.trace_id, &events)?;
-        seal::seal_manifest(
+        let chain_head = stream
+            .chain_head()
+            .context("active journal chain was not tracked")?
+            .to_owned();
+        seal::seal_recovered_manifest(
             &mut manifest,
             chain_head,
-            events.len() as u64,
-            recovered,
+            event_count,
+            recovered.is_some(),
+            recovered.map_or(0, |discarded| discarded.bytes),
+            recovered.and_then(|discarded| discarded.frames),
             signing_key,
         )?;
     }
+    drop(stream);
     write_manifest(root, &manifest, encryption_key)?;
     fs::remove_file(active)?;
     let lease = root.join(RECORDER_LEASE);
@@ -1770,47 +1899,57 @@ fn finalize_active_journal(
     Ok(manifest)
 }
 
-pub fn validate_events(events: &[TraceEvent]) -> Vec<TraceDiagnostic> {
-    // The kinds first-party producers emit: the demo, the SDK helpers and the native adapters.
-    const KNOWN: [&str; 14] = [
-        "agent.spawn",
-        "agent.turn",
-        "agent.result",
-        "agent.delegation",
-        "agent.join",
-        "agent.message",
-        "model.request",
-        "model.response",
-        "tool.invocation",
-        "tool.result",
-        "tool.execution",
-        "tool.error",
-        "approval.request",
-        "approval.decision",
-    ];
-    const STATUSES: [&str; 14] = [
-        "running",
-        "ok",
-        "error",
-        "failed",
-        "denied",
-        "blocked",
-        "pending",
-        "approved",
-        "rejected",
-        "cancelled",
-        "completed",
-        "success",
-        "warning",
-        "skipped",
-    ];
-    let mut diagnostics = Vec::new();
-    let mut seen_event_ids = HashSet::new();
-    for event in events {
+/// A set of event ids that stores the usual UUID form in 16 bytes.
+#[derive(Default)]
+struct IdSet {
+    uuids: HashSet<u128>,
+    others: HashSet<String>,
+}
+
+impl IdSet {
+    /// The id as a number when it is a UUID in exactly the canonical
+    /// lowercase form, so two different strings never share an entry.
+    fn canonical_uuid(id: &str) -> Option<u128> {
+        if id.len() != 36 {
+            return None;
+        }
+        let uuid = Uuid::try_parse(id).ok()?;
+        let mut buffer = Uuid::encode_buffer();
+        (uuid.hyphenated().encode_lower(&mut buffer) == id).then(|| uuid.as_u128())
+    }
+
+    /// Add `id`; false when it was already present.
+    fn insert(&mut self, id: &str) -> bool {
+        match Self::canonical_uuid(id) {
+            Some(uuid) => self.uuids.insert(uuid),
+            None => self.others.insert(id.to_owned()),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        match Self::canonical_uuid(id) {
+            Some(uuid) => self.uuids.contains(&uuid),
+            None => self.others.contains(id),
+        }
+    }
+}
+
+/// [`validate_events`] fed one event at a time. It keeps the ids it has seen
+/// and the identifying fields of lifecycle events, never a payload.
+#[derive(Default)]
+pub struct EventValidator {
+    seen_event_ids: IdSet,
+    parent_diagnostics: Vec<TraceDiagnostic>,
+    kind_diagnostics: Vec<TraceDiagnostic>,
+    lifecycle_events: Vec<TraceEvent>,
+}
+
+impl EventValidator {
+    pub fn push(&mut self, event: &TraceEvent) {
         if !event.parent_event_id.is_empty()
-            && !seen_event_ids.contains(event.parent_event_id.as_str())
+            && !self.seen_event_ids.contains(event.parent_event_id.as_str())
         {
-            diagnostics.push(diagnostic(
+            self.parent_diagnostics.push(diagnostic(
                 event,
                 "unknown_parent_event",
                 format!(
@@ -1819,37 +1958,101 @@ pub fn validate_events(events: &[TraceEvent]) -> Vec<TraceDiagnostic> {
                 ),
             ));
         }
-        seen_event_ids.insert(event.event_id.as_str());
-    }
-    for event in events {
-        if !KNOWN.contains(&event.kind.as_str()) {
-            continue;
+        self.seen_event_ids.insert(event.event_id.as_str());
+        if !KNOWN_KINDS.contains(&event.kind.as_str()) {
+            return;
         }
         if event.status.trim().is_empty() {
-            diagnostics.push(diagnostic(
+            self.kind_diagnostics.push(diagnostic(
                 event,
                 "missing_status",
                 format!("{} must declare a status", event.kind),
             ));
-        } else if !STATUSES.contains(&event.status.to_ascii_lowercase().as_str()) {
-            diagnostics.push(diagnostic(
+        } else if !KNOWN_STATUSES.contains(&event.status.to_ascii_lowercase().as_str()) {
+            self.kind_diagnostics.push(diagnostic(
                 event,
                 "invalid_status",
                 format!("{} uses unknown status '{}'", event.kind, event.status),
             ));
         }
         if !event.payload().is_object() {
-            diagnostics.push(diagnostic(
+            self.kind_diagnostics.push(diagnostic(
                 event,
                 "payload_not_object",
                 format!("{} payload must be a JSON object", event.kind),
             ));
         }
+        let in_lifecycle = LIFECYCLES.iter().any(|lifecycle| {
+            lifecycle.finish == event.kind || lifecycle.starts.contains(&event.kind.as_str())
+        });
+        if in_lifecycle {
+            // Only what pairing a start with its finish looks at.
+            self.lifecycle_events.push(TraceEvent {
+                event_id: event.event_id.clone(),
+                sequence: event.sequence,
+                kind: event.kind.clone(),
+                actor_id: event.actor_id.clone(),
+                parent_event_id: event.parent_event_id.clone(),
+                span_id: event.span_id.clone(),
+                parent_span_id: event.parent_span_id.clone(),
+                correlation_id: event.correlation_id.clone(),
+                links: event.links.clone(),
+                ..TraceEvent::default()
+            });
+        }
     }
-    for lifecycle in &LIFECYCLES {
-        validate_pair(events, lifecycle, &mut diagnostics);
+
+    pub fn finish(self) -> Vec<TraceDiagnostic> {
+        let mut diagnostics = self.parent_diagnostics;
+        diagnostics.extend(self.kind_diagnostics);
+        for lifecycle in &LIFECYCLES {
+            validate_pair(&self.lifecycle_events, lifecycle, &mut diagnostics);
+        }
+        diagnostics
     }
-    diagnostics
+}
+
+// The kinds first-party producers emit: the demo, the SDK helpers and the native adapters.
+const KNOWN_KINDS: [&str; 14] = [
+    "agent.spawn",
+    "agent.turn",
+    "agent.result",
+    "agent.delegation",
+    "agent.join",
+    "agent.message",
+    "model.request",
+    "model.response",
+    "tool.invocation",
+    "tool.result",
+    "tool.execution",
+    "tool.error",
+    "approval.request",
+    "approval.decision",
+];
+
+const KNOWN_STATUSES: [&str; 14] = [
+    "running",
+    "ok",
+    "error",
+    "failed",
+    "denied",
+    "blocked",
+    "pending",
+    "approved",
+    "rejected",
+    "cancelled",
+    "completed",
+    "success",
+    "warning",
+    "skipped",
+];
+
+pub fn validate_events(events: &[TraceEvent]) -> Vec<TraceDiagnostic> {
+    let mut validator = EventValidator::default();
+    for event in events {
+        validator.push(event);
+    }
+    validator.finish()
 }
 
 struct Lifecycle {
@@ -1997,55 +2200,80 @@ fn validate_pair(
     }
 }
 
+/// Read `limit` events after `after_sequence`, decoding the journal from its
+/// beginning. [`read_events_page_indexed`] avoids that for finalized journals.
 pub fn read_events_page(
     root: impl AsRef<Path>,
+    after_sequence: u64,
+    limit: usize,
+) -> Result<Vec<TraceEvent>> {
+    journal::collect_page(stream_events(root)?, after_sequence, limit)
+}
+
+/// [`read_events_page`] that starts decoding at the resume point of `index`
+/// covering `after_sequence`. An index built for another journal file (the
+/// trace was since recovered or re-encrypted) is ignored.
+pub fn read_events_page_indexed(
+    root: impl AsRef<Path>,
+    index: &JournalIndex,
     after_sequence: u64,
     limit: usize,
 ) -> Result<Vec<TraceEvent>> {
     let root = root.as_ref();
     let manifest = read_manifest(root)?;
     let encryption_key = required_encryption_key(&manifest)?;
-    let final_path = root.join("events").join(FINAL_JOURNAL);
-    let active_path = root.join("events").join(ACTIVE_JOURNAL);
-    if final_path.exists() {
-        let decoder = zstd::stream::read::Decoder::new(BufReader::new(File::open(final_path)?))?;
-        read_frames_page(
-            decoder,
+    let page = journal::read_indexed_page(
+        root,
+        &manifest,
+        encryption_key.clone(),
+        index,
+        after_sequence,
+        limit,
+    )?;
+    match page {
+        Some(events) => Ok(events),
+        None => journal::collect_page(
+            EventStream::open(root, &manifest, encryption_key)?,
             after_sequence,
             limit,
-            encryption_key.as_ref(),
-            &manifest.trace_id,
-        )
-    } else if active_path.exists() {
-        read_frames_page(
-            BufReader::new(File::open(active_path)?),
-            after_sequence,
-            limit,
-            encryption_key.as_ref(),
-            &manifest.trace_id,
-        )
-    } else {
-        bail!("trace has no event journal")
+        ),
     }
 }
 
-fn read_frames_page(
-    mut reader: impl Read,
-    after_sequence: u64,
-    limit: usize,
-    encryption_key: Option<&EncryptionKey>,
-    trace_id: &str,
-) -> Result<Vec<TraceEvent>> {
-    let mut events = Vec::with_capacity(limit.min(1024));
-    while events.len() < limit {
-        let Some(event) = read_next_frame(&mut reader, encryption_key, trace_id)? else {
-            break;
-        };
-        if event.sequence > after_sequence {
-            events.push(event);
-        }
+/// Read a finalized journal once and return its resume points. Callers that
+/// already stream the journal get the same from [`EventStream::into_index`].
+pub fn build_journal_index(root: impl AsRef<Path>) -> Result<JournalIndex> {
+    let mut stream = stream_events(root)?;
+    for event in &mut stream {
+        event?;
     }
-    Ok(events)
+    stream
+        .into_index()
+        .context("only a finalized journal can be indexed")
+}
+
+/// Iterate over a trace's events without loading the journal: the finalized
+/// journal once the manifest names one, otherwise the active journal.
+pub fn stream_events(root: impl AsRef<Path>) -> Result<EventStream> {
+    let root = root.as_ref();
+    let manifest = read_manifest(root)?;
+    let encryption_key = required_encryption_key(&manifest)?;
+    EventStream::open(root, &manifest, encryption_key)
+}
+
+/// [`stream_events`] with an explicit master key.
+pub fn stream_events_with_key(
+    root: impl AsRef<Path>,
+    master_key: &EncryptionKey,
+) -> Result<EventStream> {
+    let root = root.as_ref();
+    let manifest = read_manifest_with_key(root, master_key)?;
+    let encryption_key = manifest
+        .encryption
+        .as_ref()
+        .map(|_| master_key.for_trace(&manifest.trace_id))
+        .transpose()?;
+    EventStream::open(root, &manifest, encryption_key)
 }
 
 #[derive(Clone, Debug)]
@@ -2055,54 +2283,104 @@ pub struct ActiveEventTail {
 }
 
 /// Read only complete frames appended to an active journal after `byte_offset`.
-/// An incomplete trailing frame is intentionally left for the next poll.
+/// An incomplete trailing frame is intentionally left for the next poll, and
+/// reading stops before the first frame that cannot be genuine.
 pub fn read_active_events_after(
     root: impl AsRef<Path>,
     byte_offset: u64,
 ) -> Result<ActiveEventTail> {
+    let batch = read_active_events_from(root, &ActiveCursor::at_byte(byte_offset), 0, usize::MAX)?;
+    Ok(ActiveEventTail {
+        next_byte_offset: batch.cursor.byte_offset(),
+        events: batch.events,
+    })
+}
+
+/// Events read from an active journal and where to continue.
+#[derive(Clone, Debug)]
+pub struct ActiveEventBatch {
+    pub events: Vec<TraceEvent>,
+    pub cursor: ActiveCursor,
+    /// Why reading stopped, or `None` when `max_events` was reached first.
+    pub end: Option<JournalEnd>,
+}
+
+/// Read complete, valid frames of an active journal from `cursor`, returning
+/// at most `max_events` events whose sequence is above `after_sequence`.
+/// Earlier events are decoded once to check them and are not returned. The
+/// returned cursor carries the sequence and chain head the next frame must
+/// follow, so later calls keep validating without rereading anything.
+pub fn read_active_events_from(
+    root: impl AsRef<Path>,
+    cursor: &ActiveCursor,
+    after_sequence: u64,
+    max_events: usize,
+) -> Result<ActiveEventBatch> {
     let root = root.as_ref();
     let manifest = read_manifest(root)?;
     let encryption_key = required_encryption_key(&manifest)?;
     let path = root.join("events").join(ACTIVE_JOURNAL);
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(byte_offset))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let (events, consumed) =
-        read_complete_frames(&bytes, encryption_key.as_ref(), &manifest.trace_id)?;
-    Ok(ActiveEventTail {
+    let mut stream = EventStream::active(&path, &manifest, encryption_key, cursor)?;
+    let mut events = Vec::new();
+    while events.len() < max_events {
+        let Some(event) = stream.next() else {
+            break;
+        };
+        let event = event?;
+        if event.sequence > after_sequence {
+            events.push(event);
+        }
+    }
+    Ok(ActiveEventBatch {
         events,
-        next_byte_offset: byte_offset.saturating_add(consumed as u64),
+        cursor: stream.cursor(),
+        end: stream.end().cloned(),
     })
 }
 
-fn read_complete_frames(
-    bytes: &[u8],
-    encryption_key: Option<&EncryptionKey>,
-    trace_id: &str,
-) -> Result<(Vec<TraceEvent>, usize)> {
-    let mut events = Vec::new();
-    let mut offset = 0_usize;
-    while bytes.len().saturating_sub(offset) >= 4 {
-        let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        if length > MAX_FRAME_BYTES {
-            bail!("event frame exceeds the 64 MiB safety limit")
-        }
-        let frame_end = offset
-            .checked_add(4)
-            .and_then(|value| value.checked_add(length))
-            .context("event frame length overflow")?;
-        if frame_end > bytes.len() {
-            break;
-        }
-        events.push(decode_frame(
-            &bytes[offset + 4..frame_end],
-            encryption_key,
-            trace_id,
-        )?);
-        offset = frame_end;
+/// State of an unfinalized trace's active journal, read without changing it.
+#[derive(Clone, Debug)]
+pub struct ActiveJournalReport {
+    pub trace_id: String,
+    pub format_version: u32,
+    /// Events in the valid prefix of the journal.
+    pub events: u64,
+    /// Length of that prefix and of the whole file when it was opened.
+    pub valid_bytes: u64,
+    pub total_bytes: u64,
+    /// Why the valid prefix ends where it does.
+    pub end: JournalEnd,
+    /// Chain head after the last valid event (format version 2).
+    pub chain_head: Option<String>,
+}
+
+/// Check every frame of an active journal up to its last complete frame: the
+/// trace id, the sequence and, from format version 2 on, the hash chain.
+pub fn inspect_active_journal(root: impl AsRef<Path>) -> Result<ActiveJournalReport> {
+    let root = root.as_ref();
+    let manifest = read_manifest(root)?;
+    if manifest.journal.is_some() {
+        bail!("trace is already finalized")
     }
-    Ok((events, offset))
+    let encryption_key = required_encryption_key(&manifest)?;
+    let path = root.join("events").join(ACTIVE_JOURNAL);
+    if !path.is_file() {
+        bail!("trace has no active journal")
+    }
+    let total_bytes = fs::metadata(&path)?.len();
+    let mut stream = EventStream::active(&path, &manifest, encryption_key, &ActiveCursor::start())?;
+    for event in &mut stream {
+        event?;
+    }
+    Ok(ActiveJournalReport {
+        events: stream.events_read(),
+        valid_bytes: stream.byte_offset(),
+        total_bytes: total_bytes.max(stream.byte_offset()),
+        end: stream.end().cloned().unwrap_or(JournalEnd::Clean),
+        chain_head: stream.chain_head().map(str::to_owned),
+        trace_id: manifest.trace_id,
+        format_version: manifest.format_version,
+    })
 }
 
 pub fn read_manifest(root: impl AsRef<Path>) -> Result<TraceManifest> {
@@ -2181,20 +2459,10 @@ fn read_events_from_storage(
     manifest: &TraceManifest,
     encryption_key: Option<&EncryptionKey>,
 ) -> Result<Vec<TraceEvent>> {
-    let final_path = root.join("events").join(FINAL_JOURNAL);
-    let active_path = root.join("events").join(ACTIVE_JOURNAL);
-    if final_path.exists() {
-        let decoder = zstd::stream::read::Decoder::new(BufReader::new(File::open(final_path)?))?;
-        read_frames(decoder, encryption_key, &manifest.trace_id)
-    } else if active_path.exists() {
-        read_frames(
-            BufReader::new(File::open(active_path)?),
-            encryption_key,
-            &manifest.trace_id,
-        )
-    } else {
-        bail!("trace has no event journal")
-    }
+    let mut stream = EventStream::open(root, manifest, encryption_key.cloned())?;
+    let events = (&mut stream).collect::<Result<Vec<_>>>()?;
+    stream.ensure_intact()?;
+    Ok(events)
 }
 
 pub fn verify(root: impl AsRef<Path>) -> Result<TraceManifest> {
@@ -2221,11 +2489,23 @@ pub fn verify_trace(
     root: impl AsRef<Path>,
     trusted_key: Option<&PublicKey>,
 ) -> Result<VerifiedTrace> {
+    verify_trace_visiting(root, trusted_key, |_| {})
+}
+
+/// [`verify_trace`] that also hands every decoded event to `visit`, so a
+/// caller can derive something from the events in the same single pass. The
+/// journal is read once, one frame at a time: its digest, the structure of
+/// its events and the hash chain are all checked along the way. `visit` sees
+/// events before the outcome is known; use what it gathered only on `Ok`.
+pub fn verify_trace_visiting(
+    root: impl AsRef<Path>,
+    trusted_key: Option<&PublicKey>,
+    visit: impl FnMut(&TraceEvent),
+) -> Result<VerifiedTrace> {
     let root = root.as_ref();
     let manifest = read_manifest(root)?;
-    verify_journal_digest(root, &manifest)?;
-    let events = read_events(root)?;
-    let status = verify_decoded_events(&manifest, &events)?;
+    let encryption_key = required_encryption_key(&manifest)?;
+    let status = verify_journal_stream(root, &manifest, encryption_key, visit).status?;
     if let Some(trusted) = trusted_key {
         match status.signer.as_ref() {
             None if status.protection == Protection::DigestOnly => {
@@ -2246,6 +2526,201 @@ pub fn verify_trace(
         signer: status.signer,
         trusted_signer: trusted_key.is_some(),
     })
+}
+
+/// What one pass over a trace's journal found. See [`scan_trace`].
+pub struct TraceScan {
+    pub manifest: TraceManifest,
+    /// Whether the journal was read to its end, so the visitor saw every
+    /// event. For an unfinalized trace the end is its last complete frame;
+    /// an active journal holding a frame that cannot be genuine is not
+    /// complete.
+    pub complete: bool,
+    /// The verification verdict of a finalized trace; `None` while the trace
+    /// is not finalized.
+    pub verified: Option<Result<SealStatus>>,
+    /// Resume points of a finalized journal that matches its digest.
+    pub index: Option<JournalIndex>,
+}
+
+/// Read a trace's journal once, handing every event to `visit`, and report
+/// everything that pass can establish: the verification verdict (as
+/// [`verify_trace`] without a trusted key), whether all events were seen, and
+/// the journal's resume points. Only an unreadable manifest is an error.
+pub fn scan_trace(root: impl AsRef<Path>, mut visit: impl FnMut(&TraceEvent)) -> Result<TraceScan> {
+    let root = root.as_ref();
+    let manifest = read_manifest(root)?;
+    let encryption_key = required_encryption_key(&manifest)?;
+    if manifest.journal.is_some() {
+        let verdict = verify_journal_stream(root, &manifest, encryption_key, visit);
+        return Ok(TraceScan {
+            manifest,
+            complete: verdict.complete,
+            verified: Some(verdict.status),
+            index: verdict.index,
+        });
+    }
+    let complete = EventStream::open(root, &manifest, encryption_key).is_ok_and(|mut stream| {
+        for event in &mut stream {
+            match event {
+                Ok(event) => visit(&event),
+                Err(_) => return false,
+            }
+        }
+        stream.ensure_intact().is_ok()
+    });
+    Ok(TraceScan {
+        manifest,
+        complete,
+        verified: None,
+        index: None,
+    })
+}
+
+struct JournalVerdict {
+    status: Result<SealStatus>,
+    complete: bool,
+    index: Option<JournalIndex>,
+}
+
+/// Digest, structure, chain and seal of a finalized journal in one pass.
+fn verify_journal_stream(
+    root: &Path,
+    manifest: &TraceManifest,
+    encryption_key: Option<EncryptionKey>,
+    visit: impl FnMut(&TraceEvent),
+) -> JournalVerdict {
+    let mut verdict = JournalVerdict {
+        status: Ok(SealStatus {
+            protection: Protection::DigestOnly,
+            signer: None,
+        }),
+        complete: false,
+        index: None,
+    };
+    verdict.status = verify_journal_frames(root, manifest, encryption_key, visit, &mut verdict);
+    verdict
+}
+
+fn verify_journal_frames(
+    root: &Path,
+    manifest: &TraceManifest,
+    encryption_key: Option<EncryptionKey>,
+    mut visit: impl FnMut(&TraceEvent),
+    verdict: &mut JournalVerdict,
+) -> Result<SealStatus> {
+    let journal = manifest
+        .journal
+        .as_ref()
+        .context("trace is not finalized")?;
+    if journal.path != format!("events/{FINAL_JOURNAL}") {
+        bail!("manifest references a non-canonical journal path")
+    }
+    let path = root.join(&journal.path);
+    let mut stream = EventStream::finalized(&path, manifest, encryption_key, true)?;
+    let mut verifier = StreamVerifier::new(manifest);
+    let mut failure = None;
+    for event in &mut stream {
+        match event {
+            Ok(event) => {
+                verifier.push(&event);
+                visit(&event);
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    verdict.complete = failure.is_none();
+    // A journal that stopped decoding is first of all a file that no longer
+    // matches its digest; say that when it is the case.
+    let digest = match stream.finish_digest()? {
+        Some(digest) => digest,
+        None => sha256_file(&path)?,
+    };
+    if digest != journal.sha256 {
+        bail!("journal digest mismatch")
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let status = verifier.finish(manifest);
+    verdict.index = stream.into_index();
+    status
+}
+
+/// The checks of [`verify_decoded_events`] applied to events as they are
+/// read, holding only the event ids.
+pub struct StreamVerifier {
+    trace_id: String,
+    count: u64,
+    foreign_event: bool,
+    structure_error: Option<String>,
+    event_ids: IdSet,
+    chain: Option<seal::Chain>,
+}
+
+impl StreamVerifier {
+    pub fn new(manifest: &TraceManifest) -> Self {
+        Self {
+            trace_id: manifest.trace_id.clone(),
+            count: 0,
+            foreign_event: false,
+            structure_error: None,
+            event_ids: IdSet::default(),
+            chain: (manifest.format_version >= 2).then(|| seal::Chain::new(&manifest.trace_id)),
+        }
+    }
+
+    pub fn push(&mut self, event: &TraceEvent) {
+        self.count += 1;
+        if event.trace_id != self.trace_id {
+            self.foreign_event = true;
+        }
+        if self.structure_error.is_none() {
+            let expected_sequence = self.count;
+            if event.sequence != expected_sequence {
+                self.structure_error = Some(format!(
+                    "event sequence is not contiguous: expected {expected_sequence}, found {}",
+                    event.sequence
+                ));
+            } else if event.event_id.is_empty() || !self.event_ids.insert(&event.event_id) {
+                self.structure_error =
+                    Some("journal contains an empty or duplicate event id".into());
+            }
+        }
+        if let Some(chain) = self.chain.as_mut() {
+            chain.push(event);
+        }
+    }
+
+    /// Number of events seen.
+    pub fn event_count(&self) -> u64 {
+        self.count
+    }
+
+    /// The verdict over every event pushed, against the finalized `manifest`.
+    pub fn finish(self, manifest: &TraceManifest) -> Result<SealStatus> {
+        let journal = manifest
+            .journal
+            .as_ref()
+            .context("trace is not finalized")?;
+        if self.count != journal.event_count {
+            bail!("event count mismatch")
+        }
+        if self.foreign_event {
+            bail!("journal contains an event from a different trace")
+        }
+        if let Some(error) = self.structure_error {
+            bail!(error)
+        }
+        let chain = match self.chain {
+            Some(chain) => chain.finish(),
+            None => Ok(String::new()),
+        };
+        seal::verify_sealed_chain(manifest, chain, self.count)
+    }
 }
 
 /// Sign (or re-sign) the seal of an already finalized version 2 trace. The
@@ -2297,33 +2772,11 @@ pub fn verify_decoded_events(
     manifest: &TraceManifest,
     events: &[TraceEvent],
 ) -> Result<SealStatus> {
-    let journal = manifest
-        .journal
-        .as_ref()
-        .context("trace is not finalized")?;
-    if events.len() as u64 != journal.event_count {
-        bail!("event count mismatch")
+    let mut verifier = StreamVerifier::new(manifest);
+    for event in events {
+        verifier.push(event);
     }
-    if events
-        .iter()
-        .any(|event| event.trace_id != manifest.trace_id)
-    {
-        bail!("journal contains an event from a different trace")
-    }
-    let mut event_ids = HashSet::with_capacity(events.len());
-    for (index, event) in events.iter().enumerate() {
-        let expected_sequence = index as u64 + 1;
-        if event.sequence != expected_sequence {
-            bail!(
-                "event sequence is not contiguous: expected {expected_sequence}, found {}",
-                event.sequence
-            )
-        }
-        if event.event_id.is_empty() || !event_ids.insert(event.event_id.as_str()) {
-            bail!("journal contains an empty or duplicate event id")
-        }
-    }
-    verify_tamper_evidence(manifest, events)
+    verifier.finish(manifest)
 }
 
 fn write_manifest(
@@ -2447,18 +2900,13 @@ pub fn reencrypt_finalized_trace_with_signing_key(
 ) -> Result<TraceManifest> {
     let root = root.as_ref();
     let mut manifest = read_manifest(root)?;
-    let events = read_events(root)?;
-    let journal = manifest
-        .journal
-        .as_ref()
-        .context("only finalized traces can be encrypted or rotated")?;
-    if journal.path != format!("events/{FINAL_JOURNAL}") {
-        bail!("trace uses a non-canonical journal path")
+    let source_key = required_encryption_key(&manifest)?;
+    if manifest.journal.is_none() {
+        bail!("only finalized traces can be encrypted or rotated")
     }
     // Re-sealing writes a fresh digest and count for whatever decoded, so a
     // source that fails verification must never reach that step.
-    verify_journal_digest(root, &manifest)?;
-    verify_event_structure(&manifest, &events)?;
+    verify_journal_stream(root, &manifest, source_key.clone(), |_| {}).status?;
     ensure_no_unencrypted_auxiliary_files(root)?;
 
     let parent = root.parent().context("trace path has no parent")?;
@@ -2477,16 +2925,18 @@ pub fn reencrypt_finalized_trace_with_signing_key(
 
     let derived = new_master_key.for_trace(&manifest.trace_id)?;
     let final_path = staging.join("events").join(FINAL_JOURNAL);
-    let output = BufWriter::new(private_truncate_file(&final_path)?);
-    let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
-    for event in &events {
-        write_frame(&mut encoder, event, Some(&derived), &manifest.trace_id)?;
+    let mut output = JournalCompressor::new(BufWriter::new(private_truncate_file(&final_path)?))?;
+    let mut event_count = 0_u64;
+    for event in EventStream::open(root, &manifest, source_key.clone())? {
+        output.begin_frame()?;
+        write_frame(&mut output, &event?, Some(&derived), &manifest.trace_id)?;
+        event_count += 1;
     }
-    encoder.finish()?.into_inner()?.sync_all()?;
+    output.finish()?.into_inner()?.sync_all()?;
     manifest.journal = Some(JournalFile {
         path: format!("events/{FINAL_JOURNAL}"),
         sha256: sha256_file(&final_path)?,
-        event_count: events.len() as u64,
+        event_count,
     });
     if !manifest
         .capabilities
@@ -2504,10 +2954,23 @@ pub fn reencrypt_finalized_trace_with_signing_key(
     seal::reseal_manifest(&mut manifest, signing_key)?;
     write_manifest(&staging, &manifest, Some(&derived))?;
     let verified_manifest = read_manifest_with_key(&staging, &new_master_key)?;
-    let verified_events = read_events_with_key(&staging, &new_master_key)?;
-    if verified_events != events
-        || verify_event_structure(&verified_manifest, &verified_events).is_err()
-    {
+    // Read the copy back next to the original: every event must be equal,
+    // and the copy must verify under its new manifest.
+    let unchanged = {
+        let source_manifest = read_manifest(root)?;
+        let mut original = EventStream::open(root, &source_manifest, source_key)?;
+        let mut copy = EventStream::open(&staging, &verified_manifest, Some(derived.clone()))?;
+        let mut verifier = StreamVerifier::new(&verified_manifest);
+        let same = loop {
+            match (original.next(), copy.next()) {
+                (None, None) => break true,
+                (Some(Ok(before)), Some(Ok(after))) if before == after => verifier.push(&after),
+                _ => break false,
+            }
+        };
+        same && verifier.finish(&verified_manifest).is_ok()
+    };
+    if !unchanged {
         fs::remove_dir_all(&staging)?;
         bail!("encrypted trace verification changed event evidence")
     }
@@ -2596,92 +3059,6 @@ fn private_truncate_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn write_frame(
-    writer: &mut impl Write,
-    event: &TraceEvent,
-    encryption_key: Option<&EncryptionKey>,
-    trace_id: &str,
-) -> Result<()> {
-    let plaintext = event.encode_to_vec();
-    let bytes = if let Some(key) = encryption_key {
-        let mut envelope = event.sequence.to_le_bytes().to_vec();
-        envelope.extend_from_slice(
-            key.encrypt(&plaintext, event_aad(trace_id, event.sequence).as_bytes())?
-                .as_bytes(),
-        );
-        envelope
-    } else {
-        plaintext
-    };
-    if bytes.len() > MAX_FRAME_BYTES {
-        bail!("event frame exceeds the 64 MiB safety limit")
-    }
-    let length = u32::try_from(bytes.len()).expect("frame length fits in u32");
-    writer.write_all(&length.to_le_bytes())?;
-    writer.write_all(&bytes)?;
-    Ok(())
-}
-
-fn read_frames(
-    mut reader: impl Read,
-    encryption_key: Option<&EncryptionKey>,
-    trace_id: &str,
-) -> Result<Vec<TraceEvent>> {
-    let mut events = Vec::new();
-    while let Some(event) = read_next_frame(&mut reader, encryption_key, trace_id)? {
-        events.push(event);
-    }
-    Ok(events)
-}
-
-fn read_next_frame(
-    reader: &mut impl Read,
-    encryption_key: Option<&EncryptionKey>,
-    trace_id: &str,
-) -> Result<Option<TraceEvent>> {
-    let mut length_bytes = [0_u8; 4];
-    match reader.read_exact(&mut length_bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
-    let length = u32::from_le_bytes(length_bytes) as usize;
-    if length > MAX_FRAME_BYTES {
-        bail!("event frame exceeds the 64 MiB safety limit")
-    }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    Ok(Some(decode_frame(&bytes, encryption_key, trace_id)?))
-}
-
-fn decode_frame(
-    bytes: &[u8],
-    encryption_key: Option<&EncryptionKey>,
-    trace_id: &str,
-) -> Result<TraceEvent> {
-    let plaintext = if let Some(key) = encryption_key {
-        if bytes.len() < 8 {
-            bail!("encrypted event frame is truncated")
-        }
-        let sequence = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        let envelope =
-            std::str::from_utf8(&bytes[8..]).context("invalid encrypted event envelope")?;
-        let plaintext = key.decrypt(envelope, event_aad(trace_id, sequence).as_bytes())?;
-        let decoded = TraceEvent::decode(plaintext.as_slice())?;
-        if decoded.sequence != sequence {
-            bail!("encrypted event sequence binding mismatch")
-        }
-        return Ok(decoded);
-    } else {
-        bytes.to_vec()
-    };
-    Ok(TraceEvent::decode(plaintext.as_slice())?)
-}
-
-fn event_aad(trace_id: &str, sequence: u64) -> String {
-    format!("premier:journal-frame:v1:{trace_id}:{sequence}")
-}
-
 fn sha256_file(path: &Path) -> Result<String> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
@@ -2692,6 +3069,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::MAX_FRAME_BYTES;
     use proptest::prelude::*;
     use std::time::Duration as StdDuration;
 
@@ -3539,11 +3917,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_refuses_an_active_journal_whose_chain_is_broken() {
+    fn recovery_cuts_an_active_journal_at_a_broken_chain_link() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("edited-live.atrace");
         let mut writer = TraceWriter::create(&root, vec!["agent".into()]).unwrap();
-        for kind in ["one", "two", "three"] {
+        for kind in ["one", "two", "three", "four"] {
             writer
                 .append(kind, "test", serde_json::Value::Null)
                 .unwrap();
@@ -3551,30 +3929,50 @@ mod tests {
         drop(writer);
         let active = root.join("events").join(ACTIVE_JOURNAL);
         let mut events = read_events(&root).unwrap();
-        events[0].payload_json = r#"{"forged":true}"#.into();
+        events[1].payload_json = r#"{"forged":true}"#.into();
         let mut bytes = Vec::new();
-        for event in &events {
+        let mut kept_bytes = 0;
+        for (index, event) in events.iter().enumerate() {
             write_frame(&mut bytes, event, None, &event.trace_id).unwrap();
+            if index == 0 {
+                kept_bytes = bytes.len();
+            }
         }
-        fs::write(&active, bytes).unwrap();
+        fs::write(&active, &bytes).unwrap();
 
-        let error = recover_interrupted_trace(
+        // The forged event still chains from its predecessor; the break shows
+        // at its successor, and neither side of a broken link is kept.
+        let report = recover_interrupted_trace_with(
             &root,
             RecoveryOptions {
                 force: true,
                 ..RecoveryOptions::default()
             },
+            None,
         )
-        .unwrap_err();
+        .unwrap();
 
-        let error = format!("{error:#}");
-        assert!(error.contains("failed chain verification"), "{error}");
+        assert_eq!(report.salvaged_events, 1);
+        assert_eq!(report.discarded_bytes, (bytes.len() - kept_bytes) as u64);
+        assert_eq!(report.discarded_frames, Some(3));
+        let reason = report.reason.unwrap();
         assert!(
-            error.contains("event chain is broken at sequence 2"),
-            "{error}"
+            reason.contains("event chain is broken at sequence 3"),
+            "{reason}"
         );
-        assert!(active.exists());
-        assert!(read_manifest(&root).unwrap().journal.is_none());
+        let recovered = read_events(&root).unwrap();
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "session.interrupted"]
+        );
+        assert_eq!(recovered[0], events[0]);
+        let sealed = verify(&root).unwrap().seal.unwrap();
+        assert!(sealed.recovered);
+        assert_eq!(sealed.discarded_bytes, report.discarded_bytes);
+        assert_eq!(sealed.discarded_frames, Some(3));
     }
 
     #[test]

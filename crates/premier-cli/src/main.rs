@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use premier_cli::evidence::{
-    DiffStatus, QueryOptions, RedactionOptions, diff_events, portable_evidence_with, query_events,
+    DiffStatus, QueryMatcher, QueryOptions, RedactionOptions, diff_events, write_portable_evidence,
 };
 use premier_cli::liveness::{
     RecorderLiveness, UnfinalizedState, recorder_liveness, unfinalized_state,
@@ -14,12 +14,13 @@ use premier_cli::{
 use premier_trace::{
     EventInput, ProcessTermination, RECORDER_LEASE, RecoveryOptions, RedactionConfig,
     TerminationKind, TraceWriter, decode_utf8_chunk, finish_utf8, prepare_trace_output,
-    read_events, read_manifest, recover_interrupted_trace, verify, verify_trace,
+    read_events, read_manifest, recover_interrupted_trace_with, stream_events, verify,
+    verify_trace_visiting,
 };
 use serde::Serialize;
 use serde_json::json;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -165,6 +166,12 @@ enum Commands {
         /// characters, or a file containing them).
         #[arg(long, value_name = "PATH-OR-HEX")]
         public_key: Option<String>,
+        /// For a trace that is not finalized (still recording, or abandoned):
+        /// check the frames of its active journal and their hash chain up to
+        /// the last complete frame, and report the event count. Nothing is
+        /// modified. A finalized trace is verified as usual.
+        #[arg(long)]
+        live: bool,
     },
     /// Generate an Ed25519 signing key: writes the private key (mode 0600) and
     /// `<output>.pub`, and prints the public key.
@@ -187,6 +194,11 @@ enum Commands {
         /// Recover even when the journal was modified recently.
         #[arg(long)]
         force: bool,
+        /// Ed25519 private key file (from `premier keygen`) used to sign the
+        /// recovered trace. The signature is the recovering party's statement
+        /// about what it found, not the recorder's.
+        #[arg(long, value_name = "PATH", env = premier_trace::SIGN_KEY_FILE_ENV)]
+        sign_key: Option<PathBuf>,
     },
     /// Atomically claim a legacy/local trace for a tenant.
     Claim {
@@ -404,23 +416,39 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Commands::Verify { trace, public_key } => {
+        Commands::Verify {
+            trace,
+            public_key,
+            live,
+        } => {
             if let Ok(manifest) = read_manifest(&trace)
                 && let Some(state) = unfinalized_state(&trace, &manifest)
             {
-                bail!("trace is not finalized ({})", state.describe(&trace))
+                if !live {
+                    bail!(
+                        "trace is not finalized ({}); `premier verify --live {}` checks the frames recorded so far without changing anything",
+                        state.describe(&trace),
+                        trace.display()
+                    )
+                }
+                if public_key.is_some() {
+                    bail!("a trace that is not finalized has no signature to check")
+                }
+                return verify_live(&trace, state);
             }
             let trusted_key = public_key
                 .as_deref()
                 .map(premier_trace::PublicKey::from_hex_or_file)
                 .transpose()?;
-            let verified = verify_trace(&trace, trusted_key.as_ref())
-                .with_context(|| format!("invalid: {} failed verification", trace.display()))?;
+            // Diagnostics are derived in the same pass that verifies.
+            let mut validator = premier_trace::EventValidator::default();
+            let verified =
+                verify_trace_visiting(&trace, trusted_key.as_ref(), |event| validator.push(event))
+                    .with_context(|| format!("invalid: {} failed verification", trace.display()))?;
             let (outcome, note) = verification_outcome(&verified);
             let mut manifest = verified.manifest;
             if manifest.diagnostics.is_empty() {
-                manifest.diagnostics =
-                    premier_trace::validate_events(&premier_trace::read_events(&trace)?);
+                manifest.diagnostics = validator.finish();
             }
             println!(
                 "{outcome} {} ({} events, {} semantic diagnostics)",
@@ -448,7 +476,9 @@ async fn main() -> Result<()> {
             trace,
             stale_after_seconds,
             force,
+            sign_key,
         } => {
+            let sign_key = load_signing_key(sign_key.as_deref())?;
             // The idle guard only approximates "is the recorder gone?"; the
             // lease answers it directly when it names a process.
             let mut skip_idle_guard = force;
@@ -462,13 +492,15 @@ async fn main() -> Result<()> {
                     RecorderLiveness::Alive(_) | RecorderLiveness::Unknown => {}
                 }
             }
-            let manifest = recover_interrupted_trace(
+            let report = recover_interrupted_trace_with(
                 &trace,
                 RecoveryOptions {
                     minimum_idle: StdDuration::from_secs(stale_after_seconds),
                     force: skip_idle_guard,
                 },
+                sign_key.as_ref(),
             )?;
+            let manifest = &report.manifest;
             println!(
                 "recovered {} ({} events, exit {})",
                 manifest.trace_id,
@@ -478,6 +510,33 @@ async fn main() -> Result<()> {
                     .map_or(0, |journal| journal.event_count),
                 manifest.exit_code.unwrap_or(130)
             );
+            println!(
+                "kept {} recorded event(s) and appended session.interrupted",
+                report.salvaged_events
+            );
+            if report.discarded_bytes > 0 {
+                println!(
+                    "discarded {} byte(s) ({}) after sequence {}: {}",
+                    report.discarded_bytes,
+                    report.discarded_frames.map_or_else(
+                        || "an unknown number of frames".to_owned(),
+                        |frames| format!("{frames} frame(s)")
+                    ),
+                    report.salvaged_events,
+                    printable(
+                        report
+                            .reason
+                            .as_deref()
+                            .unwrap_or("the journal ends inside a frame")
+                    )
+                );
+            }
+            if let Some(key) = sign_key.as_ref().filter(|_| is_signed(Some(manifest))) {
+                println!(
+                    "signed the recovered trace with key {}",
+                    key.public_key().fingerprint()
+                );
+            }
             Ok(())
         }
         Commands::Keygen { output } => keygen(&output),
@@ -688,6 +747,44 @@ fn keygen(output: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// `premier verify --live`: check an unfinalized trace's active journal up to
+/// its last complete frame. Read-only.
+fn verify_live(trace: &std::path::Path, state: UnfinalizedState) -> Result<()> {
+    let report = premier_trace::inspect_active_journal(trace)
+        .with_context(|| format!("cannot check the active journal of {}", trace.display()))?;
+    let checked = if report.format_version >= 2 {
+        "frames and hash chain valid"
+    } else {
+        "frames valid (v1: no hash chain)"
+    };
+    if let premier_trace::JournalEnd::Invalid { reason, .. } = &report.end {
+        bail!(
+            "invalid: the active journal of {} holds a frame that cannot be genuine after {} valid event(s), at byte {} of {}: {}. `premier recover` finalizes the valid part and records what it discards",
+            report.trace_id,
+            report.events,
+            report.valid_bytes,
+            report.total_bytes,
+            printable(reason)
+        )
+    }
+    println!(
+        "live: {checked} up to the last complete frame: {} ({} events, not finalized: {})",
+        report.trace_id,
+        report.events,
+        state.describe(trace)
+    );
+    if report.end == premier_trace::JournalEnd::TornTail {
+        println!(
+            "note: the last {} byte(s) are an incomplete frame: one still being written, or torn by an interruption",
+            report.total_bytes - report.valid_bytes
+        );
+    }
+    println!(
+        "note: an unfinalized journal has no digest, seal or signature. This shows that the complete frames belong to this trace and follow one another; events removed from the end leave no mark"
+    );
+    Ok(())
+}
+
 /// Leading words and caveat of a successful `premier verify`. Only a
 /// signature by a key the caller supplied is called verified; everything else
 /// is described as what it is.
@@ -833,21 +930,31 @@ fn printable(value: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn print_json(value: &impl Serialize) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
+    // Unbuffered, every token the serializer emits is its own write call.
+    let mut output = BufWriter::new(std::io::stdout().lock());
     serde_json::to_writer_pretty(&mut output, value)?;
     writeln!(output)?;
+    output.flush()?;
     Ok(())
 }
 
 fn query_trace(trace: PathBuf, options: QueryOptions, json_output: bool) -> Result<()> {
     read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
-    let result = query_events(&read_events(&trace)?, &options);
+    // Only the matches up to the limit are kept while the journal streams by.
+    let mut matcher = QueryMatcher::new(&options);
+    let mut events = stream_events(&trace)?;
+    for event in &mut events {
+        matcher.push(event?);
+    }
+    events.ensure_intact()?;
+    let result = matcher.finish();
     if json_output {
         return print_json(&result);
     }
+    let mut output = BufWriter::new(std::io::stdout().lock());
     for event in &result.events {
-        println!(
+        writeln!(
+            output,
             "{:>6}  {}  {:<24} {:<18} {}",
             event.sequence,
             printable(&event.timestamp),
@@ -859,8 +966,9 @@ fn query_trace(trace: PathBuf, options: QueryOptions, json_output: bool) -> Resu
                 printable(&event.actor_id)
             },
             printable(&event.status)
-        );
+        )?;
     }
+    output.flush()?;
     eprintln!(
         "{} matched; {} returned{}",
         result.matched,
@@ -881,47 +989,74 @@ fn export_trace(
 ) -> Result<()> {
     let manifest =
         read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
-    let export = portable_evidence_with(&manifest, &read_events(&trace)?, redaction);
+    let mut events = stream_events(&trace)?;
     if manifest.encryption.is_some() {
         eprintln!(
             "warning: {} is encrypted, but this export is plaintext; protect or delete it accordingly",
             trace.display()
         );
     }
-    if let Some(output) = output {
-        let mut bytes = serde_json::to_vec_pretty(&export)?;
-        bytes.push(b'\n');
-        let temporary = output.with_file_name(format!(
-            ".{}.tmp-{}",
-            output
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("premier-export"),
-            std::process::id()
-        ));
-        write_private(&temporary, &bytes)
-            .with_context(|| format!("cannot write export {}", temporary.display()))?;
-        if let Err(error) = fs::rename(&temporary, &output) {
+    // Events are redacted and written one at a time; the export is never
+    // held in memory.
+    let Some(output) = output else {
+        let mut stdout = BufWriter::new(std::io::stdout().lock());
+        write_portable_evidence(&mut stdout, &manifest, &mut events, redaction)?;
+        writeln!(stdout)?;
+        stdout.flush()?;
+        return events.ensure_intact();
+    };
+    let temporary = output.with_file_name(format!(
+        ".{}.tmp-{}",
+        output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("premier-export"),
+        std::process::id()
+    ));
+    let written = write_export_file(&temporary, &output, &manifest, &mut events, redaction);
+    let counts = match written {
+        Ok(counts) => counts,
+        Err(error) => {
             let _ = fs::remove_file(&temporary);
-            return Err(error)
-                .with_context(|| format!("cannot publish export {}", output.display()));
+            return Err(error);
         }
-        let counts = &export.redaction.redacted;
-        println!(
-            "exported redacted evidence to {} ({} value(s) redacted by this export, {} already redacted when recorded)",
-            output.display(),
-            counts.total,
-            counts.already_redacted
-        );
-        Ok(())
-    } else {
-        print_json(&export)
-    }
+    };
+    println!(
+        "exported redacted evidence to {} ({} value(s) redacted by this export, {} already redacted when recorded)",
+        output.display(),
+        counts.total,
+        counts.already_redacted
+    );
+    Ok(())
+}
+
+/// Write the export next to its destination, then publish it atomically.
+fn write_export_file(
+    temporary: &std::path::Path,
+    output: &std::path::Path,
+    manifest: &premier_trace::TraceManifest,
+    events: &mut premier_trace::EventStream,
+    redaction: RedactionOptions,
+) -> Result<premier_cli::evidence::RedactionCounts> {
+    let mut file = BufWriter::new(
+        create_private(temporary)
+            .with_context(|| format!("cannot write export {}", temporary.display()))?,
+    );
+    let counts = write_portable_evidence(&mut file, manifest, &mut *events, redaction)?;
+    events.ensure_intact()?;
+    writeln!(file)?;
+    file.into_inner()
+        .map_err(|error| error.into_error())
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("cannot write export {}", temporary.display()))?;
+    fs::rename(temporary, output)
+        .with_context(|| format!("cannot publish export {}", output.display()))?;
+    Ok(counts)
 }
 
 /// Create `path` readable and writable by its owner only (0600 on Unix): an
 /// export holds the trace's evidence in plaintext.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+fn create_private(path: &std::path::Path) -> std::io::Result<fs::File> {
     // A leftover file would keep its own, possibly wider, permissions.
     match fs::remove_file(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
@@ -934,9 +1069,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    options.open(path)
 }
 
 fn diff_traces(baseline: PathBuf, current: PathBuf, json_output: bool) -> Result<()> {
@@ -974,17 +1107,29 @@ fn diff_traces(baseline: PathBuf, current: PathBuf, json_output: bool) -> Result
 const MAX_REPLAY_GAP: StdDuration = StdDuration::from_secs(10);
 
 fn replay_trace(trace: PathBuf, speed: f64, no_sleep: bool) -> Result<()> {
-    read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
-    let mut events = read_events(&trace)?;
-    events.sort_by_key(|event| event.sequence);
+    let manifest =
+        read_manifest(&trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
+    // Events are emitted in journal order as they are decoded. An unfinalized
+    // journal has no recorded count, so it is counted first.
+    let event_count = match manifest.journal.as_ref() {
+        Some(journal) => journal.event_count,
+        None => {
+            let mut events = stream_events(&trace)?;
+            for event in &mut events {
+                event?;
+            }
+            events.ensure_intact()?;
+            events.events_read()
+        }
+    };
     eprintln!(
-        "NON-EXECUTION evidence replay: emitting {} recorded events at {speed}x; no commands, tools, or models will run",
-        events.len()
+        "NON-EXECUTION evidence replay: emitting {event_count} recorded events at {speed}x; no commands, tools, or models will run"
     );
     let mut previous = None;
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
-    for event in events {
+    let mut output = BufWriter::new(std::io::stdout().lock());
+    let mut events = stream_events(&trace)?;
+    for event in &mut events {
+        let event = event?;
         if !no_sleep && let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&event.timestamp) {
             if let Some(previous) = previous {
                 let delay = timestamp.signed_duration_since(previous);
@@ -992,6 +1137,8 @@ fn replay_trace(trace: PathBuf, speed: f64, no_sleep: bool) -> Result<()> {
                     && !delay.is_zero()
                 {
                     let delay = delay.min(MAX_REPLAY_GAP);
+                    // Everything emitted so far is visible while waiting.
+                    output.flush()?;
                     thread::sleep(StdDuration::from_secs_f64(delay.as_secs_f64() / speed));
                 }
             }
@@ -999,9 +1146,12 @@ fn replay_trace(trace: PathBuf, speed: f64, no_sleep: bool) -> Result<()> {
         }
         serde_json::to_writer(&mut output, &event)?;
         writeln!(output)?;
-        output.flush()?;
+        if !no_sleep {
+            output.flush()?;
+        }
     }
-    Ok(())
+    output.flush()?;
+    events.ensure_intact()
 }
 
 fn resolve_viewer_dir(viewer_dir: Option<PathBuf>) -> Result<Option<PathBuf>> {

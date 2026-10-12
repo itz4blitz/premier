@@ -24,14 +24,38 @@ Directories are created `0700` and files `0600`. A trace is *finalized* when
 `manifest.json` has a `journal` object; finalization compresses the active
 journal, writes the manifest, then removes the active journal and the lease.
 
+The finalized journal is a series of concatenated zstd frames, which is one
+valid zstd stream and decompresses with any zstd decoder. The writer starts a
+new zstd frame once the current one holds 1 MiB of uncompressed data, always
+between two event frames, so decoding can start at any zstd frame. A journal
+written as a single zstd frame (as earlier builds did) is equally valid; a
+reader must not rely on where the zstd frames fall.
+
 ## Frames
 
 The journal is a sequence of frames with no header or trailer:
 
 ```
 frame  = length body
-length = u32, little-endian, byte length of body, at most 64 MiB
+length = u32, little-endian, byte length of body, at least 1 and at most 64 MiB
 ```
+
+A journal ends at a frame boundary. A frame with length zero, a length above
+64 MiB, a body that does not decode (or, when encrypted, does not
+authenticate) or an event with neither a sequence nor an id is not a frame of
+any journal, and a reader stops with an error instead of returning it.
+
+- A *finalized* journal that ends inside a frame, or whose zstd stream ends
+  early, is truncated: every reader reports an error rather than the events
+  before the cut.
+- An *active* journal may end inside a frame, because its recorder appends to
+  it (or was interrupted while doing so); readers stop before that frame. It
+  has no digest, so each complete frame is also checked against its
+  predecessor: the event must carry the trace's id, its sequence must be the
+  predecessor's plus one and, in version 2, its `prev_hash` must be the hash
+  of the predecessor. Readers that follow or page a live journal stop before
+  the first frame that fails; readers asked for the whole journal report an
+  error.
 
 In a plaintext trace `body` is one protobuf-encoded event. In an encrypted
 trace `body` is the event's `sequence` as a u64 little-endian, followed by the
@@ -108,6 +132,8 @@ first event whose `prev_hash` is not the hash of its predecessor.
   "chain_head": "<64 hex>",
   "event_count": 3,
   "recovered": true,
+  "discarded_bytes": 4096,
+  "discarded_frames": 2,
   "digest": "<64 hex>",
   "signature": {
     "algorithm": "ed25519",
@@ -119,6 +145,10 @@ first event whose `prev_hash` is not the hash of its predecessor.
 
 `recovered` is written only when true, `signature` only when the trace is
 signed. `event_count` must equal the number of events in the journal.
+`discarded_bytes` is written only when recovery left part of the abandoned
+journal out, and is the number of bytes it left out; `discarded_frames` is the
+number of frames in those bytes and is written only when recovery could
+determine it (see [`premier recover`](#operations-that-rewrite-a-trace)).
 
 ### Seal
 
@@ -127,7 +157,8 @@ digest = hex(SHA-256("premier:manifest-seal:v2\0" || canonical(manifest)))
 ```
 
 `canonical(manifest)` covers every manifest field, including `journal`,
-`seal.chain_head`, `seal.event_count` and `seal.recovered`, with exactly three
+`seal.chain_head`, `seal.event_count`, `seal.recovered`,
+`seal.discarded_bytes` and `seal.discarded_frames`, with exactly three
 members removed: `seal.digest`, `seal.signature` and
 `encryption.private_manifest` (ciphertext with a fresh nonce on every write;
 `encryption.algorithm` and `encryption.key_id` are covered). It is JSON with:
@@ -149,8 +180,9 @@ not covered. Parsing normalizes a few fields before they are hashed: a missing
 `redaction.terminal_literal_count` and `terminal_regex_count` are `0`; and
 `diagnostics`, `redaction.custom_fields`, `redaction.implicit_rules`, and
 `redaction.builtin_patterns` are omitted when empty, as are
-`redaction.terminal_multiline_regex_count` when zero and `seal.recovered`
-when false. Every other field is hashed as stored.
+`redaction.terminal_multiline_regex_count` when zero, `seal.recovered` when
+false and `seal.discarded_bytes` when zero. Every other field is hashed as
+stored.
 
 ### Signature
 
@@ -177,6 +209,7 @@ bytes of the SHA-256 of the raw public key, in hex.
 premier keygen <path>                     # writes <path> (0600) and <path>.pub
 premier record --sign-key <path> -- ...   # or PREMIER_SIGN_KEY_FILE=<path>
 premier sign <trace> --sign-key <path>    # an already finalized trace
+premier recover <trace> --sign-key <path> # an abandoned trace, as it is recovered
 premier verify <trace> [--public-key <path-or-hex>]
 ```
 
@@ -224,6 +257,14 @@ limit. With `--public-key`, an unsigned trace, a version 1 trace and a trace
 signed by any other key are all failures. The full output is shown in
 [cli.md](cli.md#verify).
 
+A trace that is not finalized has no digest, seal or signature, and
+`premier verify` refuses it. `premier verify --live` instead reads its active
+journal, without modifying anything, under the active-journal rules in
+[Frames](#frames): it exits zero with `live: ...` and the number of events up
+to the last complete frame, or non-zero with `invalid` and the number of valid
+events before the first frame that fails. This shows only that the complete
+frames belong to the trace and follow one another (see the limits below).
+
 The viewer API reports the same thing per trace as `integrity`
 (`live`, `abandoned`, `verified`, `invalid`, `locked`), `integrity_protection`
 (`digest_only`, `sealed`, `signed`; present only for `verified`) and
@@ -234,12 +275,26 @@ server has no usable key for. The server has no list of trusted keys, so
 
 ## Operations that rewrite a trace
 
-- **`premier recover`** finalizes an abandoned active journal. It verifies the
-  chain over the complete frames and refuses a journal whose chain is broken,
-  drops a torn trailing frame, appends a `session.interrupted` event that
-  continues the chain, and seals with `seal.recovered = true`. It signs if
-  `PREMIER_SIGN_KEY_FILE` is set; that signature is the recovering party's
-  statement about what it found, not the recorder's.
+- **`premier recover`** finalizes an abandoned active journal from the longest
+  prefix of it that can be genuine. It reads the journal frame by frame under
+  the active-journal rules in [Frames](#frames) and cuts it at the first frame
+  that is incomplete or fails them. When that frame is complete but its
+  `prev_hash` does not match, one of it and its predecessor was altered and
+  nothing says which, so the predecessor is cut as well. The kept frames are
+  copied byte for byte (never re-encoded, and no event is reconstructed), a
+  `session.interrupted` event that continues the chain is appended, and the
+  trace is sealed with `seal.recovered = true`. What was cut is recorded three
+  times: `seal.discarded_bytes` and `seal.discarded_frames`, a
+  `journal.recovery_discarded` entry in `diagnostics` giving the reason, and
+  the payload of the `session.interrupted` event (`recovered_event_count`,
+  `discarded_trailing_bytes`, and `discarded_frames` and `discard_reason` when
+  known). The frame count is known when the cut bytes divide, by their length
+  prefixes, into frames that decode as events of this trace (the first
+  excepted, being the one that failed), with at most one incomplete frame at
+  the end; padding or other garbage has no frame count. The cut bytes
+  themselves are not kept. It signs with `--sign-key` or
+  `PREMIER_SIGN_KEY_FILE`; that signature is the recovering party's statement
+  about what it found, not the recorder's.
 - **`premier encrypt`** (encrypt or rotate) re-encrypts the events unchanged,
   so the chain and its head are preserved. `journal.sha256` and `encryption`
   change, so the seal digest is recomputed and an existing signature no longer
@@ -253,7 +308,8 @@ server has no usable key for. The server has no list of trusted keys, so
   the source trace's `format_version`, `protection`, `journal_sha256`,
   `chain_head`, `event_count`, `seal`, `signature`, `public_key` and
   `public_key_fingerprint`. The export itself is not covered by the seal or the
-  signature, because redaction changes the events.
+  signature, because redaction changes the events. It is written in one pass,
+  so its `redaction` summary follows the `events` it counts.
 
 ## Version 1 compatibility
 
@@ -308,6 +364,8 @@ Limits that apply at every level:
 - An unfinalized journal has no recorded chain head. Its chain exposes a
   careless edit among complete frames, but trailing events can be removed at a
   frame boundary without trace, exactly as a crash would, and a full re-chain
-  is undetectable. `seal.recovered` marks traces sealed from such a journal.
+  is undetectable. The last event of such a journal has no successor to vouch
+  for it, so damage confined to it that still decodes goes unnoticed too.
+  `seal.recovered` marks traces sealed from such a journal.
 - Deleting a trace, or replacing it with a different validly sealed or signed
   trace, is outside what a per-trace format can detect.

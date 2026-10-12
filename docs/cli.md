@@ -484,6 +484,18 @@ Diagnostics are warnings about the recorded events (see
 What each outcome does and does not prove is covered in
 [security.md](security.md#what-verification-proves).
 
+### `verify --live`
+
+`premier verify <TRACE>` on a trace that is not finalized fails and points
+here. `premier verify --live <TRACE>` checks the active journal of a trace
+that is still recording or was abandoned: it validates each frame and the
+format v2 hash chain up to the last complete frame and prints the event count.
+It modifies nothing. A frame that cannot be genuine (zero length, an empty
+event, another trace's id, a sequence that does not follow its predecessor, or
+a chain mismatch) makes it print `invalid:` with the reason and exit non-zero.
+A torn trailing frame is not an error. On a finalized trace `--live` changes
+nothing: the trace is verified as usual.
+
 ## Signing: `keygen` and `sign`
 
 A signature is optional. It is an Ed25519 signature over the manifest seal,
@@ -652,6 +664,29 @@ recovered 01a130a7-90c7-7e40-b2e9-9a029dfb6ed5 (3 events, exit 130)
 `--force` on a trace whose recorder is still running finalizes it underneath
 that recorder. Stop the recorder first. Recovery removes the lease, and a
 recorder that is still running does not write it again.
+
+### Damaged journals
+
+`recover` salvages the longest valid prefix of the active journal. It keeps
+every frame before the first one that cannot be genuine, copies those frames
+unchanged, appends `session.interrupted`, and finalizes. It never fabricates
+events. What was dropped is reported on stdout (bytes, and frames when that can
+be known, with the sequence after which the cut was made and the reason) and
+recorded in three places: `seal.discarded_bytes` and `seal.discarded_frames`
+in the manifest, a `journal.recovery_discarded` diagnostic, and the
+`session.interrupted` payload. The discarded bytes themselves are not kept.
+
+When an event fails to chain to its predecessor, nothing says which of the two
+was altered, so recovery drops both.
+
+`recover --sign-key <PATH>` (env `PREMIER_SIGN_KEY_FILE`) signs the recovered
+trace. That signature is the recovering party's statement about what it found,
+not the recorder's.
+
+A finalized journal that has been cut short is a different case: every reader
+fails with `journal is truncated`, and `verify` reports a digest mismatch.
+`query`, `export`, `diff`, and `replay` no longer read a truncated journal as
+an empty or shorter trace.
 
 ## `claim`
 
