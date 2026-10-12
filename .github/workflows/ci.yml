@@ -31,4 +31,5 @@ jobs:
         run: npm run security:secrets
       - run: npm run test:all
       - run: ./scripts/tests/distribution.sh
+      - run: ./scripts/tests/premier-emit.sh
       - run: node scripts/tests/preflight-npm-trusted-publishing.test.mjs

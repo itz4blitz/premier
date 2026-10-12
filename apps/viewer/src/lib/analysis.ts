@@ -1,3 +1,4 @@
+import { nativeExitCode, nativeOf, nativeText, nativeType, payloadError, payloadModel, payloadTool, payloadTotalTokens } from './nativePayload';
 import type { EventCategory, EventFilters, TraceEvent, TraceManifest } from './types';
 
 export type ActorRole = 'process' | 'agent' | 'subagent' | 'human' | 'system';
@@ -149,6 +150,14 @@ function first(payload: Record<string, unknown>, keys: string[]): string | null 
   return null;
 }
 
+/** Provider text is unbounded; rows only need the opening of it. */
+function excerpt(value: string | null, limit = 240): string | null {
+  if (!value) return null;
+  const flat = value.replace(/\s+/g, ' ').trim();
+  if (!flat) return null;
+  return flat.length > limit ? `${flat.slice(0, limit - 1)}…` : flat;
+}
+
 export function eventSummary(event: TraceEvent): string {
   let payload: Record<string, unknown>;
   try {
@@ -163,6 +172,13 @@ export function eventSummary(event: TraceEvent): string {
     return event.payload_json.trim() || event.source;
   }
   const kind = event.kind.toLowerCase();
+  // Adapter events keep the provider object under payload.native; top-level fields win when present.
+  const native = nativeOf(payload);
+  const nativeError = native ? payloadError(payload) : null;
+  /** What a provider event says for itself: its error, its text, or at least its native type. */
+  const nativeFallback = (): string | null => native
+    ? (nativeError ? `error: ${excerpt(nativeError)}` : null) ?? excerpt(nativeText(payload)) ?? nativeType(payload)
+    : null;
   if (kind === 'session.start') {
     const goal = first(payload, ['goal']);
     const command = Array.isArray(payload.command) ? payload.command.map(String) : null;
@@ -172,13 +188,17 @@ export function eventSummary(event: TraceEvent): string {
   }
   if (kind.includes('stdout') || kind.includes('stderr')) return first(payload, ['text'])?.replace(/\s+/g, ' ').trim() || 'Empty output';
   if (kind.startsWith('model.')) {
-    const model = first(payload, ['model']);
-    const content = first(payload, ['summary', 'text', 'content', 'response']);
-    const tokens = first(payload, ['tokens', 'total_tokens']);
-    return [model, content, tokens ? `${tokens} tokens` : null].filter(Boolean).join(' · ') || 'Model response captured';
+    const model = first(payload, ['model']) ?? payloadModel(payload);
+    const content = first(payload, ['summary', 'text', 'content', 'response'])
+      ?? (nativeError ? `error: ${excerpt(nativeError)}` : excerpt(nativeText(payload)));
+    // Missing usage stays absent from the row; it is never rendered as "0 tokens".
+    const tokens = first(payload, ['tokens', 'total_tokens']) ?? payloadTotalTokens(payload);
+    return [model, content, tokens !== null ? `${tokens} tokens` : null].filter(Boolean).join(' · ') || 'Model response captured';
   }
   if (kind.startsWith('tool.')) {
-    const tool = first(payload, ['tool', 'name', 'command']) || event.source;
+    const namedTool = first(payload, ['tool', 'name', 'command']) || (native ? payloadTool(payload) : null);
+    const tool = namedTool || (native ? (kind === 'tool.result' ? 'Tool result' : 'Tool call') : event.source);
+    const exitCode = nativeExitCode(payload);
     const result = payload.failed !== undefined ? `failed: ${compact(payload.failed)}`
       : payload.error !== undefined ? `error: ${compact(payload.error)}`
       : payload.query !== undefined ? `query: ${compact(payload.query)}`
@@ -186,11 +206,15 @@ export function eventSummary(event: TraceEvent): string {
       : payload.missing !== undefined ? `${compact(payload.missing)} missing`
       : payload.matches !== undefined ? `${compact(payload.matches)} matches`
       : payload.files_changed !== undefined ? `${compact(payload.files_changed)} files changed`
-      : first(payload, ['result', 'summary']);
+      : first(payload, ['result', 'summary'])
+        ?? (nativeError ? `error: ${excerpt(nativeError)}`
+          : exitCode !== null ? `exit ${exitCode}`
+          : native && !namedTool ? excerpt(nativeText(payload))
+          : null);
     return result ? `${tool} · ${result}` : tool;
   }
   if (kind === 'approval.request') {
-    const operation = first(payload, ['operation', 'action']) || 'operation';
+    const operation = first(payload, ['operation', 'action']) || (native ? payloadTool(payload) : null) || 'operation';
     const target = first(payload, ['files', 'resource', 'scope']);
     const reason = first(payload, ['reason']);
     return [`Request ${operation}`, target, reason].filter(Boolean).join(' · ');
@@ -206,10 +230,10 @@ export function eventSummary(event: TraceEvent): string {
     if (kind === 'agent.delegation' && delegates) return [`Delegated to ${delegates}`, content].filter(Boolean).join(' · ');
     if (kind === 'agent.join' && delegates) return [`Joined ${delegates}`, content].filter(Boolean).join(' · ');
     if (kind === 'agent.message' && delegates) return [`Sent to ${delegates}`, content].filter(Boolean).join(' · ');
-    return content || event.source;
+    return content || nativeFallback() || event.source;
   }
   if (kind === 'process.exit' || typeof payload.exit_code === 'number') return `Exited with status ${payload.exit_code}`;
-  return first(payload, ['summary', 'text', 'message', 'operation', 'command']) || event.source;
+  return first(payload, ['summary', 'text', 'message', 'operation', 'command']) || nativeFallback() || event.source;
 }
 
 export function timelineLayout(events: TraceEvent[]): { lanes: string[]; events: TimelineEvent[] } {
@@ -263,6 +287,24 @@ export function countByCategory(events: TraceEvent[], category: EventCategory): 
   if (category === 'all') return events.length;
   if (category === 'error') return events.filter(isIssue).length;
   return events.filter((event) => familyOf(event) === category).length;
+}
+
+/**
+ * First timestamp and overall span of a journal. Written as a loop on purpose: spreading a large
+ * journal into Math.min/Math.max overflows the call stack above roughly 125k events.
+ */
+export function traceTimeBounds(input: TraceEvent[]): { start: number; span: number } | null {
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const event of input) {
+    const timestamp = Date.parse(event.timestamp);
+    if (!Number.isFinite(timestamp)) continue;
+    if (timestamp < start) start = timestamp;
+    const finished = timestamp + Math.max(0, event.duration_ms || 0);
+    if (finished > end) end = finished;
+  }
+  if (!Number.isFinite(start)) return null;
+  return { start, span: Math.max(1, end - start) };
 }
 
 export function isProcessNoise(event: TraceEvent): boolean {

@@ -102,3 +102,15 @@ it('renders architecture without coupling it to a second time ruler', () => {
   expect(screen.queryByText('Orchestration ruler', { exact: true })).not.toBeInTheDocument();
   expect(screen.getByRole('heading', { name: 'Agent topology' })).toBeInTheDocument();
 });
+
+it('mounts the time navigator for a journal larger than the argument-spread limit', () => {
+  const origin = Date.parse('2026-07-13T12:00:00.000Z');
+  const journal: TraceEvent[] = Array.from({ length: 130_000 }, (_, index) => ({
+    ...event(index + 1, index % 2 ? 'researcher' : 'coordinator', 'process.stdout', 0),
+    timestamp: new Date(origin + index * 10).toISOString()
+  }));
+  expect(() => render(ArchitectureView, {
+    props: { events: journal, timeOnly: true, compact: true, showHeader: false, showDiagram: false, onwindow: vi.fn(), onactor: vi.fn(), onselect: vi.fn() }
+  })).not.toThrow();
+  expect(document.querySelector('.architecture-view.time-only')).toBeInTheDocument();
+}, 60_000);

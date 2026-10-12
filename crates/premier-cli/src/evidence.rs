@@ -89,39 +89,25 @@ fn normalized_key(key: &str) -> String {
         .collect()
 }
 
+/// Export shares the recorder's secret field list instead of keeping its own.
 fn secret_key(key: &str) -> bool {
-    let key = normalized_key(key);
-    matches!(
-        key.as_str(),
-        "password"
-            | "passwd"
-            | "token"
-            | "accesstoken"
-            | "refreshtoken"
-            | "authorization"
-            | "proxyauthorization"
-            | "apikey"
-            | "secret"
-            | "clientsecret"
-            | "privatekey"
-            | "cookie"
-            | "setcookie"
-            | "credential"
-            | "credentials"
-            | "secretaccesskey"
-            | "bearer"
-    ) || key.ends_with("token")
-        || key.ends_with("password")
-        || key.ends_with("clientsecret")
-        || key.ends_with("apikey")
-        || key.ends_with("secretaccesskey")
+    premier_trace::is_secret_field_name(key)
 }
 
+/// Recursively replace the values of secret-named fields. Besides plain
+/// object keys this covers header-style pairs (`{"name": "Authorization",
+/// "value": ...}` and `["Authorization", ...]`), argument and header lists
+/// (`--token VALUE`, `API_KEY=VALUE`, `Cookie: VALUE`), and JSON documents
+/// stored inside string values.
 pub fn redact_secrets(value: &mut Value) {
     match value {
         Value::Object(object) => {
+            let named_secret = ["name", "key", "header"]
+                .iter()
+                .filter_map(|field| object.get(*field)?.as_str())
+                .any(secret_key);
             for (key, value) in object {
-                if secret_key(key) {
+                if secret_key(key) || (named_secret && matches!(key.as_str(), "value" | "values")) {
                     *value = Value::String(REDACTED.into());
                 } else {
                     redact_secrets(value);
@@ -129,8 +115,41 @@ pub fn redact_secrets(value: &mut Value) {
             }
         }
         Value::Array(items) => {
+            let strings = items
+                .iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>();
+            if let Some(mut strings) = strings {
+                // A bare header name followed by its value: `["Cookie", VALUE]`.
+                let bare_name = |name: &str| {
+                    !name.contains(|character: char| {
+                        character.is_whitespace() || matches!(character, ':' | '=')
+                    })
+                };
+                if strings.len() == 2 && bare_name(&strings[0]) && secret_key(&strings[0]) {
+                    strings[1] = REDACTED.into();
+                }
+                for (item, redacted) in items
+                    .iter_mut()
+                    .zip(premier_trace::redact_command_secrets(&strings))
+                {
+                    *item = Value::String(redacted);
+                }
+            }
             for item in items {
                 redact_secrets(item);
+            }
+        }
+        Value::String(text) => {
+            if text.trim_start().starts_with(['{', '['])
+                && let Ok(original) = serde_json::from_str::<Value>(text)
+            {
+                let mut nested = original.clone();
+                redact_secrets(&mut nested);
+                // Untouched documents keep their exact original text.
+                if nested != original {
+                    *text = nested.to_string();
+                }
             }
         }
         _ => {}
@@ -176,7 +195,7 @@ pub fn portable_evidence(manifest: &TraceManifest, events: &[TraceEvent]) -> Por
         redaction: PortableRedaction {
             applied: true,
             replacement: REDACTED,
-            policy: "recursive common secret field names",
+            policy: "recursive common secret field names, including JSON strings and header or argument lists",
         },
         manifest,
         events,
@@ -246,15 +265,18 @@ pub fn semantic_event_key(event: &TraceEvent) -> String {
     } else {
         None
     };
+    // Adapter subagent actors end in the provider's generated tool-call id, which differs per run.
+    let actor = event.actor_id.trim();
+    let actor = match actor.split_once(":subagent:") {
+        Some((provider, _)) if event.source.starts_with("adapter.") => {
+            format!("{provider}:subagent")
+        }
+        _ => actor.to_owned(),
+    };
     format!(
         "{}:{}{}",
         event.kind.trim().to_lowercase(),
-        if event.actor_id.trim().is_empty() {
-            "root"
-        } else {
-            event.actor_id.trim()
-        }
-        .to_lowercase(),
+        if actor.is_empty() { "root" } else { &actor }.to_lowercase(),
         discriminator
             .map(|value| format!(":{}", compact_identity(value)))
             .unwrap_or_default()
@@ -275,16 +297,48 @@ fn generated_key(key: &str) -> bool {
     )
 }
 
+/// Ids a provider CLI generates per run; only ignored inside an adapter's `native` copy.
+fn provider_generated_key(key: &str) -> bool {
+    matches!(
+        normalized_key(key).as_str(),
+        "id" | "uuid"
+            | "sessionid"
+            | "threadid"
+            | "messageid"
+            | "requestid"
+            | "itemid"
+            | "callid"
+            | "toolid"
+            | "tooluseid"
+            | "toolcallid"
+            | "parenttooluseid"
+    )
+}
+
 fn comparable_payload(value: &Value) -> Value {
+    comparable_value(value, false)
+}
+
+fn comparable_value(value: &Value, native: bool) -> Value {
     match value {
         Value::Object(object) => Value::Object(
             object
                 .iter()
-                .filter(|(key, _)| !generated_key(key))
-                .map(|(key, value)| (key.clone(), comparable_payload(value)))
+                .filter(|(key, _)| !generated_key(key) && !(native && provider_generated_key(key)))
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        comparable_value(value, native || key == "native"),
+                    )
+                })
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(comparable_payload).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| comparable_value(item, native))
+                .collect(),
+        ),
         _ => value.clone(),
     }
 }
@@ -474,6 +528,78 @@ mod tests {
     }
 
     #[test]
+    fn redacts_secret_fields_inside_stringified_json_values() {
+        let mut value = json!({
+            "arguments": "{\"api_key\":\"sk-JSON-IN-STRING\",\"region\":\"eu\"}",
+            "body": "[{\"password\":\"nested-pw\"}]",
+            "double": "{\"inner\":\"{\\\"token\\\":\\\"deep-token\\\"}\"}",
+            "plain": "{\"region\": \"eu\"}",
+            "prose": "not json {token}"
+        });
+        redact_secrets(&mut value);
+        let text = value.to_string();
+        for secret in ["sk-JSON-IN-STRING", "nested-pw", "deep-token"] {
+            assert!(!text.contains(secret), "{secret} survived: {text}");
+        }
+        let arguments: Value = serde_json::from_str(value["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"api_key": REDACTED, "region": "eu"}));
+        assert_eq!(value["plain"], "{\"region\": \"eu\"}");
+        assert_eq!(value["prose"], "not json {token}");
+    }
+
+    #[test]
+    fn redacts_header_style_arrays_and_argument_lists() {
+        let mut value = json!({
+            "headers": [
+                {"name": "Authorization", "value": "Bearer pair-secret"},
+                {"name": "Accept", "value": "application/json"},
+                {"key": "X-Api-Key", "value": "key-secret"}
+            ],
+            "raw_headers": [["Cookie", "session=cookie-secret"], ["Accept", "text/html"]],
+            "lines": ["Authorization: Bearer line-secret", "Accept: */*"],
+            "env": ["OPENAI_API_KEY=env-secret", "HOME=/home/agent"],
+            "command": ["deploy", "--token", "argv-secret", "--password=flag-secret", "--max-tokens", "64"],
+            "usage": {"input_tokens": 1200, "output_tokens": 400}
+        });
+        redact_secrets(&mut value);
+        let text = value.to_string();
+        for secret in [
+            "pair-secret",
+            "key-secret",
+            "cookie-secret",
+            "line-secret",
+            "env-secret",
+            "argv-secret",
+            "flag-secret",
+        ] {
+            assert!(!text.contains(secret), "{secret} survived: {text}");
+        }
+        assert_eq!(value["headers"][0]["name"], "Authorization");
+        assert_eq!(value["headers"][1]["value"], "application/json");
+        assert_eq!(value["raw_headers"][1], json!(["Accept", "text/html"]));
+        assert_eq!(
+            value["lines"],
+            json!(["Authorization: [REDACTED]", "Accept: */*"])
+        );
+        assert_eq!(value["env"][1], "HOME=/home/agent");
+        assert_eq!(
+            value["command"],
+            json!([
+                "deploy",
+                "--token",
+                REDACTED,
+                "--password=[REDACTED]",
+                "--max-tokens",
+                "64"
+            ])
+        );
+        assert_eq!(
+            value["usage"],
+            json!({"input_tokens": 1200, "output_tokens": 400})
+        );
+    }
+
+    #[test]
     fn semantic_diff_ignores_generated_payload_fields() {
         let baseline = event(
             "model.response",
@@ -486,5 +612,38 @@ mod tests {
         let diff = diff_events(&[baseline], &[current]);
         assert_eq!(diff.counts.unchanged, 1);
         assert_eq!(diff.counts.changed, 0);
+    }
+
+    #[test]
+    fn adapter_events_key_on_the_tool_and_ignore_provider_generated_ids() {
+        let adapter = |tool: &str, id: &str, actor: &str| TraceEvent {
+            source: "adapter.claude.v1".into(),
+            actor_id: actor.into(),
+            ..event(
+                "tool.result",
+                json!({"provider": "claude", "tool": tool, "id": "kept", "native": {
+                    "uuid": id, "session_id": id,
+                    "message": {"id": id, "content": [{"type": "tool_result", "tool_use_id": id}]}
+                }}),
+            )
+        };
+        let read = adapter("Read", "run-a", "claude:subagent:toolu_a");
+        assert_eq!(
+            semantic_event_key(&read),
+            "tool.result:claude:subagent:read"
+        );
+        let baseline = [adapter("Grep", "run-a", "claude"), read];
+        let current = [
+            adapter("Read", "run-b", "claude:subagent:toolu_b"),
+            adapter("Grep", "run-b", "claude"),
+        ];
+        let diff = diff_events(&baseline, &current);
+        assert_eq!(diff.counts.unchanged, 2, "{:?}", diff.items);
+
+        // Outside `native`, a caller's own `id` field is still compared.
+        let mut changed = adapter("Grep", "run-b", "claude");
+        changed.payload_json = changed.payload_json.replace("kept", "edited");
+        let diff = diff_events(&baseline[..1], &[changed]);
+        assert_eq!(diff.counts.changed, 1);
     }
 }

@@ -238,10 +238,15 @@ export function inferArchitecture(
     actors.set(id, accumulator);
   }
 
-  const allStarts = [...actors.values()].flatMap((entry) => entry.starts);
-  const allEnds = [...actors.values()].flatMap((entry) => entry.ends);
-  const runStart = allStarts.length ? Math.min(...allStarts) : 0;
-  const runEnd = allEnds.length ? Math.max(...allEnds) : runStart;
+  // Loops, not Math.min(...values): spreading a large journal overflows the call stack.
+  let earliest = Number.POSITIVE_INFINITY;
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const entry of actors.values()) {
+    for (const startMs of entry.starts) if (startMs < earliest) earliest = startMs;
+    for (const endMs of entry.ends) if (endMs > latest) latest = endMs;
+  }
+  const runStart = Number.isFinite(earliest) ? earliest : 0;
+  const runEnd = Number.isFinite(latest) ? latest : runStart;
   const runSpan = Math.max(0, runEnd - runStart);
   // Gap threshold: idle stretches beyond 8% of the run (min 400ms, max 30s) break activity segments.
   const gapMs = Math.min(30_000, Math.max(400, runSpan * 0.08));
@@ -254,8 +259,9 @@ export function inferArchitecture(
     });
     const segments = activitySegments(intervals, gapMs);
     accumulator.actor.segments = segments;
-    const startMs = segments[0]?.startMs ?? Math.min(...accumulator.starts);
-    const endMs = segments.at(-1)?.endMs ?? Math.max(...accumulator.ends);
+    // activitySegments always yields at least one segment for a non-empty interval list.
+    const startMs = segments[0].startMs;
+    const endMs = segments[segments.length - 1].endMs;
     accumulator.actor.window = { startMs, endMs, durationMs: Math.max(0, endMs - startMs) };
   }
 

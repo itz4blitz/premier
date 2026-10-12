@@ -85,7 +85,8 @@
     const model = architectureModel;
     if (!ordered.length) return { ordered, model, start: 0, end: 0, span: 1, bins: [] as Bin[], windowEvents: [] as TraceEvent[], selected: null as TraceEvent | null, hottest: null as Bin | null, firstIssue: null as TraceEvent | null, maxBin: 1 };
     const start = timeOf(ordered[0]);
-    const end = Math.max(start, ...ordered.map((event) => timeOf(event) + Math.max(0, event.duration_ms || 0)));
+    // reduce, not Math.max(...values): spreading a large journal overflows the call stack.
+    const end = ordered.reduce((latest, event) => Math.max(latest, timeOf(event) + Math.max(0, event.duration_ms || 0)), start);
     const span = Math.max(1, end - start);
     const binCount = Math.min(24, Math.max(10, Math.ceil(Math.sqrt(ordered.length) * 2.4)));
     const bins: Bin[] = Array.from({ length: binCount }, (_, index) => ({

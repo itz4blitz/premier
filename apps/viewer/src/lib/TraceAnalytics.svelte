@@ -69,7 +69,8 @@
     if (!ordered.length) return null;
 
     const start = timestamp(ordered[0]);
-    const rawEnd = Math.max(...ordered.map((event) => timestamp(event) + Math.max(0, event.duration_ms || 0)));
+    // reduce, not Math.max(...values): spreading a large journal overflows the call stack.
+    const rawEnd = ordered.reduce((latest, event) => Math.max(latest, timestamp(event) + Math.max(0, event.duration_ms || 0)), Number.NEGATIVE_INFINITY);
     const end = Math.max(start, rawEnd);
     const span = Math.max(1, end - start);
     const binCount = ordered.length === 1 ? 1 : Math.min(24, Math.max(8, Math.ceil(Math.sqrt(ordered.length) * 2)));

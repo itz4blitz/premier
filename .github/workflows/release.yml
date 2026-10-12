@@ -135,6 +135,9 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               "$archive"
           done
+          # Refuse to publish a release that the consumer-side verifier, with
+          # its own pinned signer identity, would reject.
+          "$GITHUB_WORKSPACE/scripts/verify-release.sh" --directory .
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: release-assets/*.tar.gz

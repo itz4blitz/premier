@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, State};
-use axum::http::{Request, StatusCode, Uri, header};
+use axum::http::uri::Authority;
+use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::ffi::OsString;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -167,15 +169,28 @@ fn decode_sha256(value: &str) -> Result<[u8; 32]> {
         bail!("token_sha256 must be exactly 64 hexadecimal characters")
     }
     let mut result = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         result[index] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
     }
     Ok(result)
 }
 
+/// Deployment choices for the viewer app beyond its trace store and credentials.
+#[derive(Clone, Debug, Default)]
+pub struct ServerOptions {
+    /// Remove the local assistant: no CLI discovery, no provider list, no spawning.
+    pub disable_assistant: bool,
+    /// Serve only this entry of the trace directory (`premier open <trace>`).
+    pub only_artifact: Option<OsString>,
+}
+
 struct AppState {
     trace_dir: PathBuf,
+    only_artifact: Option<OsString>,
     assistants: AssistantRegistry,
+    assistant_enabled: bool,
+    /// One local agent CLI at a time; a second request is refused, not queued.
+    assistant_slot: tokio::sync::Semaphore,
     /// Decoded/verified trace snapshots memoized by artifact freshness stamp.
     /// Finalized journals are immutable, so an unchanged stamp means the
     /// expensive decode + digest verification never has to repeat.
@@ -415,7 +430,22 @@ fn validate_remote_trace(path: PathBuf) -> Result<()> {
 /// (useful for local UI development). Otherwise the binary serves the embedded viewer
 /// so a PATH-installed `premier` works without the monorepo checkout.
 pub fn app(trace_dir: PathBuf, viewer_dir: Option<PathBuf>, auth: AuthPolicy) -> Router {
-    app_with_registry(trace_dir, viewer_dir, auth, AssistantRegistry::discover())
+    app_with_options(trace_dir, viewer_dir, auth, ServerOptions::default())
+}
+
+/// [`app`] with explicit [`ServerOptions`].
+pub fn app_with_options(
+    trace_dir: PathBuf,
+    viewer_dir: Option<PathBuf>,
+    auth: AuthPolicy,
+    options: ServerOptions,
+) -> Router {
+    let assistants = if options.disable_assistant {
+        AssistantRegistry::none()
+    } else {
+        AssistantRegistry::discover()
+    };
+    app_with_registry(trace_dir, viewer_dir, auth, options, assistants)
 }
 
 /// True when the embedded bundle includes a real Vite build (not the compile-time fallback).
@@ -432,11 +462,18 @@ fn app_with_registry(
     trace_dir: PathBuf,
     viewer_dir: Option<PathBuf>,
     auth: AuthPolicy,
+    options: ServerOptions,
     assistants: AssistantRegistry,
 ) -> Router {
+    let guard = Arc::new(RequestGuard {
+        anonymous: !auth.is_configured(),
+    });
     let state = Arc::new(AppState {
         trace_dir,
+        only_artifact: options.only_artifact,
         assistants,
+        assistant_enabled: !options.disable_assistant,
+        assistant_slot: tokio::sync::Semaphore::new(1),
         snapshots: Mutex::new(HashMap::new()),
     });
     let api = Router::new()
@@ -463,6 +500,7 @@ fn app_with_registry(
     };
     router
         .layer(middleware::from_fn_with_state(Arc::new(auth), authorize))
+        .layer(middleware::from_fn_with_state(guard, guard_request))
         .layer(middleware::from_fn(security_headers))
 }
 
@@ -530,12 +568,134 @@ async fn capture_event(
         .map_err(|error| ApiResponseError::bad_request(&error.to_string()))?;
     let input: EventInput = serde_json::from_slice(&bytes)
         .map_err(|error| ApiResponseError::bad_request(&error.to_string()))?;
+    if let Some(reason) = recorder_owned(&input) {
+        return Err(ApiResponseError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: reason,
+        });
+    }
     let event = state
         .writer
         .lock()
         .map_err(|_| ApiResponseError::internal("trace writer lock was poisoned"))?
         .append_input(input)?;
     Ok(Json(event))
+}
+
+/// Why a collector client may not assert `input`, if it claims evidence only
+/// the recorder can observe. The recorded process holds the collector token,
+/// so without this it could forge its own exit status, terminal output, or
+/// adapter-normalized provider events.
+fn recorder_owned(input: &EventInput) -> Option<String> {
+    let kind = input.kind.trim().to_ascii_lowercase();
+    if kind == "session.start" || kind == "session.interrupted" || kind.starts_with("process.") {
+        return Some(format!(
+            "event kind `{kind}` is recorded by Premier itself and cannot be emitted through the collector"
+        ));
+    }
+    let source = input.source.trim().to_ascii_lowercase();
+    if matches!(
+        source.as_str(),
+        "premier" | "command" | "process" | "recorder" | "premier-recovery"
+    ) || source.starts_with("adapter.")
+    {
+        return Some(format!(
+            "event source `{source}` is reserved for the Premier recorder"
+        ));
+    }
+    None
+}
+
+struct RequestGuard {
+    /// No credentials configured, which `validate_bind` only permits on loopback.
+    anonymous: bool,
+}
+
+/// Browser-facing origin checks that run before authentication.
+///
+/// An anonymous server trusts whoever can reach loopback, so it must not answer
+/// to a DNS name: a web page whose hostname is re-pointed at 127.0.0.1 would
+/// otherwise be same-origin with the viewer API and could read every trace.
+/// API routes additionally refuse requests a browser marks as cross-origin.
+/// A client that sends neither `Host` nor fetch metadata is not a browser.
+async fn guard_request(
+    State(guard): State<Arc<RequestGuard>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Ok(authority) = request_authority(&request) else {
+        return forbidden("invalid Host header");
+    };
+    if guard.anonymous
+        && let Some(authority) = &authority
+        && !is_loopback_host(authority.host())
+    {
+        return forbidden(
+            "Host is not a loopback address; an unauthenticated Premier viewer only answers on localhost",
+        );
+    }
+    if request.uri().path().starts_with("/api/")
+        && !is_same_origin(request.headers(), authority.as_ref())
+    {
+        return forbidden("cross-origin requests to the Premier API are not allowed");
+    }
+    next.run(request).await
+}
+
+fn request_authority(request: &Request<Body>) -> Result<Option<Authority>, ()> {
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let Some(host) = hosts.next() else {
+        // HTTP/2 carries the authority in the request target instead.
+        return Ok(request.uri().authority().cloned());
+    };
+    if hosts.next().is_some() {
+        return Err(());
+    }
+    host.to_str()
+        .ok()
+        .and_then(|host| host.parse::<Authority>().ok())
+        .map(Some)
+        .ok_or(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn is_same_origin(headers: &HeaderMap, authority: Option<&Authority>) -> bool {
+    // Fetch metadata is set by the browser and cannot be forged by page script.
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return matches!(site.as_bytes(), b"same-origin" | b"none");
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let origin = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| origin.parse::<Uri>().ok());
+    let (Some(origin), Some(authority)) = (origin, authority) else {
+        return false;
+    };
+    let default_port = if origin.scheme_str() == Some("https") {
+        443
+    } else {
+        80
+    };
+    origin
+        .host()
+        .is_some_and(|host| host.eq_ignore_ascii_case(authority.host()))
+        && origin.port_u16().unwrap_or(default_port) == authority.port_u16().unwrap_or(default_port)
+}
+
+fn forbidden(message: &str) -> Response {
+    ApiResponseError {
+        status: StatusCode::FORBIDDEN,
+        message: message.into(),
+    }
+    .into_response()
 }
 
 async fn authorize(
@@ -689,6 +849,12 @@ impl AssistantRegistry {
         }
     }
 
+    fn none() -> Self {
+        Self {
+            providers: Arc::new(HashMap::new()),
+        }
+    }
+
     #[cfg(test)]
     fn with_provider(id: &'static str, executable: PathBuf) -> Self {
         let provider = AssistantProvider {
@@ -736,6 +902,7 @@ fn probe_assistant_capabilities(
             "--ignore-user-config",
             "--ignore-rules",
             "--skip-git-repo-check",
+            "--config",
         ],
         "grok" => &[
             "--single",
@@ -751,6 +918,8 @@ fn probe_assistant_capabilities(
             "--approval-mode",
             "--sandbox",
             "--output-format",
+            "--extensions",
+            "--allowed-mcp-server-names",
         ],
         _ => return Err("unsupported assistant provider".into()),
     };
@@ -821,6 +990,11 @@ async fn ask_assistant(
     AxumPath(trace_id): AxumPath<String>,
     Json(request): Json<AssistantRequest>,
 ) -> Result<Json<AssistantResponse>, ApiResponseError> {
+    if !state.assistant_enabled {
+        return Err(ApiResponseError::not_found(
+            "the local assistant is disabled on this server",
+        ));
+    }
     require_scope(&principal, "assistant:use")?;
     validate_assistant_request(&request)?;
     let provider = state
@@ -840,24 +1014,70 @@ async fn ask_assistant(
         ));
     }
 
+    // Held until the response is produced. A disconnecting client drops this
+    // future, which releases the slot and kills the child (`kill_on_drop`).
+    let _slot = state
+        .assistant_slot
+        .try_acquire()
+        .map_err(|_| ApiResponseError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "another assistant request is already running".into(),
+        })?;
     let prompt_state = state.clone();
     let prompt_principal = principal.clone();
-    let (trace_path, prompt) = spawn_blocking_api(move || {
-        let trace_path = resolve_trace(&prompt_state.trace_dir, &trace_id, &prompt_principal)?;
+    let prompt = spawn_blocking_api(move || {
+        let trace_path = resolve_trace(&prompt_state, &trace_id, &prompt_principal)?;
         let manifest = read_manifest(&trace_path)?;
         let events = read_events(&trace_path)?;
-        let prompt = build_assistant_prompt(&manifest, &events, &request)?;
-        Ok((trace_path, prompt))
+        build_assistant_prompt(&manifest, &events, &request)
     })
     .await?;
     let started = Instant::now();
-    let answer = run_assistant(provider.id, executable, &trace_path, &prompt).await?;
+    let scratch = AssistantScratchDir::create()?;
+    let answer = run_assistant(provider.id, executable, &scratch.path, &prompt).await?;
     Ok(Json(AssistantResponse {
         provider: provider.id.to_owned(),
         answer,
         elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
     }))
 }
+
+/// Empty private directory used as the assistant CLI's working directory, so
+/// its file tools and project discovery find nothing: neither the trace store
+/// nor the directory `premier` was started from.
+struct AssistantScratchDir {
+    path: PathBuf,
+}
+
+impl AssistantScratchDir {
+    fn create() -> Result<Self, ApiResponseError> {
+        let path = std::env::temp_dir().join(format!("premier-assistant-{}", uuid::Uuid::now_v7()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for AssistantScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Server and recorder secrets an assistant CLI has no use for.
+const ASSISTANT_SCRUBBED_ENV: [&str; 6] = [
+    "PREMIER_PASSWORD",
+    "PREMIER_AUTH_CONFIG",
+    "PREMIER_TLS_KEY",
+    premier_trace::KEY_FILE_ENV,
+    "PREMIER_COLLECTOR_URL",
+    "PREMIER_COLLECTOR_TOKEN",
+];
 
 fn validate_assistant_request(request: &AssistantRequest) -> Result<(), ApiResponseError> {
     if request.prompt.trim().is_empty() {
@@ -1024,6 +1244,14 @@ fn assistant_args(provider: &str, prompt: &str) -> Option<Vec<String>> {
             "--skip-git-repo-check",
             "--color",
             "never",
+            // `--sandbox read-only` still lets the model read any file through
+            // its shell; answering a trace question needs no tools at all.
+            "--config",
+            "features.shell_tool=false",
+            "--config",
+            "features.unified_exec=false",
+            "--config",
+            "web_search=\"disabled\"",
         ],
         "grok" => vec![
             "--single",
@@ -1045,6 +1273,12 @@ fn assistant_args(provider: &str, prompt: &str) -> Option<Vec<String>> {
             "--sandbox",
             "--output-format",
             "text",
+            // Plan mode is read-only but keeps built-in file and web tools; at
+            // least drop every user extension and MCP server.
+            "--extensions",
+            "none",
+            "--allowed-mcp-server-names",
+            "premier-none",
         ],
         _ => return None,
     };
@@ -1065,7 +1299,11 @@ async fn run_assistant(
 ) -> Result<String, ApiResponseError> {
     let args = assistant_args(provider, prompt)
         .ok_or_else(|| ApiResponseError::bad_request("unsupported assistant provider"))?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    for name in ASSISTANT_SCRUBBED_ENV {
+        command.env_remove(name);
+    }
+    let mut child = command
         .args(args)
         .current_dir(working_directory)
         .stdin(std::process::Stdio::null())
@@ -1170,7 +1408,7 @@ fn list_traces_blocking(
     };
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        if !state.serves(&entry) || !entry.file_type()?.is_dir() {
             continue;
         }
         let path = entry.path();
@@ -1340,7 +1578,7 @@ async fn get_trace(
 ) -> Result<Json<TraceDetail>, ApiResponseError> {
     require_scope(&principal, "trace:read")?;
     let detail = spawn_blocking_api(move || {
-        let path = resolve_trace(&state.trace_dir, &trace_id, &principal)?;
+        let path = resolve_trace(&state, &trace_id, &principal)?;
         let snapshot = trace_snapshot(&state, &path)?;
         Ok(trace_detail(&path, snapshot))
     })
@@ -1369,7 +1607,7 @@ async fn get_events(
 ) -> Result<Json<Vec<TraceEvent>>, ApiResponseError> {
     require_scope(&principal, "trace:read")?;
     let events = spawn_blocking_api(move || {
-        let path = resolve_trace(&state.trace_dir, &trace_id, &principal)?;
+        let path = resolve_trace(&state, &trace_id, &principal)?;
         match (query.after_sequence, query.limit) {
             (None, None) => Ok(read_events(path)?),
             (after, limit) => {
@@ -1399,7 +1637,7 @@ async fn stream_events(
     AxumPath(trace_id): AxumPath<String>,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiResponseError> {
     require_scope(&principal, "trace:read")?;
-    let trace_path = resolve_trace(&state.trace_dir, &trace_id, &principal)?;
+    let trace_path = resolve_trace(&state, &trace_id, &principal)?;
     let stream = async_stream::stream! {
         let mut byte_offset = 0_u64;
         let mut seen_sequence = 0_u64;
@@ -1455,17 +1693,28 @@ async fn stream_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
 }
 
+impl AppState {
+    /// Whether a trace-directory entry is part of the served set.
+    fn serves(&self, entry: &fs::DirEntry) -> bool {
+        self.only_artifact
+            .as_ref()
+            .is_none_or(|only| entry.file_name() == *only)
+    }
+}
+
 fn resolve_trace(
-    root: &Path,
+    state: &AppState,
     trace_id: &str,
     principal: &Principal,
 ) -> Result<PathBuf, ApiResponseError> {
     if trace_id.contains('/') || trace_id.contains('\\') || trace_id == "." || trace_id == ".." {
         return Err(ApiResponseError::bad_request("invalid trace id"));
     }
+    let root = &state.trace_dir;
     for entry in fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))? {
         let entry = entry?;
-        if entry.file_type()?.is_dir()
+        if state.serves(&entry)
+            && entry.file_type()?.is_dir()
             && let Ok(manifest) = read_manifest(entry.path())
             && manifest.trace_id == trace_id
             && manifest.tenant_id == principal.tenant_id
@@ -1631,6 +1880,148 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("premier"));
+    }
+
+    async fn status_with_headers(app: &Router, uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+        let mut request = Request::builder().uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn anonymous_loopback_server_rejects_dns_rebinding_hosts() {
+        let app = test_app(AuthPolicy::default());
+        for host in [
+            "attacker.example:4317",
+            "attacker.example",
+            "127.0.0.1.attacker.example:4317",
+            "localhost.attacker.example",
+            "192.168.1.10:4317",
+        ] {
+            for uri in ["/api/traces", "/api/health", "/"] {
+                assert_eq!(
+                    status_with_headers(&app, uri, &[("host", host)]).await,
+                    StatusCode::FORBIDDEN,
+                    "{host} must not reach {uri}"
+                );
+            }
+        }
+        for host in [
+            "127.0.0.1:4317",
+            "localhost:4317",
+            "LOCALHOST:4317",
+            "[::1]:4317",
+        ] {
+            assert_eq!(
+                status_with_headers(&app, "/api/traces", &[("host", host)]).await,
+                StatusCode::OK,
+                "{host} is a loopback name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_rejects_cross_origin_browser_requests() {
+        let app = test_app(AuthPolicy::default());
+        let host = ("host", "127.0.0.1:4317");
+        for extra in [
+            ("origin", "http://attacker.example"),
+            ("origin", "http://127.0.0.1:9999"),
+            ("origin", "null"),
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-site", "same-site"),
+        ] {
+            assert_eq!(
+                status_with_headers(&app, "/api/traces", &[host, extra]).await,
+                StatusCode::FORBIDDEN,
+                "{extra:?} must be rejected"
+            );
+        }
+        for extra in [
+            ("origin", "http://127.0.0.1:4317"),
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-site", "none"),
+        ] {
+            assert_eq!(
+                status_with_headers(&app, "/api/traces", &[host, extra]).await,
+                StatusCode::OK,
+                "{extra:?} is same-origin"
+            );
+        }
+        // Static viewer assets carry no trace data and stay loadable.
+        assert_eq!(
+            status_with_headers(&app, "/", &[host, ("sec-fetch-site", "cross-site")]).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn collector_rejects_recorder_owned_kinds_and_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("forged.atrace");
+        let writer = Arc::new(Mutex::new(
+            TraceWriter::create(&root, vec!["agent".into()]).unwrap(),
+        ));
+        let app = instrumentation_app(writer.clone(), "collector-secret".into());
+        let post = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/events")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, "Bearer collector-secret")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        for forged in [
+            serde_json::json!({"kind": "process.exit", "source": "sdk", "status": "ok", "payload": {"exit_code": 0}}),
+            serde_json::json!({"kind": "process.stdout", "payload": {"text": "all tests passed"}}),
+            serde_json::json!({"kind": "Process.Exit"}),
+            serde_json::json!({"kind": " session.start", "payload": {"cwd": "/elsewhere"}}),
+            serde_json::json!({"kind": "session.interrupted"}),
+            serde_json::json!({"kind": "tool.execution", "source": "command"}),
+            serde_json::json!({"kind": "tool.execution", "source": "premier"}),
+            serde_json::json!({"kind": "tool.execution", "source": "process"}),
+            serde_json::json!({"kind": "tool.execution", "source": "premier-recovery"}),
+            serde_json::json!({"kind": "approval.decision", "source": "adapter.claude.v1"}),
+            serde_json::json!({"kind": "approval.decision", "source": "Adapter.Codex.v1"}),
+        ] {
+            assert_eq!(
+                post(forged.clone()).await,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{forged}"
+            );
+        }
+        for honest in [
+            serde_json::json!({"kind": "agent.spawn", "actor_id": "researcher"}),
+            serde_json::json!({"kind": "tool.execution", "source": "premier-sdk"}),
+            serde_json::json!({"kind": "tool.execution", "source": "premier-emit"}),
+        ] {
+            assert_eq!(post(honest.clone()).await, StatusCode::OK, "{honest}");
+        }
+        drop(app);
+        let Ok(writer) = Arc::try_unwrap(writer) else {
+            panic!("collector still owns the trace writer");
+        };
+        writer.into_inner().unwrap().finish(0).unwrap();
+        let events = read_events(&root).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| {
+            !event.kind.starts_with("process.") && !event.kind.starts_with("session.")
+        }));
     }
 
     #[test]
@@ -2247,6 +2638,17 @@ mod tests {
         );
         assert!(codex.contains(&"--ephemeral".into()));
         assert!(codex.contains(&"--skip-git-repo-check".into()));
+        for disabled in [
+            "features.shell_tool=false",
+            "features.unified_exec=false",
+            "web_search=\"disabled\"",
+        ] {
+            assert!(
+                codex.windows(2).any(|args| args == ["--config", disabled]),
+                "codex must run without {disabled}"
+            );
+        }
+        assert_eq!(codex.last().unwrap(), "question");
 
         let grok = assistant_args("grok", "question").unwrap();
         assert!(grok.windows(2).any(|args| args == ["--tools", ""]));
@@ -2258,6 +2660,13 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--approval-mode", "plan"])
         );
+        assert_eq!(gemini[..2], ["--prompt", "question"]);
+        assert!(
+            gemini
+                .windows(2)
+                .any(|args| args == ["--extensions", "none"])
+        );
+        assert!(gemini.contains(&"--allowed-mcp-server-names".into()));
         assert!(assistant_args("opencode", "question").is_none());
     }
 
@@ -2417,6 +2826,7 @@ mod tests {
             trace_dir,
             Some(viewer),
             AuthPolicy::default(),
+            ServerOptions::default(),
             AssistantRegistry::with_provider("claude", executable),
         );
         let body = serde_json::json!({
@@ -2445,6 +2855,312 @@ mod tests {
         assert_eq!(answer["provider"], "claude");
         assert_eq!(answer["answer"], "assistant answer");
         assert!(answer["elapsed_ms"].is_number());
+    }
+
+    /// A viewer over one finalized trace whose only assistant is a shell script.
+    #[cfg(unix)]
+    fn assistant_fixture(
+        temp: &Path,
+        script: &str,
+        options: ServerOptions,
+    ) -> (Router, String, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let trace_dir = temp.join("traces");
+        let mut writer =
+            TraceWriter::create(trace_dir.join("assistant.atrace"), vec!["agent".into()]).unwrap();
+        writer
+            .append("tool.error", "test", serde_json::json!({"detail": "boom"}))
+            .unwrap();
+        let trace_id = writer.trace_id().to_owned();
+        writer.finish(1).unwrap();
+        let executable = temp.join("fake-claude");
+        fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let viewer = temp.join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        let app = app_with_registry(
+            trace_dir.clone(),
+            Some(viewer),
+            AuthPolicy::default(),
+            options,
+            AssistantRegistry::with_provider("claude", executable),
+        );
+        (app, trace_id, trace_dir)
+    }
+
+    fn assistant_post(trace_id: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/traces/{trace_id}/assistant"))
+            .header("host", "127.0.0.1:4317");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request
+            .body(Body::from(r#"{"provider":"claude","prompt":"help"}"#))
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assistant_runs_in_an_empty_scratch_directory_not_the_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, trace_id, trace_dir) = assistant_fixture(
+            temp.path(),
+            r#"printf '%s\n%s\n' "$(pwd -P)" "$(ls -A | wc -l)""#,
+            ServerOptions::default(),
+        );
+        let response = app
+            .oneshot(assistant_post(
+                &trace_id,
+                &[("content-type", "application/json")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let (cwd, entries) = answer["answer"].as_str().unwrap().split_once('\n').unwrap();
+        let cwd = Path::new(cwd);
+        assert!(
+            !cwd.starts_with(fs::canonicalize(&trace_dir).unwrap()),
+            "assistant ran inside the trace store: {}",
+            cwd.display()
+        );
+        assert!(
+            cwd.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("premier-assistant-")
+        );
+        assert_eq!(entries.trim(), "0");
+        assert!(!cwd.exists(), "scratch directory must be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assistant_refuses_cross_origin_and_non_json_requests_without_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("spawned");
+        let (app, trace_id, _) = assistant_fixture(
+            temp.path(),
+            &format!("touch '{}'\nprintf answer", marker.display()),
+            ServerOptions::default(),
+        );
+        let json = ("content-type", "application/json");
+        for (headers, expected) in [
+            (
+                vec![json, ("origin", "http://attacker.example")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec![json, ("sec-fetch-site", "cross-site")],
+                StatusCode::FORBIDDEN,
+            ),
+            // The only body types a cross-origin form or no-cors fetch can send.
+            (
+                vec![("content-type", "text/plain")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                vec![("content-type", "application/x-www-form-urlencoded")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (vec![], StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(assistant_post(&trace_id, &headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{headers:?}");
+        }
+        assert!(!marker.exists(), "no rejected request may reach the CLI");
+
+        let same_origin = app
+            .oneshot(assistant_post(
+                &trace_id,
+                &[
+                    json,
+                    ("origin", "http://127.0.0.1:4317"),
+                    ("sec-fetch-site", "same-origin"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(same_origin.status(), StatusCode::OK);
+        assert!(marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assistant_allows_one_run_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, trace_id, _) = assistant_fixture(
+            temp.path(),
+            "sleep 1\nprintf answer",
+            ServerOptions::default(),
+        );
+        let json = [("content-type", "application/json")];
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(assistant_post(&trace_id, &json)),
+            app.clone().oneshot(assistant_post(&trace_id, &json)),
+        );
+        let mut statuses = [first.unwrap().status(), second.unwrap().status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+
+        let afterwards = app.oneshot(assistant_post(&trace_id, &json)).await.unwrap();
+        assert_eq!(afterwards.status(), StatusCode::OK, "the slot is released");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disabled_assistant_lists_no_providers_and_refuses_to_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("spawned");
+        let (app, trace_id, trace_dir) = assistant_fixture(
+            temp.path(),
+            &format!("touch '{}'\nprintf answer", marker.display()),
+            ServerOptions {
+                disable_assistant: true,
+                ..ServerOptions::default()
+            },
+        );
+        let response = app
+            .oneshot(assistant_post(
+                &trace_id,
+                &[("content-type", "application/json")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!marker.exists());
+
+        // The public constructor must not even discover CLIs when disabled.
+        let app = app_with_options(
+            trace_dir,
+            Some(temp.path().join("viewer")),
+            AuthPolicy::default(),
+            ServerOptions {
+                disable_assistant: true,
+                ..ServerOptions::default()
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/assistants")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"[]");
+    }
+
+    #[tokio::test]
+    async fn only_artifact_hides_sibling_traces_from_list_and_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_dir = temp.path().join("traces");
+        let finish = |name: &str| {
+            TraceWriter::create(trace_dir.join(name), vec!["agent".into()])
+                .unwrap()
+                .finish(0)
+                .unwrap()
+                .trace_id
+        };
+        let opened = finish("opened.atrace");
+        let sibling = finish("sibling.atrace");
+        let viewer = temp.path().join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        let app = app_with_registry(
+            trace_dir,
+            Some(viewer),
+            AuthPolicy::default(),
+            ServerOptions {
+                only_artifact: Some("opened.atrace".into()),
+                ..ServerOptions::default()
+            },
+            AssistantRegistry::none(),
+        );
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/traces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(list.into_body(), 64 * 1024).await.unwrap();
+        let traces: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(traces.as_array().unwrap().len(), 1);
+        assert_eq!(traces[0]["trace_id"], opened);
+        for (trace_id, expected) in [(&opened, StatusCode::OK), (&sibling, StatusCode::NOT_FOUND)] {
+            for suffix in ["", "/events"] {
+                let uri = format!("/api/traces/{trace_id}{suffix}");
+                assert_eq!(
+                    status_with_headers(&app, &uri, &[]).await,
+                    expected,
+                    "{uri}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_server_keeps_answering_on_its_public_hostname() {
+        let app = test_app(AuthPolicy {
+            password: Some("secret".into()),
+            bearer_tokens: Vec::new(),
+        });
+        let encoded = base64::engine::general_purpose::STANDARD.encode("premier:secret");
+        let authorization = ("authorization", format!("Basic {encoded}"));
+        let host = ("host", "premier.example.com".to_owned());
+        let status = |extra: Vec<(&'static str, String)>| {
+            let app = app.clone();
+            let mut request = Request::builder().uri("/api/traces");
+            for (name, value) in extra {
+                request = request.header(name, value);
+            }
+            async move {
+                app.oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(
+            status(vec![host.clone(), authorization.clone()]).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(vec![
+                host.clone(),
+                authorization.clone(),
+                ("origin", "https://premier.example.com".into()),
+            ])
+            .await,
+            StatusCode::OK
+        );
+        // Credentials do not make a cross-site browser request acceptable.
+        assert_eq!(
+            status(vec![
+                host.clone(),
+                authorization,
+                ("origin", "https://attacker.example".into()),
+            ])
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(status(vec![host]).await, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actorInventory, eventSummary, filterEvents, isIssue, runHealth, summarizeAgents, timelineLayout } from './analysis';
+import { actorInventory, eventSummary, filterEvents, isIssue, runHealth, summarizeAgents, timelineLayout, traceTimeBounds } from './analysis';
 import type { TraceEvent, TraceManifest } from './types';
 
 function event(sequence: number, actor: string, kind: string, status = 'ok'): TraceEvent {
@@ -124,5 +124,30 @@ describe('agent trace analysis', () => {
     const layout = timelineLayout([parent, child]);
     expect(layout.lanes).toEqual(['coordinator', 'researcher']);
     expect(layout.events[1]).toMatchObject({ lane: 1, parentLane: 0, depth: 1, elapsedMs: 0 });
+  });
+});
+
+function largeJournal(count: number): TraceEvent[] {
+  const origin = Date.parse('2026-07-13T12:00:00.000Z');
+  return Array.from({ length: count }, (_, index) => ({
+    event_id: `big-${index}`, trace_id: 'big', sequence: index + 1,
+    timestamp: new Date(origin + index * 10).toISOString(), kind: 'process.stdout', source: 'recorder', payload_json: '{"text":"x"}',
+    actor_id: index % 2 ? 'worker' : 'root', actor_type: 'process', parent_event_id: '', span_id: '', parent_span_id: '',
+    correlation_id: '', status: 'ok', duration_ms: index === count - 1 ? 500 : 0, links: []
+  }));
+}
+
+describe('traceTimeBounds', () => {
+  it('measures journals larger than the argument-spread limit', () => {
+    // Math.min(...values) throws a RangeError above roughly 125k arguments.
+    const bounds = traceTimeBounds(largeJournal(140_000));
+    expect(bounds).toEqual({ start: Date.parse('2026-07-13T12:00:00.000Z'), span: 139_999 * 10 + 500 });
+  }, 60_000);
+
+  it('ignores unparseable timestamps and reports null when none are usable', () => {
+    const [first, second] = largeJournal(2);
+    expect(traceTimeBounds([])).toBeNull();
+    expect(traceTimeBounds([{ ...first, timestamp: 'not a time' }])).toBeNull();
+    expect(traceTimeBounds([{ ...first, timestamp: 'not a time' }, { ...second, duration_ms: 0 }])).toEqual({ start: Date.parse(second.timestamp), span: 1 });
   });
 });

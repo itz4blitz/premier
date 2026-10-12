@@ -5,8 +5,8 @@ use premier_cli::evidence::{
     DiffStatus, QueryOptions, diff_events, portable_evidence, query_events,
 };
 use premier_cli::{
-    AuthPolicy, app, embedded_viewer_ready, instrumentation_app, validate_bind,
-    validate_remote_trace_store,
+    AuthPolicy, ServerOptions, app_with_options, embedded_viewer_ready, instrumentation_app,
+    validate_bind, validate_remote_trace_store,
 };
 use premier_trace::{
     EventInput, ProcessTermination, RECORDER_LEASE, RecoveryOptions, RedactionConfig,
@@ -21,10 +21,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 use tracing_subscriber::EnvFilter;
 
 mod adapters;
@@ -72,10 +72,12 @@ enum Commands {
         /// Additional structured payload field name to redact recursively.
         #[arg(long = "redact-field")]
         redact_fields: Vec<String>,
-        /// Exact text to redact from persisted terminal output (terminal display stays raw).
+        /// Exact text to redact from persisted terminal output, event payloads, and the
+        /// recorded command line (terminal display stays raw).
         #[arg(long = "redact-literal")]
         redact_literals: Vec<String>,
-        /// Regex to redact from persisted terminal output (terminal display stays raw).
+        /// Regex to redact from persisted terminal output, event payloads, and the
+        /// recorded command line (terminal display stays raw). Matched per line.
         #[arg(long = "redact-regex")]
         redact_regexes: Vec<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -157,6 +159,9 @@ enum Commands {
         /// Emit one structured JSON result instead of the compact text view.
         #[arg(long)]
         json: bool,
+        /// Read a finalized trace even though it fails `premier verify`.
+        #[arg(long)]
+        allow_unverified: bool,
     },
     /// Export portable JSON evidence with common secret fields recursively redacted.
     Export {
@@ -164,6 +169,9 @@ enum Commands {
         /// Destination JSON file. Omit to write JSON to stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Export a finalized trace even though it fails `premier verify`.
+        #[arg(long)]
+        allow_unverified: bool,
     },
     /// Compare two traces by semantic event structure, ignoring generated identity noise.
     Diff {
@@ -198,6 +206,9 @@ enum Commands {
         viewer_dir: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:4317")]
         bind: SocketAddr,
+        /// Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1).
+        #[arg(long)]
+        no_assistant: bool,
     },
     /// Serve the viewer locally or to an authenticated team.
     Serve {
@@ -219,6 +230,9 @@ enum Commands {
         /// PEM private key for native HTTPS. Must be paired with --tls-cert.
         #[arg(long, env = "PREMIER_TLS_KEY")]
         tls_key: Option<PathBuf>,
+        /// Do not expose the local assistant (also: PREMIER_DISABLE_ASSISTANT=1).
+        #[arg(long)]
+        no_assistant: bool,
     },
 }
 
@@ -285,6 +299,11 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Verify { trace } => {
+            if let Ok(manifest) = read_manifest(&trace)
+                && let Some(state) = unfinalized_state(&trace, &manifest)
+            {
+                bail!("trace is not finalized ({})", state.describe(&trace))
+            }
             let mut manifest = verify(&trace)?;
             if manifest.diagnostics.is_empty() {
                 manifest.diagnostics =
@@ -293,7 +312,10 @@ async fn main() -> Result<()> {
             println!(
                 "verified {} ({} events, {} semantic diagnostics)",
                 manifest.trace_id,
-                manifest.journal.as_ref().unwrap().event_count,
+                manifest
+                    .journal
+                    .as_ref()
+                    .map_or(0, |journal| journal.event_count),
                 manifest.diagnostics.len(),
             );
             for diagnostic in &manifest.diagnostics {
@@ -354,18 +376,29 @@ async fn main() -> Result<()> {
             search,
             limit,
             json,
-        } => query_trace(
+            allow_unverified,
+        } => {
+            ensure_verified(&trace, allow_unverified)?;
+            query_trace(
+                trace,
+                QueryOptions {
+                    kind,
+                    actor,
+                    status,
+                    search,
+                    limit,
+                },
+                json,
+            )
+        }
+        Commands::Export {
             trace,
-            QueryOptions {
-                kind,
-                actor,
-                status,
-                search,
-                limit,
-            },
-            json,
-        ),
-        Commands::Export { trace, output } => export_trace(trace, output),
+            output,
+            allow_unverified,
+        } => {
+            ensure_verified(&trace, allow_unverified)?;
+            export_trace(trace, output)
+        }
         Commands::Diff {
             baseline,
             current,
@@ -382,9 +415,20 @@ async fn main() -> Result<()> {
             trace_dir,
             viewer_dir,
             bind,
+            no_assistant,
         } => {
+            let mut options = server_options(no_assistant);
             let (trace_dir, focus) = if let Some(trace) = trace {
                 let manifest = read_manifest(&trace)?;
+                // Canonical so `.` and `dir/..` still name one directory entry:
+                // opening a trace must not publish its siblings.
+                let trace = fs::canonicalize(&trace)?;
+                options.only_artifact = Some(
+                    trace
+                        .file_name()
+                        .context("trace path has no directory name")?
+                        .to_owned(),
+                );
                 (trace_parent_dir(&trace), Some(manifest.trace_id))
             } else {
                 (trace_dir, None)
@@ -394,6 +438,7 @@ async fn main() -> Result<()> {
                 viewer_dir,
                 bind,
                 AuthPolicy::default(),
+                options,
                 focus,
                 true,
                 None,
@@ -408,11 +453,53 @@ async fn main() -> Result<()> {
             auth_config,
             tls_cert,
             tls_key,
+            no_assistant,
         } => {
             let auth = AuthPolicy::from_sources(password, auth_config.as_deref())?;
             let tls = TlsFiles::from_options(tls_cert, tls_key)?;
-            serve_viewer(trace_dir, viewer_dir, bind, auth, None, false, tls).await
+            let options = server_options(no_assistant);
+            serve_viewer(trace_dir, viewer_dir, bind, auth, options, None, false, tls).await
         }
+    }
+}
+
+/// Viewer options shared by every command that serves; the environment switch
+/// also covers `record --open`.
+fn server_options(no_assistant: bool) -> ServerOptions {
+    let disabled_by_env = std::env::var("PREMIER_DISABLE_ASSISTANT")
+        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false" | "no" | "off"));
+    ServerOptions {
+        disable_assistant: no_assistant || disabled_by_env,
+        ..ServerOptions::default()
+    }
+}
+
+/// Gate evidence-reading commands on the same checks as `premier verify`.
+/// A live trace has no digest yet, so it is readable with a note; a finalized
+/// trace that fails verification is refused unless explicitly allowed.
+fn ensure_verified(trace: &std::path::Path, allow_unverified: bool) -> Result<()> {
+    let manifest =
+        read_manifest(trace).with_context(|| format!("cannot read trace {}", trace.display()))?;
+    if manifest.journal.is_none() {
+        eprintln!(
+            "note: {} is not finalized (still recording or interrupted); its events are unverified and may be incomplete",
+            trace.display()
+        );
+        return Ok(());
+    }
+    match verify(trace) {
+        Ok(_) => Ok(()),
+        Err(error) if allow_unverified => {
+            eprintln!(
+                "warning: {} failed verification ({error:#}); reading it anyway because --allow-unverified was given",
+                trace.display()
+            );
+            Ok(())
+        }
+        Err(error) => bail!(
+            "trace {} failed verification: {error:#}. Its evidence may have been altered or truncated; pass --allow-unverified to read it anyway",
+            trace.display()
+        ),
     }
 }
 
@@ -587,11 +674,13 @@ fn resolve_viewer_dir(viewer_dir: Option<PathBuf>) -> Result<Option<PathBuf>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_viewer(
     trace_dir: PathBuf,
     viewer_dir: Option<PathBuf>,
     bind: SocketAddr,
     auth: AuthPolicy,
+    options: ServerOptions,
     focus_trace: Option<String>,
     launch_browser: bool,
     tls: Option<TlsFiles>,
@@ -611,7 +700,7 @@ async fn serve_viewer(
     if launch_browser && let Err(error) = open_browser(&url) {
         tracing::warn!("could not open browser: {error}");
     }
-    let router = app(trace_dir, viewer, auth);
+    let router = app_with_options(trace_dir, viewer, auth, options);
     if let Some(tls) = tls {
         let config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(tls.cert, tls.key).await?;
@@ -704,7 +793,21 @@ async fn emit_event(args: EmitArgs) -> Result<()> {
         event
     };
 
-    let client = reqwest::Client::new();
+    // Seconds to wait for the collector (PREMIER_EMIT_TIMEOUT, default 10), so
+    // a stalled collector cannot hang the agent that shells out to `emit`.
+    let timeout = std::env::var("PREMIER_EMIT_TIMEOUT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|seconds| *seconds > 0.0)
+        .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+        .unwrap_or(std::time::Duration::from_secs(10));
+    // The collector is a loopback endpoint authenticated by a bearer token:
+    // never route the token or payload through HTTP(S)_PROXY / ALL_PROXY.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .context("failed to build the collector HTTP client")?;
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1164,7 +1267,8 @@ async fn record(options: RecordOptions) -> Result<()> {
     };
     recorder_lease.stop()?;
     let termination = capture.termination;
-    let recorder_signal = capture.recorder_signal;
+    let recorder_signals = capture.recorder_signals;
+    let mut faults = capture.faults;
     let code = termination.shell_exit_code();
     let command_success = code == 0;
     let mut exit_payload = json!({
@@ -1182,31 +1286,67 @@ async fn record(options: RecordOptions) -> Result<()> {
     if let Some(signal_name) = termination.signal_name.as_deref() {
         exit_payload["signal_name"] = json!(signal_name);
     }
-    if recorder_signal.is_some() {
+    // The termination above is always the child's own wait status. A stop
+    // request received by the recorder is separate evidence: the child may
+    // have handled it and exited normally.
+    if let Some(signal) = recorder_signals.received {
         exit_payload["forwarded_by_recorder"] = json!(true);
+        exit_payload["recorder_signal"] = json!(signal);
+        if let Some(name) = signal_name(signal) {
+            exit_payload["recorder_signal_name"] = json!(name);
+        }
+    }
+    if recorder_signals.killed_child {
+        exit_payload["killed_by_recorder"] = json!(true);
     }
     if capture.core_dumped {
         exit_payload["core_dumped"] = json!(true);
     }
-    writer.lock().unwrap().append_input(EventInput {
-        kind: "process.exit".into(),
-        source: "command".into(),
-        actor_id: "root".into(),
-        actor_type: "process".into(),
-        span_id: "command".into(),
-        parent_span_id: "session".into(),
-        status: if command_success { "ok" } else { "error" }.into(),
-        payload: exit_payload,
-        ..EventInput::default()
-    })?;
-    let _ = shutdown_sender.send(());
-    collector_task.await??;
-    let writer = Arc::try_unwrap(writer)
-        .map_err(|_| anyhow::anyhow!("collector still owns the trace writer"))?
-        .into_inner()
-        .map_err(|_| anyhow::anyhow!("trace writer lock was poisoned"))?;
-    let manifest = writer.finish_termination(termination.clone())?;
-    eprintln!("\ntrace {} → {}", manifest.trace_id, output.display());
+    if capture.output_open_at_exit {
+        exit_payload["output_open_at_exit"] = json!(true);
+    }
+    faults.note(
+        writer
+            .lock()
+            .unwrap()
+            .append_input(EventInput {
+                kind: "process.exit".into(),
+                source: "command".into(),
+                actor_id: "root".into(),
+                actor_type: "process".into(),
+                span_id: "command".into(),
+                parent_span_id: "session".into(),
+                status: if command_success { "ok" } else { "error" }.into(),
+                payload: exit_payload,
+                ..EventInput::default()
+            })
+            .map(drop),
+    );
+    // From here on a recorder failure must not replace the command's own
+    // exit status, so finalization errors are reported instead of returned.
+    let finalized: Result<premier_trace::TraceManifest> = async {
+        let _ = shutdown_sender.send(());
+        collector_task.await??;
+        let writer = Arc::try_unwrap(writer)
+            .map_err(|_| anyhow::anyhow!("collector still owns the trace writer"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("trace writer lock was poisoned"))?;
+        writer.finish_termination(termination.clone())
+    }
+    .await;
+    match &finalized {
+        Ok(manifest) => eprintln!("\ntrace {} → {}", manifest.trace_id, output.display()),
+        Err(error) => eprintln!(
+            "\npremier: recording failed: the trace could not be finalized: {error:#}\npremier: salvage what was captured with `premier recover --force {}`",
+            output.display()
+        ),
+    }
+    if let Some(first) = faults.first.as_deref() {
+        eprintln!(
+            "premier: recording failed: {} event(s) are missing from the trace (first error: {first})",
+            faults.dropped
+        );
+    }
     if !command_success {
         match (
             &termination.kind,
@@ -1222,18 +1362,21 @@ async fn record(options: RecordOptions) -> Result<()> {
             _ => eprintln!("recorded command exited with status {code}"),
         }
     }
-    eprintln!("next: premier open {}", output.display());
-    if open_viewer && recorder_signal.is_none() {
-        return serve_viewer(
-            trace_parent_dir(&output),
-            viewer_dir,
-            bind,
-            AuthPolicy::default(),
-            Some(manifest.trace_id),
-            true,
-            None,
-        )
-        .await;
+    if let Ok(manifest) = finalized {
+        eprintln!("next: premier open {}", output.display());
+        if open_viewer && recorder_signals.received.is_none() {
+            return serve_viewer(
+                trace_parent_dir(&output),
+                viewer_dir,
+                bind,
+                AuthPolicy::default(),
+                server_options(false),
+                Some(manifest.trace_id),
+                true,
+                None,
+            )
+            .await;
+        }
     }
     if command_success {
         Ok(())
@@ -1252,8 +1395,91 @@ struct CaptureEnvironment<'a> {
 
 struct CaptureOutcome {
     termination: ProcessTermination,
-    recorder_signal: Option<i32>,
+    recorder_signals: RecorderSignals,
     core_dumped: bool,
+    /// A descendant still held the output stream after the child exited.
+    output_open_at_exit: bool,
+    faults: RecordingFaults,
+}
+
+/// Stop requests the recorder itself received while the child was running.
+#[derive(Clone, Copy, Default)]
+struct RecorderSignals {
+    received: Option<i32>,
+    killed_child: bool,
+}
+
+/// Journal failures seen while capturing. Evidence capture must never take
+/// the recorded command down, so they are reported and counted instead of
+/// ending the run.
+#[derive(Default)]
+struct RecordingFaults {
+    first: Option<String>,
+    dropped: u64,
+}
+
+impl RecordingFaults {
+    fn note(&mut self, result: Result<()>) {
+        let Err(error) = result else { return };
+        if self.first.is_none() {
+            // `\r` keeps the notice readable while a PTY capture holds the
+            // terminal in raw mode.
+            eprintln!(
+                "\r\npremier: recording failed: {error:#}\r\npremier: the command keeps running, but its trace is incomplete\r"
+            );
+            self.first = Some(format!("{error:#}"));
+        }
+        self.dropped += 1;
+    }
+}
+
+/// How often the capture loop checks whether the child has exited.
+const CHILD_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
+/// After the child exits, a stream held open by a descendant is considered
+/// drained once it has been quiet this long.
+const OUTPUT_QUIET_AFTER_EXIT: StdDuration = StdDuration::from_millis(250);
+/// Upper bound on draining after exit when a descendant keeps writing.
+const OUTPUT_DRAIN_LIMIT: StdDuration = StdDuration::from_secs(5);
+
+/// Hand captured output to `on_output` until the child has exited and its
+/// streams are drained. Finalization must not wait for end-of-file: a
+/// descendant can hold the pipe or PTY open long after the child is gone.
+/// Returns the status if the exit was observed here, and whether a stream
+/// was still open when draining stopped.
+fn drain_child_output(
+    receiver: mpsc::Receiver<(&'static str, Vec<u8>)>,
+    mut try_wait: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    mut on_output: impl FnMut(&'static str, &[u8]),
+) -> std::io::Result<(Option<std::process::ExitStatus>, bool)> {
+    let mut status = None;
+    let mut exited_at = None;
+    let mut last_output = Instant::now();
+    let mut next_poll = Instant::now();
+    loop {
+        let now = Instant::now();
+        if status.is_none() && now >= next_poll {
+            status = try_wait()?;
+            next_poll = now + CHILD_POLL_INTERVAL;
+            if status.is_some() {
+                exited_at = Some(now);
+                last_output = now;
+            }
+        }
+        if let Some(exited_at) = exited_at
+            && (now.duration_since(last_output) >= OUTPUT_QUIET_AFTER_EXIT
+                || now.duration_since(exited_at) >= OUTPUT_DRAIN_LIMIT)
+        {
+            return Ok((status, true));
+        }
+        match receiver.recv_timeout(CHILD_POLL_INTERVAL) {
+            Ok((stream, bytes)) => {
+                on_output(stream, &bytes);
+                last_output = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok((status, false)),
+        }
+    }
 }
 
 fn capture_pipes(
@@ -1281,57 +1507,82 @@ fn capture_pipes(
     let (sender, receiver) = mpsc::sync_channel::<(&'static str, Vec<u8>)>(256);
     pump(child.stdout.take().unwrap(), sender.clone(), "stdout");
     pump(child.stderr.take().unwrap(), sender, "stderr");
-    let mut stdout_pending = Vec::new();
-    let mut stderr_pending = Vec::new();
+    let mut stdout_pending = PendingOutput::new(writer, "process.stdout");
+    let mut stderr_pending = PendingOutput::new(writer, "process.stderr");
     let mut mirror_stdout = true;
     let mut mirror_stderr = true;
     let mut native_adapter = environment.native_provider.map(NativeAdapter::new);
-    for (stream, bytes) in receiver {
-        // A closed recorder stdout/stderr (for example `premier record -- cmd | head`)
-        // stops mirroring but must never abort evidence capture.
-        if stream == "stdout" {
-            if mirror_stdout {
-                mirror_stdout = std::io::stdout()
-                    .write_all(&bytes)
-                    .and_then(|()| std::io::stdout().flush())
+    let mut faults = RecordingFaults::default();
+    let (status, output_open_at_exit) = drain_child_output(
+        receiver,
+        || {
+            let status = child.try_wait()?;
+            #[cfg(unix)]
+            if status.is_some() {
+                signal_forwarder.child_exited();
+            }
+            Ok(status)
+        },
+        |stream, bytes| {
+            // A closed recorder stdout/stderr (for example `premier record -- cmd | head`)
+            // stops mirroring but must never abort evidence capture.
+            if stream == "stdout" {
+                if mirror_stdout {
+                    mirror_stdout = std::io::stdout()
+                        .write_all(bytes)
+                        .and_then(|()| std::io::stdout().flush())
+                        .is_ok();
+                }
+            } else if mirror_stderr {
+                mirror_stderr = std::io::stderr()
+                    .write_all(bytes)
+                    .and_then(|()| std::io::stderr().flush())
                     .is_ok();
             }
-        } else if mirror_stderr {
-            mirror_stderr = std::io::stderr()
-                .write_all(&bytes)
-                .and_then(|()| std::io::stderr().flush())
-                .is_ok();
-        }
-        let pending = if stream == "stdout" {
-            &mut stdout_pending
-        } else {
-            &mut stderr_pending
-        };
-        append_process_bytes(writer, &format!("process.{stream}"), pending, &bytes)?;
-        if stream == "stdout"
-            && let Some(adapter) = native_adapter.as_mut()
-        {
-            append_adapter_events(writer, adapter.push(&bytes))?;
-        }
-    }
+            let pending = if stream == "stdout" {
+                &mut stdout_pending
+            } else {
+                &mut stderr_pending
+            };
+            // Passthrough above already happened; a journal failure only
+            // costs evidence, never the command's output or exit status.
+            faults.note(append_process_bytes(
+                writer,
+                &format!("process.{stream}"),
+                pending,
+                bytes,
+            ));
+            if stream == "stdout"
+                && let Some(adapter) = native_adapter.as_mut()
+            {
+                faults.note(append_adapter_events(writer, adapter.push(bytes)));
+            }
+        },
+    )?;
     for (stream, pending) in [
         ("stdout", &mut stdout_pending),
         ("stderr", &mut stderr_pending),
     ] {
-        append_pending_utf8(writer, &format!("process.{stream}"), pending)?;
+        faults.note(append_pending_utf8(
+            writer,
+            &format!("process.{stream}"),
+            pending,
+        ));
     }
     if let Some(adapter) = native_adapter.as_mut() {
-        append_adapter_events(writer, adapter.finish())?;
+        faults.note(append_adapter_events(writer, adapter.finish()));
     }
-    let status = child.wait()?;
+    let status = match status {
+        Some(status) => status,
+        None => child.wait()?,
+    };
     #[cfg(unix)]
-    let recorder_signal = signal_forwarder.finish()?;
+    let recorder_signals = {
+        signal_forwarder.child_exited();
+        signal_forwarder.finish()?
+    };
     #[cfg(not(unix))]
-    let recorder_signal: Option<i32> = None;
-    let termination = recorder_signal.map_or_else(
-        || process_termination(&status),
-        |signal| ProcessTermination::signaled(signal, signal_name(signal).map(str::to_owned)),
-    );
+    let recorder_signals = RecorderSignals::default();
     #[cfg(unix)]
     let core_dumped = {
         use std::os::unix::process::ExitStatusExt;
@@ -1340,9 +1591,11 @@ fn capture_pipes(
     #[cfg(not(unix))]
     let core_dumped = false;
     Ok(CaptureOutcome {
-        termination,
-        recorder_signal,
+        termination: process_termination(&status),
+        recorder_signals,
         core_dumped,
+        output_open_at_exit,
+        faults,
     })
 }
 
@@ -1355,16 +1608,19 @@ fn capture_pty(
     writer: &Arc<Mutex<TraceWriter>>,
 ) -> Result<CaptureOutcome> {
     use portable_pty::{CommandBuilder, native_pty_system};
+    use std::os::unix::process::ExitStatusExt;
 
     let pair = native_pty_system()
         .openpty(size)
         .context("failed to allocate pseudo-terminal")?;
     let mut command = CommandBuilder::new(executable);
     command.args(args);
+    // portable-pty starts children in $HOME unless told otherwise.
+    command.cwd(std::env::current_dir()?);
     command.env("PREMIER_TRACE_ID", environment.trace_id);
     command.env("PREMIER_COLLECTOR_URL", environment.collector_url);
     command.env("PREMIER_COLLECTOR_TOKEN", environment.collector_token);
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(command)
         .with_context(|| format!("failed to start {executable} in pseudo-terminal"))?;
@@ -1373,7 +1629,8 @@ fn capture_pty(
         .process_id()
         .context("PTY child process id is unavailable")?;
     let signal_forwarder = UnixSignalForwarder::start_process_group(child_pid)?;
-    let mut reader = pair.master.try_clone_reader()?;
+    let child_pid = i32::try_from(child_pid).context("child process id exceeds i32")?;
+    let reader = pair.master.try_clone_reader()?;
     let mut terminal_writer = pair.master.take_writer()?;
     let _raw_terminal = ParentTerminalMode::raw_if_interactive()?;
     let (release_stdin, wait_for_release) = mpsc::channel::<()>();
@@ -1386,53 +1643,117 @@ fn capture_pty(
         let _ = wait_for_release.recv();
     });
 
-    let mut pending = Vec::new();
-    let mut buffer = vec![0_u8; 8192];
+    // The reader runs on its own thread so a descendant that keeps the
+    // terminal open cannot block finalization after the child has exited.
+    // Unix PTY masters commonly report EIO after the final slave closes;
+    // the pump treats any read error as end of output.
+    let (sender, receiver) = mpsc::sync_channel::<(&'static str, Vec<u8>)>(256);
+    pump(reader, sender, "terminal");
+    let mut pending = PendingOutput::new(writer, "process.terminal");
     let mut mirror = true;
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                let bytes = &buffer[..count];
-                if mirror {
-                    mirror = std::io::stdout()
-                        .write_all(bytes)
-                        .and_then(|()| std::io::stdout().flush())
-                        .is_ok();
-                }
-                append_process_bytes(writer, "process.terminal", &mut pending, bytes)?;
+    let mut faults = RecordingFaults::default();
+    let (status, output_open_at_exit) = drain_child_output(
+        receiver,
+        || {
+            let status = wait_for_pid(child_pid, false)?;
+            if status.is_some() {
+                signal_forwarder.child_exited();
             }
-            // Unix PTY masters commonly report EIO after the final slave closes.
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-            Err(error) => return Err(error).context("failed to read pseudo-terminal output"),
+            Ok(status)
+        },
+        |_, bytes| {
+            if mirror {
+                mirror = std::io::stdout()
+                    .write_all(bytes)
+                    .and_then(|()| std::io::stdout().flush())
+                    .is_ok();
+            }
+            faults.note(append_process_bytes(
+                writer,
+                "process.terminal",
+                &mut pending,
+                bytes,
+            ));
+        },
+    )?;
+    faults.note(append_pending_utf8(
+        writer,
+        "process.terminal",
+        &mut pending,
+    ));
+    let status = match status {
+        Some(status) => status,
+        None => loop {
+            if let Some(status) = wait_for_pid(child_pid, true)? {
+                break status;
+            }
+        },
+    };
+    signal_forwarder.child_exited();
+    let _ = release_stdin.send(());
+    let recorder_signals = signal_forwarder.finish()?;
+    Ok(CaptureOutcome {
+        termination: process_termination(&status),
+        recorder_signals,
+        core_dumped: status.core_dumped(),
+        output_open_at_exit,
+        faults,
+    })
+}
+
+/// Reap the PTY child with `waitpid` directly. portable-pty's own exit status
+/// keeps only a `strsignal` description, which loses the signal number and
+/// the core-dump flag; the raw wait status preserves both exactly.
+#[cfg(unix)]
+fn wait_for_pid(pid: i32, block: bool) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let options = if block { 0 } else { libc::WNOHANG };
+    loop {
+        let mut status = 0;
+        // SAFETY: `pid` is our own unreaped child and `status` is a valid
+        // out-pointer for the duration of the call.
+        match unsafe { libc::waitpid(pid, &mut status, options) } {
+            0 => return Ok(None),
+            -1 => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            _ => return Ok(Some(std::process::ExitStatus::from_raw(status))),
         }
     }
-    append_pending_utf8(writer, "process.terminal", &mut pending)?;
-    let status = child.wait()?;
-    let _ = release_stdin.send(());
-    let recorder_signal = signal_forwarder.finish()?;
-    let termination = recorder_signal.map_or_else(
-        || portable_process_termination(&status),
-        |signal| ProcessTermination::signaled(signal, signal_name(signal).map(str::to_owned)),
-    );
-    Ok(CaptureOutcome {
-        termination,
-        recorder_signal,
-        core_dumped: false,
-    })
+}
+
+/// Captured output of one stream that is not yet journaled: an incomplete
+/// UTF-8 sequence, plus text held back so a redaction rule cannot be defeated
+/// by a secret that arrives split across reads. Mirroring is never delayed.
+struct PendingOutput {
+    utf8: Vec<u8>,
+    redaction: premier_trace::TerminalRedactionBuffer,
+}
+
+impl PendingOutput {
+    fn new(writer: &Arc<Mutex<TraceWriter>>, kind: &str) -> Self {
+        Self {
+            utf8: Vec::new(),
+            redaction: writer.lock().unwrap().terminal_redaction_buffer(kind),
+        }
+    }
 }
 
 fn append_process_bytes(
     writer: &Arc<Mutex<TraceWriter>>,
     kind: &str,
-    pending: &mut Vec<u8>,
+    pending: &mut PendingOutput,
     bytes: &[u8],
 ) -> Result<()> {
-    let text = decode_utf8_chunk(pending, bytes);
-    if text.is_empty() {
-        return Ok(());
+    let text = decode_utf8_chunk(&mut pending.utf8, bytes);
+    match pending.redaction.push(&text, bytes.len()) {
+        Some((text, byte_length)) => append_process_event(writer, kind, text, byte_length),
+        None => Ok(()),
     }
-    append_process_event(writer, kind, text, bytes.len())
 }
 
 fn append_process_event(
@@ -1462,14 +1783,15 @@ fn append_process_event(
 fn append_pending_utf8(
     writer: &Arc<Mutex<TraceWriter>>,
     kind: &str,
-    pending: &mut Vec<u8>,
+    pending: &mut PendingOutput,
 ) -> Result<()> {
-    let byte_length = pending.len();
-    let text = finish_utf8(pending);
-    if text.is_empty() {
-        return Ok(());
+    let byte_length = pending.utf8.len();
+    let text = finish_utf8(&mut pending.utf8);
+    let released = pending.redaction.push(&text, byte_length);
+    for (text, byte_length) in released.into_iter().chain(pending.redaction.finish()) {
+        append_process_event(writer, kind, text, byte_length)?;
     }
-    append_process_event(writer, kind, text, byte_length)
+    Ok(())
 }
 
 fn append_adapter_events(writer: &Arc<Mutex<TraceWriter>>, events: Vec<EventInput>) -> Result<()> {
@@ -1516,42 +1838,6 @@ fn terminal_size() -> portable_pty::PtySize {
         cols,
         pixel_width: 0,
         pixel_height: 0,
-    }
-}
-
-#[cfg(unix)]
-fn portable_process_termination(status: &portable_pty::ExitStatus) -> ProcessTermination {
-    if let Some(description) = status.signal()
-        && let Some(signal) = portable_signal_number(description)
-    {
-        return ProcessTermination::signaled(signal, signal_name(signal).map(str::to_owned));
-    }
-    ProcessTermination::exited(i32::try_from(status.exit_code()).unwrap_or(1))
-}
-
-#[cfg(unix)]
-fn portable_signal_number(description: &str) -> Option<i32> {
-    let normalized = description.to_ascii_lowercase();
-    if normalized.contains("hangup") {
-        Some(1)
-    } else if normalized.contains("interrupt") {
-        Some(2)
-    } else if normalized.contains("quit") {
-        Some(3)
-    } else if normalized.contains("abort") {
-        Some(6)
-    } else if normalized.contains("killed") {
-        Some(9)
-    } else if normalized.contains("segmentation") {
-        Some(11)
-    } else if normalized.contains("broken pipe") {
-        Some(13)
-    } else if normalized.contains("alarm") {
-        Some(14)
-    } else if normalized.contains("terminated") {
-        Some(15)
-    } else {
-        None
     }
 }
 
@@ -1623,11 +1909,64 @@ impl RecorderLease {
     }
 }
 
+/// Overrides how long a child may outlive a SIGTERM sent to the recorder, in
+/// milliseconds, for supervisors that enforce their own shutdown deadline.
+#[cfg(unix)]
+const STOP_GRACE_ENV: &str = "PREMIER_STOP_GRACE_MS";
+#[cfg(unix)]
+const DEFAULT_STOP_GRACE: StdDuration = StdDuration::from_secs(10);
+/// Interrupts no further apart than this count as one insistent request.
+#[cfg(unix)]
+const RAPID_INTERRUPT_WINDOW: StdDuration = StdDuration::from_secs(2);
+#[cfg(unix)]
+const RAPID_INTERRUPTS_TO_KILL: u32 = 3;
+
+/// Relays SIGINT/SIGTERM received by the recorder to the child and escalates
+/// to SIGKILL when the child will not stop, so the recorder can always be
+/// stopped and the trace finalized:
+/// - SIGTERM is forwarded, and the child is killed if it is still running
+///   after the stop grace period.
+/// - SIGINT is forwarded without a deadline, because interactive agents
+///   handle an interrupt and keep running; the third interrupt in quick
+///   succession kills the child instead.
 #[cfg(unix)]
 struct UnixSignalForwarder {
     handle: signal_hook::iterator::Handle,
-    thread: thread::JoinHandle<()>,
-    received: Arc<AtomicI32>,
+    listener: thread::JoinHandle<()>,
+    supervisor: thread::JoinHandle<()>,
+    state: Arc<ForwarderState>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct ForwarderState {
+    received: AtomicI32,
+    killed_child: AtomicBool,
+    child_exited: AtomicBool,
+}
+
+#[cfg(unix)]
+impl ForwarderState {
+    /// Signal the child unless it has already been reaped, so a late signal
+    /// can never reach an unrelated process that reused its id.
+    fn signal_child(&self, target: i32, signal: i32) -> bool {
+        if self.child_exited.load(Ordering::SeqCst) {
+            return false;
+        }
+        // SAFETY: `target` names the live child (or its process group)
+        // spawned by this recorder and `signal` is a valid signal number.
+        // This runs on an ordinary thread, not inside the OS signal handler.
+        unsafe {
+            libc::kill(target, signal);
+        }
+        true
+    }
+
+    fn kill_child(&self, target: i32) {
+        if self.signal_child(target, libc::SIGKILL) {
+            self.killed_child.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1642,45 +1981,134 @@ impl UnixSignalForwarder {
 
     fn start_target(child_pid: u32, process_group: bool) -> Result<Self> {
         use signal_hook::consts::signal::{SIGINT, SIGTERM};
-        use signal_hook::iterator::Signals;
+        use signal_hook::iterator::SignalsInfo;
+        use signal_hook::iterator::exfiltrator::WithOrigin;
 
         let child_pid = i32::try_from(child_pid).context("child process id exceeds i32")?;
         let signal_target = if process_group { -child_pid } else { child_pid };
-        let mut signals = Signals::new([SIGINT, SIGTERM])?;
+        let mut signals = SignalsInfo::<WithOrigin>::new([SIGINT, SIGTERM])?;
         let handle = signals.handle();
-        let received = Arc::new(AtomicI32::new(0));
-        let received_by_thread = received.clone();
-        let thread = thread::spawn(move || {
-            for signal in signals.forever() {
-                received_by_thread
+        let state = Arc::new(ForwarderState::default());
+        let (sender, receiver) = mpsc::channel::<(i32, bool)>();
+        let listener = thread::spawn(move || {
+            for origin in signals.forever() {
+                if sender
+                    .send((origin.signal, origin.process.is_some()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let supervisor_state = state.clone();
+        let stop_grace = std::env::var(STOP_GRACE_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map_or(DEFAULT_STOP_GRACE, StdDuration::from_millis);
+        let supervisor = thread::spawn(move || {
+            let state = supervisor_state;
+            let mut kill_deadline: Option<Instant> = None;
+            let mut interrupts = 0_u32;
+            let mut last_interrupt: Option<Instant> = None;
+            loop {
+                let message = match kill_deadline {
+                    Some(deadline) => {
+                        let wait = deadline.saturating_duration_since(Instant::now());
+                        match receiver.recv_timeout(wait) {
+                            Ok(message) => message,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                kill_deadline = None;
+                                state.kill_child(signal_target);
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    None => match receiver.recv() {
+                        Ok(message) => message,
+                        Err(mpsc::RecvError) => break,
+                    },
+                };
+                let (signal, sent_by_process) = message;
+                state
+                    .received
                     .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst)
                     .ok();
-                // SAFETY: `child_pid` came from the live child returned by
-                // std::process::Command and SIGINT/SIGTERM are valid signals.
-                // libc::kill is async-signal-safe; this call runs on the signal
-                // iterator thread, not inside the OS signal handler.
-                unsafe {
-                    libc::kill(signal_target, signal);
+                if signal == SIGINT {
+                    let now = Instant::now();
+                    let rapid = last_interrupt.is_some_and(|previous| {
+                        now.duration_since(previous) <= RAPID_INTERRUPT_WINDOW
+                    });
+                    interrupts = if rapid { interrupts + 1 } else { 1 };
+                    last_interrupt = Some(now);
+                    if interrupts >= RAPID_INTERRUPTS_TO_KILL {
+                        state.kill_child(signal_target);
+                        continue;
+                    }
+                    // A pipe-mode child shares the recorder's foreground
+                    // process group, so a terminal Ctrl-C has already
+                    // reached it. Forwarding it again would deliver one
+                    // keypress twice.
+                    if !process_group && interrupt_is_from_terminal(sent_by_process) {
+                        continue;
+                    }
+                } else if kill_deadline.is_none() {
+                    kill_deadline = Some(Instant::now() + stop_grace);
                 }
+                state.signal_child(signal_target, signal);
             }
         });
         Ok(Self {
             handle,
-            thread,
-            received,
+            listener,
+            supervisor,
+            state,
         })
     }
 
-    fn finish(self) -> Result<Option<i32>> {
-        self.handle.close();
-        self.thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("signal forwarding thread panicked"))?;
-        match self.received.load(Ordering::SeqCst) {
-            0 => Ok(None),
-            signal => Ok(Some(signal)),
-        }
+    /// Tell the forwarder the child has been reaped and must not be signalled.
+    fn child_exited(&self) {
+        self.state.child_exited.store(true, Ordering::SeqCst);
     }
+
+    fn finish(self) -> Result<RecorderSignals> {
+        self.handle.close();
+        for thread in [self.listener, self.supervisor] {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("signal forwarding thread panicked"))?;
+        }
+        Ok(RecorderSignals {
+            received: match self.state.received.load(Ordering::SeqCst) {
+                0 => None,
+                signal => Some(signal),
+            },
+            killed_child: self.state.killed_child.load(Ordering::SeqCst),
+        })
+    }
+}
+
+/// Whether a SIGINT received by the recorder was generated by its terminal
+/// (Ctrl-C) rather than sent to the recorder alone.
+#[cfg(unix)]
+fn interrupt_is_from_terminal(sent_by_process: bool) -> bool {
+    // Linux marks terminal-generated signals as sent by the kernel, with no
+    // sending process, which identifies them exactly.
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        return !sent_by_process;
+    }
+    // Other systems (macOS names the terminal emulator as the sender) give
+    // no such marker, so assume the terminal whenever the recorder is in the
+    // foreground process group of its controlling terminal. A `kill -INT`
+    // aimed at a foreground recorder is then not relayed; repeating it, or
+    // SIGTERM, still stops the child.
+    use std::os::fd::AsRawFd;
+    let Ok(terminal) = fs::File::open("/dev/tty") else {
+        return false;
+    };
+    // SAFETY: both calls only query process-group ids; the descriptor is a
+    // terminal opened above and stays open for the duration of the call.
+    unsafe { libc::tcgetpgrp(terminal.as_raw_fd()) == libc::getpgrp() }
 }
 
 fn process_termination(status: &std::process::ExitStatus) -> ProcessTermination {
@@ -1694,24 +2122,31 @@ fn process_termination(status: &std::process::ExitStatus) -> ProcessTermination 
     ProcessTermination::exited(status.code().unwrap_or(1))
 }
 
+/// Signal numbers differ between platforms (SIGBUS is 7 on Linux and 10 on
+/// macOS), so names are resolved through the target's libc constants.
 #[cfg(unix)]
 fn signal_name(signal: i32) -> Option<&'static str> {
     Some(match signal {
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        4 => "SIGILL",
-        5 => "SIGTRAP",
-        6 => "SIGABRT",
-        7 => "SIGBUS",
-        8 => "SIGFPE",
-        9 => "SIGKILL",
-        10 => "SIGUSR1",
-        11 => "SIGSEGV",
-        12 => "SIGUSR2",
-        13 => "SIGPIPE",
-        14 => "SIGALRM",
-        15 => "SIGTERM",
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        libc::SIGVTALRM => "SIGVTALRM",
+        libc::SIGPROF => "SIGPROF",
+        libc::SIGSYS => "SIGSYS",
         _ => return None,
     })
 }
@@ -1752,19 +2187,98 @@ fn list(trace_dir: PathBuf) -> Result<()> {
         if entry.file_type()?.is_dir()
             && let Ok(manifest) = read_manifest(entry.path())
         {
-            manifests.push(manifest);
+            manifests.push((entry.path(), manifest));
         }
     }
-    manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.started_at));
-    for manifest in manifests {
+    manifests.sort_by_key(|(_, manifest)| std::cmp::Reverse(manifest.started_at));
+    for (path, manifest) in manifests {
+        let state = match unfinalized_state(&path, &manifest) {
+            None => String::new(),
+            Some(UnfinalizedState::Recording) => "  [recording]".into(),
+            Some(state) => format!("  [{}]", state.describe(&path)),
+        };
         println!(
-            "{}  {}  {}",
+            "{}  {}  {}{state}",
             manifest.trace_id,
             manifest.started_at,
             manifest.name.unwrap_or_else(|| manifest.command.join(" "))
         );
     }
     Ok(())
+}
+
+/// Why a trace without a finalized journal is in that state.
+enum UnfinalizedState {
+    /// The recorder named in the lease is alive and heartbeating.
+    Recording,
+    /// The recorder is gone; `recover` needs `--force` only while the
+    /// journal is still inside its idle guard.
+    Abandoned { needs_force: bool },
+}
+
+impl UnfinalizedState {
+    fn describe(&self, trace: &std::path::Path) -> String {
+        match self {
+            Self::Recording => "still recording".into(),
+            Self::Abandoned { needs_force } => format!(
+                "abandoned: the recorder is no longer running — run `premier recover {}{}`",
+                if *needs_force { "--force " } else { "" },
+                trace.display()
+            ),
+        }
+    }
+}
+
+/// Classify an unfinalized trace from its recorder lease: the lease holds the
+/// recorder's process id and is rewritten every two seconds while it runs.
+fn unfinalized_state(
+    trace: &std::path::Path,
+    manifest: &premier_trace::TraceManifest,
+) -> Option<UnfinalizedState> {
+    if manifest.journal.is_some() {
+        return None;
+    }
+    let stale_after = RecoveryOptions::default().minimum_idle;
+    let lease = trace.join(RECORDER_LEASE);
+    let idle = |path: &std::path::Path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+    };
+    let recorder_pid = fs::read_to_string(&lease)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    let lease_idle = idle(&lease);
+    let heartbeating = lease_idle.is_some_and(|idle| idle < stale_after);
+    if recorder_pid.is_some_and(process_is_alive) && heartbeating {
+        return Some(UnfinalizedState::Recording);
+    }
+    // `premier recover` guards on the newer of the journal and the lease.
+    let journal_idle = idle(&trace.join("events").join(premier_trace::ACTIVE_JOURNAL));
+    let needs_force = [lease_idle, journal_idle]
+        .into_iter()
+        .flatten()
+        .any(|idle| idle < stale_after);
+    Some(UnfinalizedState::Abandoned { needs_force })
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs only the existence and permission check.
+    // EPERM still means a process with this id exists.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Without a portable liveness probe, rely on the lease heartbeat alone.
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Directory that contains `trace`, treating the empty parent of a bare

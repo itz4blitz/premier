@@ -1,4 +1,5 @@
 import { actorId } from './analysis';
+import { isRunSummary, nativeCost, nativeText, nativeUsage, payloadModel, payloadProvider } from './nativePayload';
 import { eventPayload, type TraceEvent } from './types';
 
 export type PromptRole = 'system' | 'developer' | 'user' | 'tool' | 'assistant';
@@ -158,40 +159,78 @@ function promptEvidence(payload: Record<string, unknown>, usage: Record<string, 
   return { prompts, toolSchemaCount: tools.length };
 }
 
-export function modelCallUsage(event: TraceEvent): ModelCallUsage | null {
-  const payload = eventPayload(event);
-  const usage = record(payload.usage);
-  const isModelEvent = event.kind.startsWith('model.') || event.kind.startsWith('llm.');
+function isModelKind(event: TraceEvent): boolean {
+  return event.kind.startsWith('model.') || event.kind.startsWith('llm.');
+}
+
+/**
+ * Usage for one event. Top-level `payload.usage` / `payload.model` win; adapter events fall back to the
+ * provider object under `payload.native`. Anything no producer reported stays null (shown as unknown).
+ */
+function callUsage(event: TraceEvent, payload: Record<string, unknown>, summary: boolean): ModelCallUsage | null {
+  const isModelEvent = isModelKind(event);
+  const direct = record(payload.usage);
+  // On an event that is not a model call, only usage attached to a single provider message is one call's usage.
+  const native = nativeUsage(payload, !isModelEvent && !summary);
+  const usage = direct ?? native;
   const hasDirectUsage = ['input_tokens', 'prompt_tokens', 'output_tokens', 'completion_tokens', 'total_tokens', 'tokens', 'cost_usd', 'total_cost_usd']
     .some((key) => finite(payload[key]) !== null);
   if (!isModelEvent && !usage && !hasDirectUsage) return null;
-  const inputDetails = record(usage?.input_tokens_details ?? payload.input_tokens_details);
-  const outputDetails = record(usage?.output_tokens_details ?? payload.output_tokens_details);
-  const model = stringFrom(payload, ['model', 'model_id', 'deployment']) ?? (isModelEvent ? 'Unknown model' : null);
+  // Normalized top-level usage carries totals; cache and reasoning detail may only exist in the provider object.
+  const sources = [direct, payload, native];
+  const inputDetails = record(usage?.input_tokens_details ?? usage?.prompt_tokens_details ?? payload.input_tokens_details);
+  const outputDetails = record(usage?.output_tokens_details ?? usage?.completion_tokens_details ?? payload.output_tokens_details);
 
-  const input = numberFrom([usage, payload], ['input_tokens', 'prompt_tokens']);
-  const output = numberFrom([usage, payload], ['output_tokens', 'completion_tokens']);
-  const cacheRead = numberFrom([inputDetails, usage, payload], ['cached_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cached_input_tokens']);
-  const cacheWrite = numberFrom([inputDetails, usage, payload], ['cache_creation_tokens', 'cache_write_tokens', 'cache_creation_input_tokens']);
-  const reasoning = numberFrom([outputDetails, usage, payload], ['reasoning_tokens']);
-  const explicitTotal = numberFrom([usage, payload], ['total_tokens', 'tokens']);
+  const input = numberFrom(sources, ['input_tokens', 'prompt_tokens']);
+  const output = numberFrom(sources, ['output_tokens', 'completion_tokens']);
+  const cacheRead = numberFrom([inputDetails, ...sources], ['cached_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cached_input_tokens']);
+  const cacheWrite = numberFrom([inputDetails, ...sources], ['cache_creation_tokens', 'cache_write_tokens', 'cache_creation_input_tokens']);
+  const reasoning = numberFrom([outputDetails, ...sources], ['reasoning_tokens', 'reasoning_output_tokens']);
+  const explicitTotal = numberFrom(sources, ['total_tokens', 'tokens']);
   const total = explicitTotal ?? (input !== null || output !== null ? (input ?? 0) + (output ?? 0) : null);
   const { prompts, toolSchemaCount } = promptEvidence(payload, usage);
   return {
     event,
     actor: actorId(event),
-    provider: stringFrom(payload, ['provider', 'vendor']),
-    model: model ?? 'Unknown model',
+    provider: payloadProvider(payload),
+    model: payloadModel(payload) ?? 'Unknown model',
     tokens: { input, output, cacheRead, cacheWrite, reasoning, total },
-    costUsd: numberFrom([usage, payload], ['cost_usd', 'total_cost_usd', 'cost']),
+    costUsd: numberFrom([direct, payload], ['cost_usd', 'total_cost_usd', 'cost']) ?? nativeCost(payload),
     prompts,
-    response: textOf(payload.response ?? payload.output ?? payload.content ?? payload.text ?? payload.summary),
+    response: textOf(payload.response ?? payload.output ?? payload.content ?? payload.text ?? payload.summary) ?? nativeText(payload),
     toolSchemaCount
   };
 }
 
+/** A provider's end-of-run total on an event that is not itself a model call. */
+function isSummaryEvent(event: TraceEvent, payload: Record<string, unknown>): boolean {
+  return !isModelKind(event) && isRunSummary(payload);
+}
+
+export function modelCallUsage(event: TraceEvent): ModelCallUsage | null {
+  const payload = eventPayload(event);
+  // Run summaries repeat the per-call usage; modelUsage() decides whether one is needed.
+  if (isSummaryEvent(event, payload)) return null;
+  return callUsage(event, payload, false);
+}
+
 export function modelUsage(events: TraceEvent[]): { calls: ModelCallUsage[]; rollups: ModelUsageRollup[] } {
-  const calls = events.map(modelCallUsage).filter((call): call is ModelCallUsage => call !== null);
+  const perCall = new Map<string, ModelCallUsage>();
+  const summaries = new Map<string, ModelCallUsage>();
+  for (const event of events) {
+    const payload = eventPayload(event);
+    const summary = isSummaryEvent(event, payload);
+    const call = callUsage(event, payload, summary);
+    if (call) (summary ? summaries : perCall).set(event.event_id, call);
+  }
+  // A run summary is the only usage evidence when the provider reported nothing per call.
+  const actorsWithUsage = new Set([...perCall.values()].filter((call) => call.tokens.total !== null).map((call) => call.actor));
+  const calls = events.flatMap((event) => {
+    const call = perCall.get(event.event_id);
+    if (call) return [call];
+    const summary = summaries.get(event.event_id);
+    return summary && !actorsWithUsage.has(summary.actor) && (summary.tokens.total !== null || summary.costUsd !== null) ? [summary] : [];
+  });
   const groups = new Map<string, ModelUsageRollup>();
   for (const call of calls) {
     const key = `${call.provider ?? ''}\u0000${call.model}\u0000${call.actor}`;

@@ -101,6 +101,94 @@ describe('buildInvestigationSummary', () => {
     expect(result.gaps.map((gap) => gap.id)).not.toContain('exit-cause');
   });
 
+  // `premier record` writes the terminal process.exit / session.interrupted event with status "error" and always
+  // records structured termination metadata, so the terminal event is itself an issue on every failing run.
+  const failedExit = (sequence: number, exitCode: number) => event(sequence, 'process.exit', {
+    actor_id: 'root', actor_type: 'process', status: 'error', payload_json: JSON.stringify({ exit_code: exitCode })
+  });
+
+  it('does not name the terminal exit event as a high-confidence cause when it is the only failure', () => {
+    const events = [
+      event(1, 'session.start', { actor_id: 'root', actor_type: 'process', status: 'running' }),
+      event(2, 'process.stdout', { actor_id: 'root', actor_type: 'process', status: 'running', payload_json: '{"text":"working"}' }),
+      failedExit(3, 2)
+    ];
+    const result = buildInvestigationSummary(trace({ exit_code: 2, termination: { kind: 'exit', exit_code: 2 } }), events);
+
+    expect(result.cause.title).toBe('Process exited with status 2');
+    expect(result.cause.role).toBe('outcome');
+    expect(result.cause.confidence).toBe('low');
+    expect(result.cause.event?.event_id).toBe('event-3');
+    expect(result.outcomeEvent?.event_id).toBe('event-3');
+    expect(result.gaps.map((gap) => gap.id)).toContain('exit-cause');
+    expect(result.recommendedEvent).toMatchObject({ event: { event_id: 'event-3' }, reason: expect.stringMatching(/no explicit cause/i) });
+    expect(result.chainKind).toBe('failure');
+    expect(result.failureChain.map((item) => [item.event.event_id, item.relation])).toEqual([['event-3', 'outcome']]);
+  });
+
+  it('prefers the earliest failing non-terminal event and presents the terminal event as the outcome', () => {
+    const events = [
+      event(1, 'session.start', { actor_id: 'root', actor_type: 'process', status: 'running' }),
+      event(2, 'tool.execution', { status: 'failed', payload_json: '{"tool":"migrate","error":"lock timeout"}' }),
+      event(3, 'model.response', { status: 'error', payload_json: '{"model":"m","error":"context overflow"}' }),
+      failedExit(4, 1)
+    ];
+    const result = buildInvestigationSummary(trace({ exit_code: 1, termination: { kind: 'exit', exit_code: 1 } }), events);
+
+    expect(result.cause.event?.event_id).toBe('event-2');
+    expect(result.cause.role).toBe('cause');
+    expect(result.cause.confidence).toBe('high');
+    expect(result.cause.detail).toContain('lock timeout');
+    expect(result.outcomeEvent?.event_id).toBe('event-4');
+    expect(result.recommendedEvent?.event.event_id).toBe('event-2');
+    expect(result.gaps.map((gap) => gap.id)).not.toContain('exit-cause');
+    const chain = result.failureChain.map((item) => [item.event.event_id, item.relation]);
+    expect(chain).toContainEqual(['event-2', 'cause']);
+    expect(chain.at(-1)).toEqual(['event-4', 'outcome']);
+    expect(result.failureChain.map((item) => item.rank)).toEqual(result.failureChain.map((_, index) => index + 1));
+  });
+
+  it('finds the failing event even when the terminal event was recorded first in sequence order', () => {
+    const events = [failedExit(1, 1), event(2, 'approval.decision', { status: 'denied', payload_json: '{"scope":"deploy"}' })];
+    const result = buildInvestigationSummary(trace({ exit_code: 1, termination: { kind: 'exit', exit_code: 1 } }), events);
+    expect(result.cause.event?.event_id).toBe('event-2');
+    expect(result.cause.role).toBe('cause');
+    expect(result.outcomeEvent?.event_id).toBe('event-1');
+  });
+
+  it('lowers confidence for a signalled run whose only failure is its terminal event', () => {
+    const events = [event(1, 'session.start', { status: 'running' }), failedExit(2, 143)];
+    const result = buildInvestigationSummary(trace({ exit_code: 143, termination: { kind: 'signal', signal: 15, signal_name: 'SIGTERM' } }), events);
+    expect(result.cause.title).toBe('Process terminated by SIGTERM');
+    expect(result.cause.role).toBe('outcome');
+    expect(result.cause.confidence).toBe('medium');
+    expect(result.cause.detail).toMatch(/no earlier failed/i);
+    expect(result.gaps.map((gap) => gap.id)).toContain('signal-cause');
+    expect(result.gaps.map((gap) => gap.id)).not.toContain('exit-cause');
+    expect(result.recommendedEvent?.event.event_id).toBe('event-2');
+  });
+
+  it('names an earlier failure as the cause of a signalled or interrupted run', () => {
+    const tool = event(1, 'tool.error', { status: 'error', payload_json: '{"tool":"build","error":"oom"}' });
+    const signalled = buildInvestigationSummary(
+      trace({ exit_code: 137, termination: { kind: 'signal', signal: 9, signal_name: 'SIGKILL' } }),
+      [tool, failedExit(2, 137)]
+    );
+    expect(signalled.cause.event?.event_id).toBe('event-1');
+    expect(signalled.cause.confidence).toBe('high');
+    expect(signalled.outcomeEvent?.event_id).toBe('event-2');
+    expect(signalled.gaps.map((gap) => gap.id)).not.toContain('signal-cause');
+
+    const interrupted = buildInvestigationSummary(
+      trace({ exit_code: null, termination: { kind: 'interrupted' } }),
+      [event(1, 'session.start', { status: 'running' }), event(2, 'session.interrupted', { actor_id: 'root', actor_type: 'process', status: 'error' })]
+    );
+    expect(interrupted.cause.title).toBe('Recorder interruption recovered');
+    expect(interrupted.cause.role).toBe('outcome');
+    expect(interrupted.cause.confidence).toBe('medium');
+    expect(interrupted.cause.event?.event_id).toBe('event-2');
+  });
+
   it('handles an active empty trace without inventing a cause or next event', () => {
     const result = buildInvestigationSummary(trace({ ended_at: null, exit_code: null, integrity: 'live' }), []);
     expect(result.cause).toMatchObject({ title: 'Waiting for evidence', confidence: 'low', event: null });

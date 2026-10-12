@@ -349,3 +349,111 @@ it('shows unverified outcome for integrity-invalid traces', async () => {
   expect(await screen.findAllByText('Unverified')).not.toHaveLength(0);
   expect(screen.getByText('Integrity failed')).toBeInTheDocument();
 });
+
+it('leaves the empty state when Refresh runs finds a first recording', async () => {
+  let available: TraceManifest[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify(available), { status: 200 });
+    if (url.endsWith('/events')) return new Response(JSON.stringify(events), { status: 200 });
+    return new Response(JSON.stringify(trace), { status: 200 });
+  });
+  const errors: unknown[] = [];
+  const onError = (event: ErrorEvent) => { errors.push(event.error ?? event.message); event.preventDefault(); };
+  const onRejection = (event: PromiseRejectionEvent) => { errors.push(event.reason); event.preventDefault(); };
+  window.addEventListener('error', onError);
+  window.addEventListener('unhandledrejection', onRejection);
+  try {
+    render(App);
+    expect(await screen.findByText('No traces yet')).toBeInTheDocument();
+    available = [trace];
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh runs' }));
+    await waitFor(() => expect(document.querySelector('.run-shell')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+    expect(screen.queryByText('No traces yet')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Investigation summary')).toBeInTheDocument();
+    expect(new URL(window.location.href).searchParams.get('trace')).toBe('trace-1');
+    expect(errors).toEqual([]);
+  } finally {
+    window.removeEventListener('error', onError);
+    window.removeEventListener('unhandledrejection', onRejection);
+  }
+});
+
+it('opens the first recording when the background poll finds it on the empty state', async () => {
+  let available: TraceManifest[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/api/traces')) return new Response(JSON.stringify(available), { status: 200 });
+    if (url.endsWith('/events')) return new Response(JSON.stringify(events), { status: 200 });
+    return new Response(JSON.stringify(trace), { status: 200 });
+  });
+  const polls: Array<() => void> = [];
+  const realSetInterval = window.setInterval.bind(window);
+  vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler, timeout?: number, ...rest: unknown[]) => {
+    if (timeout === 4000 && typeof handler === 'function') {
+      polls.push(handler as () => void);
+      return 0;
+    }
+    return realSetInterval(handler, timeout, ...rest);
+  }) as typeof window.setInterval);
+  render(App);
+  expect(await screen.findByText('No traces yet')).toBeInTheDocument();
+  await waitFor(() => expect(polls).toHaveLength(1));
+  available = [trace];
+  polls[0]();
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(screen.queryByText('No traces yet')).not.toBeInTheDocument();
+  expect(screen.getByLabelText('Current run')).toHaveTextContent('Investigation');
+});
+
+it('recovers from a missing shared trace by opening the latest available run', async () => {
+  window.history.replaceState({}, '', '/?trace=missing-trace&event=4');
+  mockWorkspace([trace]);
+  render(App);
+  expect(await screen.findByText('Trace not found')).toBeInTheDocument();
+  await fireEvent.click(screen.getByRole('button', { name: 'Open the latest available run' }));
+  await waitFor(() => expect(screen.getAllByText('tool.execution').length).toBeGreaterThan(0));
+  expect(screen.queryByText('Trace not found')).not.toBeInTheDocument();
+  expect(screen.getByLabelText('Investigation summary')).toBeInTheDocument();
+  expect(new URL(window.location.href).searchParams.get('trace')).toBe('trace-1');
+});
+
+it('exports token usage intact, masks credentials, and labels the file honestly', async () => {
+  const usageEvents: TraceEvent[] = [
+    events[0],
+    { ...events[1], kind: 'model.response', payload_json: JSON.stringify({ model: 'gpt-5.2', apiKey: 'sk-live-EXPORT1', usage: { input_tokens: 1296, output_tokens: 546, total_tokens: 1842 } }) },
+    { ...events[1], event_id: 'event-3', sequence: 3, kind: 'process.stdout', payload_json: JSON.stringify({ text: '{"apiKey":"sk-live-STDOUT1","ok":true}\n' }) }
+  ];
+  const unverified: TraceManifest = { ...trace, integrity: 'invalid', integrity_detail: 'journal digest mismatch' };
+  mockWorkspace([unverified], { 'trace-1': usageEvents });
+  const blobs: Blob[] = [];
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn((blob: Blob) => { blobs.push(blob); return 'blob:export'; }) });
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+
+  render(App);
+  await screen.findByRole('button', { name: 'Ask AI' });
+  await waitFor(() => expect(screen.getAllByText('model.response').length).toBeGreaterThan(0));
+  await fireEvent.click(screen.getByRole('button', { name: 'More' }));
+  await fireEvent.click(screen.getByRole('menuitem', { name: /Export safe JSON/ }));
+
+  expect(click).toHaveBeenCalledTimes(1);
+  expect(blobs).toHaveLength(1);
+  const text = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(blobs[0]);
+  });
+  expect(text).not.toContain('sk-live-EXPORT1');
+  expect(text).not.toContain('sk-live-STDOUT1');
+  const exported = JSON.parse(text) as { export: { source_integrity: string; verified: boolean; redaction: { masked_values: number } }; events: TraceEvent[] };
+  expect(JSON.parse(exported.events[1].payload_json).usage).toEqual({ input_tokens: 1296, output_tokens: 546, total_tokens: 1842 });
+  expect(exported.export.source_integrity).toBe('invalid');
+  expect(exported.export.verified).toBe(false);
+  expect(exported.export.redaction.masked_values).toBe(2);
+  const toast = document.querySelector('.action-feedback');
+  expect(toast).toHaveTextContent(/2 values masked/);
+  expect(toast).toHaveTextContent(/not verified/);
+});

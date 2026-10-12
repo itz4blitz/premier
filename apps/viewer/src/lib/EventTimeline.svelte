@@ -3,6 +3,7 @@
   import type { TraceEvent } from './types';
   import { actorId, actorRole, categoryOf, eventSummary, isProcessNoise, timelineLayout } from './analysis';
   import { eventPayload } from './types';
+  import { payloadModel, payloadProvider } from './nativePayload';
   import BrandIcon from './BrandIcon.svelte';
   import { Bot, Wrench, ShieldCheck, SquareTerminal, Sparkles, CircleAlert } from '@lucide/svelte';
 
@@ -21,9 +22,7 @@
       return { provider: null, model: null };
     }
     const payload = eventPayload(event);
-    const provider = typeof payload.provider === 'string' ? payload.provider : typeof payload.vendor === 'string' ? payload.vendor : null;
-    const model = typeof payload.model === 'string' ? payload.model : typeof payload.model_id === 'string' ? payload.model_id : null;
-    return { provider, model };
+    return { provider: payloadProvider(payload), model: payloadModel(payload) };
   }
 
   let { events, selectedSequence, onselect }: {

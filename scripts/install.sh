@@ -16,8 +16,8 @@ ALLOW_FOREIGN=0
 ALLOW_UNSIGNED=0
 SIGNATURE_BUNDLE=""
 VERIFICATION_KEY=""
-CERTIFICATE_IDENTITY_REGEXP='^https://github\.com/PremierStudio/premier\.dev/\.github/workflows/release\.yml@refs/tags/v[0-9].*$'
-CERTIFICATE_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+CERTIFICATE_IDENTITY_REGEXP="$DISTRIBUTION_SIGNER_IDENTITY_REGEXP"
+CERTIFICATE_OIDC_ISSUER="$DISTRIBUTION_SIGNER_OIDC_ISSUER"
 
 usage() {
   cat <<'EOF'

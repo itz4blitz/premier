@@ -31,6 +31,16 @@ describe('InvestigationSummary', () => {
     expect(onselect).toHaveBeenCalledWith(expect.objectContaining({ event_id: 'event-2' }));
   });
 
+  it('labels a terminal-only failure as an outcome instead of a likely cause', () => {
+    const exit = event(1, 'process.exit', { actor_id: 'root', actor_type: 'process', status: 'error', payload_json: '{"exit_code":2}' });
+    render(InvestigationSummary, { props: { trace: { ...trace, exit_code: 2, termination: { kind: 'exit', exit_code: 2 } }, events: [exit] } });
+    expect(screen.queryByText('Likely cause')).not.toBeInTheDocument();
+    expect(screen.getByText('Outcome · cause not recorded')).toBeInTheDocument();
+    expect(screen.getByText('low confidence')).toBeInTheDocument();
+    expect(screen.getByText('Process exited with status 2')).toBeInTheDocument();
+    expect(screen.getByText('Exit cause is missing')).toBeInTheDocument();
+  });
+
   it('provides a compact truthful empty state for an active trace', () => {
     render(InvestigationSummary, { props: { trace: { ...trace, ended_at: null, exit_code: null, integrity: 'live' }, events: [] } });
     expect(screen.getByText('Waiting for evidence')).toBeInTheDocument();

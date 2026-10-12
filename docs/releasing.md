@@ -117,6 +117,16 @@ signed aggregate manifest:
 ./scripts/verify-release.sh --directory ./downloaded-release
 ```
 
+Both scripts take the pinned signer from one constant,
+`DISTRIBUTION_SIGNER_IDENTITY_REGEXP` in `scripts/lib/distribution.sh`: tag
+builds of `.github/workflows/release.yml` in `PremierStudio/premier`. The
+release workflow runs `verify-release.sh` against the assets it has just signed,
+and `scripts/tests/distribution.sh` checks the constant against the identity in
+`release.yml`, so a pin that no longer matches the signing workflow fails CI and
+blocks publication instead of breaking every consumer install. If the
+repository or workflow file is ever renamed, change that constant and the
+workflow's `--certificate-identity` together.
+
 Unsigned archives are rejected by default. `--allow-unsigned` exists only for a
 locally produced developer archive and prints an explicit warning; it is never
 part of the public installation path.

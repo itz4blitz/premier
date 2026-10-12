@@ -1,2 +1,4 @@
 {"type":"step_start","session_id":"open-session"}
 {"type":"tool_use","id":"tool-1","name":"read"}
+{"type":"tool_use","sessionID":"open-session","part":{"type":"tool","callID":"tool-1","tool":"read","state":{"status":"completed","output":"ok"}}}
+{"type":"step_finish","sessionID":"open-session","part":{"type":"step-finish","tokens":{"input":10,"output":5}}}

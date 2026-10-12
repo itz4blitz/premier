@@ -3,7 +3,7 @@
   import { api } from './lib/api';
   import type { EventFilters, TraceEvent, TraceManifest } from './lib/types';
   import { listKey } from './lib/types';
-  import { filterEvents, isIssue, materialEvent, runHealth } from './lib/analysis';
+  import { filterEvents, isIssue, materialEvent, runHealth, traceTimeBounds } from './lib/analysis';
   import { applyTraceComplete, mergeLiveEvents, resolveSelectedEvent, shouldCommitLoad, type EventRequest } from './lib/traceLoad';
   import { readViewSession, writeViewSession, clearViewSession } from './lib/viewSession';
   import TraceList from './lib/TraceList.svelte';
@@ -22,6 +22,7 @@
   import { deriveRunIdentity } from './lib/runIdentity';
   import { focusTrap } from './lib/interactions';
   import { findEventById } from './lib/causal';
+  import { buildSafeExport } from './lib/safeExport';
   import {
     clearScopeFilters,
     parseInvestigationParams,
@@ -121,17 +122,6 @@
   let rightCompact = $derived(rightCollapsed || !selectedEvent);
   let filtersActive = $derived(scopeIsActive(filters, architectureWindowStart));
 
-  function traceTimeBounds(input: TraceEvent[]): { start: number; span: number } | null {
-    const timestamps = input.map((event) => Date.parse(event.timestamp)).filter(Number.isFinite);
-    if (!timestamps.length) return null;
-    const start = Math.min(...timestamps);
-    const end = Math.max(...input.map((event) => {
-      const timestamp = Date.parse(event.timestamp);
-      return Number.isFinite(timestamp) ? timestamp + Math.max(0, event.duration_ms || 0) : start;
-    }));
-    return { start, span: Math.max(1, end - start) };
-  }
-
   function normalizedWindow(input: TraceEvent[], startMs: number, endMs: number): [number, number] {
     const bounds = traceTimeBounds(input);
     const span = bounds?.span ?? 1;
@@ -221,9 +211,9 @@
     return items.find(isIssue) ?? null;
   }
 
-  function showFeedback(message: string) {
+  function showFeedback(message: string, durationMs = 2200) {
     actionFeedback = message;
-    window.setTimeout(() => { if (actionFeedback === message) actionFeedback = ''; }, 2200);
+    window.setTimeout(() => { if (actionFeedback === message) actionFeedback = ''; }, durationMs);
   }
 
   function persistSessionSoon() {
@@ -522,41 +512,16 @@
     }
   }
 
-  function redactString(value: string): string {
-    return value
-      .replace(/(bearer\s+)[a-z0-9._~+/=-]+/gi, '$1[REDACTED]')
-      .replace(/((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]');
-  }
-
-  function safeExportValue(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(safeExportValue);
-    if (typeof value === 'string') {
-      try {
-        const decoded = JSON.parse(value) as unknown;
-        if (decoded && typeof decoded === 'object') return JSON.stringify(safeExportValue(decoded));
-      } catch {
-        // Plain strings still receive token-pattern masking below.
-      }
-      return redactString(value);
-    }
-    if (!value || typeof value !== 'object') return value;
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => {
-      const normalized = key.toLowerCase().replace(/[- ]/g, '_');
-      const sensitive = /password|secret|token|authorization|cookie|api_key|private_key/.test(normalized);
-      return [key, sensitive ? '[REDACTED BY PREMIER]' : safeExportValue(child)];
-    }));
-  }
-
   function exportJson() {
     if (!selectedTrace) return;
-    const artifact = JSON.stringify(safeExportValue({ manifest: selectedTrace, events }), null, 2);
-    const url = URL.createObjectURL(new Blob([artifact], { type: 'application/json' }));
+    const { document: exported, label } = buildSafeExport(selectedTrace, events);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(exported, null, 2)], { type: 'application/json' }));
     const anchor = document.createElement('a');
     anchor.href = url;
     anchor.download = `${runTitle(selectedTrace).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase()}.redacted.json`;
     anchor.click();
     URL.revokeObjectURL(url);
-    showFeedback('Redacted JSON export created');
+    showFeedback(label, 6000);
   }
 
   function focusIssue() {
@@ -720,6 +685,8 @@
         if (next.length !== traces.length || next.some((item, index) => item.trace_id !== traces[index]?.trace_id || item.ended_at !== traces[index]?.ended_at)) {
           traces = next;
         }
+        // The empty state has nothing selected; adopt the first recording as soon as it appears.
+        if (next.length && !selectedTrace && !pendingTraceId && !fatalError) void applyLocationState();
       }).catch(() => undefined);
     }, 4000);
   });
@@ -773,7 +740,7 @@
         <button bind:this={moreButton} class="menu-trigger" aria-label="More" aria-haspopup="menu" aria-expanded={moreOpen} onclick={toggleMore}>More</button>
         {#if moreOpen}<div bind:this={moreMenu} role="menu" tabindex="-1" aria-label="More trace actions" onkeydown={navigateMore}>
           <button role="menuitem" onclick={() => { closeMore(); void copyLink(); }}><span>Copy link</span><small>Deep link with filters and time window</small></button>
-          <button role="menuitem" onclick={() => { closeMore(); exportJson(); }}><span>Export safe JSON</span><small>Redacts common secret and credential fields</small></button>
+          <button role="menuitem" onclick={() => { closeMore(); exportJson(); }}><span>Export safe JSON</span><small>Best-effort masking of common secrets; token usage is kept</small></button>
           <button role="menuitem" onclick={() => { closeMore(); void shareTrace(); }}><span>Share local link</span><small>Open the system share sheet</small></button>
           <button role="menuitem" onclick={() => { closeMore(); shortcutsOpen = true; }}><span>Keyboard shortcuts</span><small>Press ? anytime</small></button>
           <hr />
@@ -947,7 +914,7 @@
             {:else}
               {#if viewMode === 'timeline'}
                 <div class="mode-content events-mode">
-                  <InvestigationSummary trace={selectedTrace!} {events} onselect={inspectEvent} />
+                  {#if selectedTrace}<InvestigationSummary trace={selectedTrace} {events} onselect={inspectEvent} />{/if}
                   <EventTimeline events={windowedVisibleEvents} selectedSequence={selectedEvent?.sequence ?? null} onselect={selectEvent} />
                 </div>
               {:else if viewMode === 'analytics'}

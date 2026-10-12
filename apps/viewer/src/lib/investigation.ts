@@ -10,11 +10,16 @@ export interface InvestigationCause {
   detail: string;
   confidence: EvidenceConfidence;
   event: TraceEvent | null;
+  /**
+   * `outcome` when a failed run's finding only restates how it ended (its terminal event or termination
+   * metadata) because the cause itself was not recorded; `cause` for every other finding.
+   */
+  role: 'cause' | 'outcome';
 }
 
 export interface ChainEvidence {
   rank: number;
-  relation: 'context' | 'cause' | 'effect' | 'correlated';
+  relation: 'context' | 'cause' | 'effect' | 'correlated' | 'outcome';
   event: TraceEvent;
   summary: string;
 }
@@ -49,10 +54,19 @@ export interface InvestigationSummary {
   hotspots: InvestigationHotspot[];
   gaps: EvidenceGap[];
   recommendedEvent: RecommendedEvidence | null;
+  /** The terminal event of a failed run: what happened in the end, as distinct from why. */
+  outcomeEvent: TraceEvent | null;
 }
 
 function sorted(events: TraceEvent[]): TraceEvent[] {
   return [...events].sort((a, b) => a.sequence - b.sequence || a.event_id.localeCompare(b.event_id));
+}
+
+const TERMINAL_KINDS = ['process.exit', 'session.end', 'session.interrupted', 'trace.complete'];
+
+/** The recorder's own end-of-run event. It reports the result of the run, never the reason for it. */
+function isTerminal(event: TraceEvent): boolean {
+  return TERMINAL_KINDS.includes(event.kind);
 }
 
 function exitEvent(events: TraceEvent[]): TraceEvent | null {
@@ -61,8 +75,22 @@ function exitEvent(events: TraceEvent[]): TraceEvent | null {
 
 function primaryIssue(events: TraceEvent[]): TraceEvent | null {
   // The first explicit failure is normally the causal divergence. Later failures are
-  // commonly propagation, cleanup, or the final process result.
-  return events.find(isIssue) ?? null;
+  // commonly propagation, cleanup, or the final process result. The terminal event is
+  // excluded: `premier record` marks process.exit as an error on every failing run, so
+  // it would otherwise name itself as the cause.
+  return events.find((event) => isIssue(event) && !isTerminal(event)) ?? null;
+}
+
+/** A failing terminal event, i.e. the recorded outcome of a run that did not end cleanly. */
+function terminalIssue(events: TraceEvent[]): TraceEvent | null {
+  return [...events].reverse().find((event) => isIssue(event) && isTerminal(event)) ?? null;
+}
+
+function runFailed(trace: TraceManifest, events: TraceEvent[]): boolean {
+  return (trace.exit_code !== null && trace.exit_code !== 0)
+    || trace.termination?.kind === 'signal'
+    || trace.termination?.kind === 'interrupted'
+    || terminalIssue(events) !== null;
 }
 
 function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCause {
@@ -71,7 +99,8 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
       title: trace.ended_at === null ? 'Waiting for evidence' : 'No evidence captured',
       detail: trace.ended_at === null ? 'The run is active but has not emitted an event yet.' : 'The recorder produced no events for this run.',
       confidence: 'low',
-      event: null
+      event: null,
+      role: 'cause'
     };
   }
   if (trace.integrity === 'invalid') {
@@ -79,7 +108,8 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
       title: 'Trace integrity failed',
       detail: trace.integrity_detail?.trim() || 'The journal does not match the recorded manifest digest.',
       confidence: 'high',
-      event: null
+      event: null,
+      role: 'cause'
     };
   }
   const issue = primaryIssue(events);
@@ -88,33 +118,49 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
       title: `${issue.kind} in ${actorId(issue)}`,
       detail: eventSummary(issue),
       confidence: issue.status || issue.kind.includes('error') || issue.kind.includes('fail') ? 'high' : 'medium',
-      event: issue
+      event: issue,
+      role: 'cause'
     };
   }
+  // From here on only the terminal event (or nothing) reports the failure. These findings describe how
+  // the run ended, so they are outcomes with reduced confidence rather than causes.
   if (trace.termination?.kind === 'interrupted') {
     return {
       title: 'Recorder interruption recovered',
-      detail: 'The journal was salvaged and finalized after the recorder stopped before normal publication.',
-      confidence: 'high',
-      event: exitEvent(events)
+      detail: 'The journal was salvaged and finalized after the recorder stopped before normal publication. No earlier failed, blocked, or denied event explains the interruption, and evidence after the last salvaged event is missing.',
+      confidence: 'medium',
+      event: exitEvent(events),
+      role: 'outcome'
     };
   }
   if (trace.termination?.kind === 'signal') {
     const signal = trace.termination.signal_name?.trim() || (trace.termination.signal ? `signal ${trace.termination.signal}` : 'a signal');
     return {
       title: `Process terminated by ${signal}`,
-      detail: 'Structured termination metadata identifies how the process stopped.',
-      confidence: 'high',
-      event: exitEvent(events)
+      detail: 'Structured termination metadata identifies how the process stopped. No earlier failed, blocked, or denied event explains why the signal was sent.',
+      confidence: 'medium',
+      event: exitEvent(events),
+      role: 'outcome'
     };
   }
   if (trace.exit_code !== null && trace.exit_code !== 0) {
     const terminal = exitEvent(events);
     return {
       title: `Process exited with status ${trace.exit_code}`,
-      detail: 'No explicit failed, blocked, or error event explains the non-zero exit.',
+      detail: 'No explicit failed, blocked, or error event explains the non-zero exit. The terminal event records the outcome, not its cause.',
       confidence: 'low',
-      event: terminal
+      event: terminal,
+      role: 'outcome'
+    };
+  }
+  const failedTerminal = terminalIssue(events);
+  if (failedTerminal) {
+    return {
+      title: `${failedTerminal.kind} in ${actorId(failedTerminal)}`,
+      detail: `${eventSummary(failedTerminal)}. Only the terminal event reports a failure; no earlier event explains it.`,
+      confidence: 'low',
+      event: failedTerminal,
+      role: 'outcome'
     };
   }
   if (trace.ended_at === null || trace.integrity === 'live') {
@@ -123,7 +169,8 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
       title: 'Run is still active',
       detail: latest ? `Latest evidence: ${eventSummary(latest)}` : 'Waiting for the first recorded event.',
       confidence: 'medium',
-      event: latest
+      event: latest,
+      role: 'cause'
     };
   }
   const terminal = exitEvent(events) ?? events.at(-1)!;
@@ -131,11 +178,12 @@ function causeFor(trace: TraceManifest, events: TraceEvent[]): InvestigationCaus
     title: 'No recorded failure',
     detail: 'The run completed cleanly with no explicit error, denial, or blocked operation.',
     confidence: 'high',
-    event: terminal
+    event: terminal,
+    role: 'cause'
   };
 }
 
-function chainFor(events: TraceEvent[], cause: TraceEvent | null, includeCorrelated = true): ChainEvidence[] {
+function chainFor(events: TraceEvent[], cause: TraceEvent | null, includeCorrelated = true, outcome: TraceEvent | null = null): ChainEvidence[] {
   if (!cause) return [];
   const byId = new Map(events.map((event) => [event.event_id, event]));
   const bySpan = new Map<string, TraceEvent>();
@@ -152,7 +200,7 @@ function chainFor(events: TraceEvent[], cause: TraceEvent | null, includeCorrela
     cursor = parent;
   }
   for (const event of ancestors) included.set(event.event_id, { event, relation: 'context' });
-  included.set(cause.event_id, { event: cause, relation: 'cause' });
+  included.set(cause.event_id, { event: cause, relation: cause.event_id === outcome?.event_id ? 'outcome' : 'cause' });
 
   let frontier = [cause.event_id];
   for (let depth = 0; depth < 3 && frontier.length; depth += 1) {
@@ -168,10 +216,16 @@ function chainFor(events: TraceEvent[], cause: TraceEvent | null, includeCorrela
       }
     }
   }
-  return [...included.values()]
+  const chain = [...included.values()]
+    .filter((item) => item.event.event_id !== outcome?.event_id || item.relation === 'outcome')
     .sort((a, b) => a.event.sequence - b.event.sequence)
-    .slice(0, 8)
-    .map((item, index) => ({ ...item, rank: index + 1, summary: eventSummary(item.event) }));
+    .slice(0, 8);
+  // The terminal event closes a failure chain as its outcome, never as a link in the cause.
+  if (outcome && !chain.some((item) => item.event.event_id === outcome.event_id)) {
+    if (chain.length === 8) chain.pop();
+    chain.push({ event: outcome, relation: 'outcome' });
+  }
+  return chain.map((item, index) => ({ ...item, rank: index + 1, summary: eventSummary(item.event) }));
 }
 
 function hotspotsFor(events: TraceEvent[]): InvestigationHotspot[] {
@@ -202,8 +256,14 @@ function gapsFor(trace: TraceManifest, events: TraceEvent[]): EvidenceGap[] {
     });
   }
   if (!events.length) add({ id: 'no-events', severity: 'high', label: 'No events captured', detail: 'Instrument the run before relying on its outcome or architecture.' });
-  if (trace.exit_code !== null && trace.exit_code !== 0 && !trace.termination && !events.some(isIssue)) {
+  // The terminal event is an issue on every failing run, so only an earlier failure counts as an explanation.
+  const explained = primaryIssue(events) !== null;
+  const stoppedBy = trace.termination?.kind;
+  if (trace.exit_code !== null && trace.exit_code !== 0 && stoppedBy !== 'signal' && stoppedBy !== 'interrupted' && !explained) {
     add({ id: 'exit-cause', severity: 'high', label: 'Exit cause is missing', detail: 'A non-zero exit was recorded without a failed, blocked, denied, or error event.' });
+  }
+  if (stoppedBy === 'signal' && events.some((event) => isIssue(event) && isTerminal(event)) && !explained) {
+    add({ id: 'signal-cause', severity: 'medium', label: 'Signal cause is not recorded', detail: 'The process was stopped by a signal, and no earlier failed, blocked, denied, or error event explains why.' });
   }
   const ids = new Set(events.map((event) => event.event_id));
   const spans = new Set(events.map((event) => event.span_id).filter(Boolean));
@@ -227,12 +287,16 @@ export function buildInvestigationSummary(trace: TraceManifest, inputEvents: Tra
   const gaps = gapsFor(trace, events);
   const hotspots = hotspotsFor(events);
   const issue = primaryIssue(events);
-  const chainKind = issue ? 'failure' : 'critical';
-  const chainAnchor = issue ?? hotspots[0]?.event ?? cause.event;
+  const failed = runFailed(trace, events);
+  // On a failed run the terminal event is the outcome; on a clean run it is just the end of the journal.
+  const outcomeEvent = failed ? terminalIssue(events) ?? exitEvent(events) : null;
+  const terminalOnly = !issue && failed ? outcomeEvent : null;
+  const chainKind = issue || terminalOnly ? 'failure' : 'critical';
+  const chainAnchor = issue ?? terminalOnly ?? hotspots[0]?.event ?? cause.event;
   const recommended = issue
     ? { event: issue, reason: 'Inspect the first explicit failure and its causal parents.' }
-    : trace.exit_code !== null && trace.exit_code !== 0 && exitEvent(events)
-      ? { event: exitEvent(events)!, reason: 'Start at the terminal event because no explicit cause was captured.' }
+    : terminalOnly
+      ? { event: terminalOnly, reason: 'Start at the terminal event because no explicit cause was captured.' }
       : hotspots[0]
         ? { event: hotspots[0].event, reason: 'Inspect the run’s highest-impact latency or cost hotspot.' }
         : cause.event
@@ -242,9 +306,10 @@ export function buildInvestigationSummary(trace: TraceManifest, inputEvents: Tra
     outcome: runHealth(trace, events),
     cause,
     chainKind,
-    failureChain: chainFor(events, chainAnchor, Boolean(issue)),
+    failureChain: chainFor(events, chainAnchor, Boolean(issue), issue || terminalOnly ? outcomeEvent : null),
     hotspots,
     gaps,
-    recommendedEvent: recommended
+    recommendedEvent: recommended,
+    outcomeEvent
   };
 }

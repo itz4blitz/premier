@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+# The one place consumers pin who may sign a Premier release: tag builds of
+# .github/workflows/release.yml in PremierStudio/premier. It must match the
+# identity that workflow signs with; scripts/tests/distribution.sh enforces it.
+# shellcheck disable=SC2034 # consumed by install.sh and verify-release.sh
+DISTRIBUTION_SIGNER_IDENTITY_REGEXP='^https://github\.com/PremierStudio/premier/\.github/workflows/release\.yml@refs/tags/v[0-9].*$'
+# shellcheck disable=SC2034
+DISTRIBUTION_SIGNER_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+
 distribution_host_target() {
   local machine os
   machine="$(uname -m)"

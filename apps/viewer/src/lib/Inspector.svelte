@@ -3,6 +3,7 @@
   import type { TraceEvent } from './types';
   import { eventPayload } from './types';
   import { actorId, categoryOf, eventSummary } from './analysis';
+  import { payloadModel, payloadProvider, payloadTool } from './nativePayload';
   import { relatedSummary, resolveRelatedTarget } from './causal';
   import { parseInvestigationParams, serializeInvestigationUrl } from './deepLink';
   import EvidenceValue from './EvidenceValue.svelte';
@@ -69,9 +70,22 @@
   ];
 
   const relations = $derived(event ? relatedSummary(event, events) : null);
+  const maxCorrelatedRows = 8;
+  /** Correlation peers that are not already listed as the parent, a child, or a link. */
+  const correlated = $derived.by(() => {
+    if (!relations) return [];
+    const shown = new Set([
+      relations.parent.found?.event_id,
+      ...relations.children.map((child) => child.event_id),
+      ...relations.links.map((link) => link.found?.event_id),
+      ...relations.linkedFrom.map((source) => source.event_id)
+    ]);
+    return relations.peers.filter((peer) => !shown.has(peer.event_id));
+  });
   const causalCount = $derived(event
     ? [event.parent_event_id, event.span_id, event.parent_span_id, event.correlation_id, ...event.links].filter(Boolean).length
       + (relations?.children.length ?? 0)
+      + (relations?.linkedFrom.length ?? 0)
     : 0);
 
   function tabCount(tab: Tab): number | null {
@@ -104,6 +118,9 @@
   function eventTitle(current: TraceEvent): string {
     const named = payload.tool_name ?? payload.tool ?? payload.model ?? payload.operation ?? payload.action ?? payload.name ?? payload.task ?? payload.goal;
     if (typeof named === 'string' && named.trim()) return named;
+    // Adapter events keep the provider object under payload.native.
+    const nativeNamed = current.kind.startsWith('tool.') ? payloadTool(payload) : current.kind.startsWith('model.') ? payloadModel(payload) : null;
+    if (nativeNamed) return nativeNamed;
     return current.kind.replace(/[._-]+/g, ' ');
   }
 
@@ -296,8 +313,8 @@
     >
       {#if activeTab === 'overview'}
         {@const FamilyIcon = eventFamilyIcon(event)}
-        {@const modelProvider = typeof payload.provider === 'string' ? payload.provider : typeof payload.vendor === 'string' ? payload.vendor : null}
-        {@const modelName = typeof payload.model === 'string' ? payload.model : typeof payload.model_id === 'string' ? payload.model_id : null}
+        {@const modelProvider = payloadProvider(payload)}
+        {@const modelName = payloadModel(payload)}
         <section class="hero-summary" aria-label="Event summary">
           <div class="summary-heading">
             <span class="category-mark" data-category={eventFamily(event)}>
@@ -390,16 +407,17 @@
           {#if causalCount || relations?.children.length}
           <dl class="field-list causal-list">
             <div><dt>Event ID</dt><dd><code>{event.event_id}</code></dd></div>
-            {#if event.parent_event_id}
+            {#if relations?.parent.reference}
+              {@const parent = relations.parent}
               <div>
                 <dt>Parent event</dt>
                 <dd>
-                  {#if relations?.missingParent}
-                    <span class="missing-ref"><code>{event.parent_event_id}</code><em>not in journal</em></span>
+                  {#if !parent.found}
+                    <span class="missing-ref"><code>{parent.reference}</code><em>{parent.via === 'span' ? 'span not in journal' : 'not in journal'}</em></span>
                   {:else if onnavigate}
-                    <button class="evidence-link" onclick={() => openRelated(event.parent_event_id)}><code>{event.parent_event_id}</code><span>Open <ChevronRight size={14} aria-hidden="true" /></span></button>
+                    <button class="evidence-link" onclick={() => openRelated(parent.found!.event_id)}><code>{parent.found.event_id}</code><span>{parent.via === 'span' ? `${parent.found.kind} · via span ${parent.reference}` : 'Open'} <ChevronRight size={14} aria-hidden="true" /></span></button>
                   {:else}
-                    <code>{event.parent_event_id}</code>
+                    <code>{parent.found.event_id}</code>
                   {/if}
                 </dd>
               </div>
@@ -420,6 +438,15 @@
             {/if}
             {#each relations?.children ?? [] as child}
               <div><dt>Child event</dt><dd>{#if onnavigate}<button class="evidence-link" onclick={() => openRelated(child.event_id)}><code>{child.event_id}</code><span>{child.kind} <ChevronRight size={14} aria-hidden="true" /></span></button>{:else}<code>{child.event_id}</code>{/if}</dd></div>
+            {/each}
+            {#each correlated.slice(0, maxCorrelatedRows) as peer}
+              <div><dt>Correlated event</dt><dd>{#if onnavigate}<button class="evidence-link" onclick={() => openRelated(peer.event_id)}><code>{peer.event_id}</code><span>{peer.kind} <ChevronRight size={14} aria-hidden="true" /></span></button>{:else}<code>{peer.event_id}</code>{/if}</dd></div>
+            {/each}
+            {#if correlated.length > maxCorrelatedRows}
+              <div><dt>Correlated</dt><dd><span class="missing-ref">{correlated.length - maxCorrelatedRows} more share this correlation. Use Filter to list them all.</span></dd></div>
+            {/if}
+            {#each relations?.linkedFrom ?? [] as source}
+              <div><dt>Linked from</dt><dd>{#if onnavigate}<button class="evidence-link" onclick={() => openRelated(source.event_id)}><code>{source.event_id}</code><span>{source.kind} <ChevronRight size={14} aria-hidden="true" /></span></button>{:else}<code>{source.event_id}</code>{/if}</dd></div>
             {/each}
             {#each event.links as link}
               <div>

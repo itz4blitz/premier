@@ -1,4 +1,5 @@
 import { modelCallUsage } from './modelUsage';
+import { payloadTool } from './nativePayload';
 import { eventPayload, type TraceEvent } from './types';
 
 export type ComparisonStatus = 'added' | 'removed' | 'changed' | 'unchanged';
@@ -40,7 +41,7 @@ function clean(value: string): string {
 function payloadIdentity(event: TraceEvent): string {
   const payload = eventPayload(event);
   if (event.kind.startsWith('tool.')) {
-    const tool = payload.tool ?? payload.name ?? payload.command;
+    const tool = payload.tool ?? payload.name ?? payload.command ?? payloadTool(payload) ?? undefined;
     return tool === undefined ? '' : `:${clean(typeof tool === 'string' ? tool : JSON.stringify(tool))}`;
   }
   if (event.kind.startsWith('approval.')) {

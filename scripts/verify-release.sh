@@ -9,8 +9,8 @@ source "$ROOT/scripts/lib/distribution.sh"
 DIRECTORY="."
 CHECKSUMS="SHA256SUMS"
 BUNDLE="SHA256SUMS.sigstore.json"
-IDENTITY_REGEXP='^https://github\.com/PremierStudio/premier\.dev/\.github/workflows/release\.yml@refs/tags/v[0-9].*$'
-ISSUER='https://token.actions.githubusercontent.com'
+IDENTITY_REGEXP="$DISTRIBUTION_SIGNER_IDENTITY_REGEXP"
+ISSUER="$DISTRIBUTION_SIGNER_OIDC_ISSUER"
 
 usage() {
   echo "Usage: ./scripts/verify-release.sh [--directory PATH] [--checksums PATH] [--bundle PATH]"

@@ -51,7 +51,7 @@
   <div class="cause-row">
     <div class="cause-mark" data-confidence={summary.cause.confidence}><CircleAlert size={18} /></div>
     <div class="cause-copy">
-      <span>Likely cause <em>{summary.cause.confidence} confidence</em></span>
+      <span>{summary.cause.role === 'outcome' ? 'Outcome · cause not recorded' : 'Likely cause'} <em>{summary.cause.confidence} confidence</em></span>
       <strong>{summary.cause.title}</strong>
       <p>{summary.cause.detail}</p>
     </div>
@@ -160,6 +160,7 @@
   li button { width: 100%; min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; padding: 8px 10px; color: inherit; border: 0; background: transparent; text-align: left; cursor: pointer; }
   li button:hover { background: rgba(87,124,216,.09); }
   li i { display: grid; place-items: center; width: 18px; height: 18px; color: #7f91aa; border: 1px solid #2d394c; border-radius: 50%; font-size: 8px; font-style: normal; font-weight: 750; }
+  li[data-relation='outcome'] i { color: #f0c88a; border-color: rgba(240,185,104,.45); background: rgba(240,185,104,.1); }
   li[data-relation='cause'] i { color: #ff9a95; border-color: rgba(255,122,117,.45); background: rgba(255,122,117,.1); }
   li span { min-width: 0; display: grid; gap: 2px; }
   li strong, li small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

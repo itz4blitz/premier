@@ -35,10 +35,88 @@ if (isPremierActive()) {
     status: "ok",
     payload: { tool: "rg", query: "reconcileInvoice" },
   });
+  await premier.result("researcher", { outcome: "round before lock" });
 }
 ```
 
-When Premier is not recording, `emit` returns `null` unless `{ required: true }`.
+### Helpers
+
+Every helper takes `(actor, payload, extra?, options?)` and returns the stored
+event (or `null`). `extra` overrides the default `actor_type` / `status` and
+carries causality fields; `options` is the same object `emit` accepts.
+
+| Helper | Kind | Default `actor_type` / `status` |
+| --- | --- | --- |
+| `premier.delegation` | `agent.delegation` | `agent` / `running` |
+| `premier.spawn` | `agent.spawn` | `subagent` / `running` |
+| `premier.result` | `agent.result` | `subagent` / `ok` |
+| `premier.join` | `agent.join` | `agent` / `ok` |
+| `premier.message` | `agent.message` | `agent` / `ok` |
+| `premier.model` | `model.response` | `agent` / `ok` |
+| `premier.tool` | `tool.execution` | `agent` / `ok` |
+| `premier.approval` | `approval.request` | `agent` / `pending` |
+| `premier.approvalDecision` | `approval.decision` | `human` / `approved` |
+
+Close what you open: `spawn` with `result`, `delegation` with `join`, and
+`approval` with `approvalDecision` (pass `{ status: "denied" }` to refuse). Use
+`emit` directly for any other kind.
+
+### Causality
+
+Events are linked by `parent_event_id`, `span_id`, `parent_span_id`,
+`correlation_id`, and `links`, all passed through `extra`. `premier.childOf`
+derives the parent fields from an event you already emitted, and accepts the
+`null` returned when Premier is not recording:
+
+```ts
+const delegation = await premier.delegation(
+  "coordinator",
+  { delegates: ["researcher"] },
+  { span_id: "delegate", correlation_id: "workstream-repair" },
+);
+const spawned = await premier.spawn(
+  "researcher",
+  { task: "find the first divergence" },
+  premier.childOf(delegation, { span_id: "research" }),
+);
+// parent_event_id = spawned.event_id, parent_span_id = "research",
+// correlation_id = "workstream-repair"
+await premier.tool("researcher", { tool: "rg" }, premier.childOf(spawned));
+
+const request = await premier.approval(
+  "researcher",
+  { operation: "write", files: ["src/billing/ledger.ts"] },
+  premier.childOf(spawned, { span_id: "patch-approval" }),
+);
+await premier.approvalDecision("brad", { receipt: "apr_01J" }, premier.childOf(request));
+
+await premier.result("researcher", { outcome: "patched" }, premier.childOf(spawned));
+await premier.join("coordinator", { joined: ["researcher"] }, premier.childOf(delegation));
+```
+
+### Failure handling
+
+Telemetry never crashes or stalls your agent. `emit` and every helper return
+`null`, without throwing, when:
+
+- Premier is not recording (the collector env is absent);
+- the collector is unreachable or rejects the event (`401`, `400`, `500`, …);
+- the collector does not answer within `timeoutMs` (default 5000 ms).
+
+Delivery failures are passed to `onError(error, event)`. Without `onError`, the
+first failure in the process is reported once through `console.warn` and later
+ones are silent.
+
+```ts
+await premier.tool("coder", { tool: "rg" }, {}, {
+  timeoutMs: 1000, // 0 disables the timeout
+  signal: abortController.signal, // optional caller cancellation
+  onError: (error, event) => logger.debug({ error, kind: event.kind }, "premier emit failed"),
+});
+```
+
+Pass `{ required: true }` to throw in all of the cases above instead, for
+example in a test that asserts evidence was recorded.
 
 ## Premier Cloud
 
@@ -62,3 +140,7 @@ never ship it to a browser.
 ```sh
 premier emit --kind agent.spawn --actor researcher --status running
 ```
+
+`premier emit` and `sdk/shell/premier-emit.sh` exit non-zero when the collector
+is unreachable or rejects the event, wait at most `PREMIER_EMIT_TIMEOUT` seconds
+(default 10), and never send the collector token through `HTTP(S)_PROXY`.

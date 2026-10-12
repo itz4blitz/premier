@@ -95,6 +95,41 @@ assert_file "$PREFIX/bin/premier"
 grep -q -- '--certificate-identity-regexp' "$COSIGN_LOG" || fail "installer did not pin signer identity"
 grep -q -- '--certificate-oidc-issuer https://token.actions.githubusercontent.com' "$COSIGN_LOG" || fail "installer did not pin OIDC issuer"
 
+# The identity consumers pin must be the identity the release workflow signs
+# with; otherwise every official release fails verification. Derive the signer
+# from release.yml and match it against what each script hands to cosign.
+logged_identity_regexp() {
+  awk '{ for (i = 1; i < NF; i++) if ($i == "--certificate-identity-regexp") found = $(i + 1) } END { print found }' "$COSIGN_LOG"
+}
+assert_pins_release_signer() {
+  local who="$1" regexp
+  regexp="$(logged_identity_regexp)"
+  [[ -n "$regexp" ]] || fail "$who did not pass a signer identity to cosign"
+  [[ "$SIGNER_IDENTITY" =~ $regexp ]] || fail "$who pins $regexp, which rejects the release workflow identity $SIGNER_IDENTITY"
+  [[ ! "${SIGNER_IDENTITY/PremierStudio\/premier\//PremierStudio/premier.dev/}" =~ $regexp ]] || fail "$who accepts a signer from another repository"
+  [[ ! "${SIGNER_IDENTITY/refs\/tags\/v0.1.0/refs/heads/main}" =~ $regexp ]] || fail "$who accepts a signer from a branch build"
+}
+SIGNER_TEMPLATE="$(sed -n 's/.*--certificate-identity "\(https:[^"]*\)".*/\1/p' "$ROOT/.github/workflows/release.yml")"
+# shellcheck disable=SC2016 # the literal ${GITHUB_REF} placeholder in release.yml
+REF_PLACEHOLDER='${GITHUB_REF}'
+[[ "$SIGNER_TEMPLATE" == *"@$REF_PLACEHOLDER" ]] || fail "could not read the signer identity from release.yml: $SIGNER_TEMPLATE"
+SIGNER_IDENTITY="${SIGNER_TEMPLATE%"$REF_PLACEHOLDER"}refs/tags/v0.1.0"
+assert_pins_release_signer "install.sh"
+
+RELEASE_DIR="$WORK/release"
+mkdir -p "$RELEASE_DIR"
+cp "$ARCHIVE" "$RELEASE_DIR/"
+(cd "$RELEASE_DIR" && printf '%s  %s\n' "$(distribution_sha256 "$(basename "$ARCHIVE")")" "./$(basename "$ARCHIVE")" >SHA256SUMS)
+printf '%s\n' "$(distribution_sha256 "$RELEASE_DIR/SHA256SUMS")" >"$RELEASE_DIR/SHA256SUMS.sigstore.json"
+: >"$COSIGN_LOG"
+PATH="$FAKE_BIN:$PATH" "$ROOT/scripts/verify-release.sh" --directory "$RELEASE_DIR" >/dev/null || fail "verify-release rejected an intact release"
+assert_pins_release_signer "verify-release.sh"
+grep -q -- '--certificate-oidc-issuer https://token.actions.githubusercontent.com' "$COSIGN_LOG" || fail "verify-release did not pin OIDC issuer"
+printf 'tamper' >>"$RELEASE_DIR/$(basename "$ARCHIVE")"
+if PATH="$FAKE_BIN:$PATH" "$ROOT/scripts/verify-release.sh" --directory "$RELEASE_DIR" >/dev/null 2>&1; then
+  fail "verify-release accepted an asset that did not match the signed manifest"
+fi
+
 TAMPERED="$WORK/tampered.tar.gz"
 cp "$ARCHIVE" "$TAMPERED"
 printf 'tamper' >>"$TAMPERED"

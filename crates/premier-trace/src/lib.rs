@@ -284,6 +284,36 @@ pub struct RedactionProvenance {
     pub terminal_regex_count: usize,
 }
 
+/// Replacement written wherever redaction removes a value.
+const REDACTED: &str = "[REDACTED]";
+/// Longest unterminated line a [`TerminalRedactionBuffer`] holds back before
+/// it stops waiting for the line to end. Matches the native adapter line cap.
+const MAX_HELD_LINE_BYTES: usize = 256 * 1024;
+
+/// Field names (normalized: lowercase letters and digits only) whose values
+/// are secret. A key matches when it equals or ends with one of these names.
+/// This is the single list shared by record-time redaction, recorded command
+/// lines, and `premier export`.
+pub const DEFAULT_REDACTED_FIELDS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "clientsecret",
+    "apikey",
+    "accesstoken",
+    "refreshtoken",
+    "token",
+    "authorization",
+    "proxyauthorization",
+    "cookie",
+    "setcookie",
+    "secretaccesskey",
+    "privatekey",
+    "credential",
+    "credentials",
+    "bearer",
+];
+
 #[derive(Clone, Debug)]
 pub struct RedactionConfig {
     fields: HashSet<String>,
@@ -309,25 +339,10 @@ impl RedactionConfig {
         terminal_literals: impl IntoIterator<Item = impl Into<String>>,
         terminal_regexes: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self> {
-        let mut fields: HashSet<String> = [
-            "password",
-            "passwd",
-            "secret",
-            "clientsecret",
-            "apikey",
-            "accesstoken",
-            "refreshtoken",
-            "token",
-            "authorization",
-            "proxyauthorization",
-            "cookie",
-            "setcookie",
-            "secretaccesskey",
-            "privatekey",
-        ]
-        .into_iter()
-        .map(normalize_redaction_field)
-        .collect();
+        let mut fields: HashSet<String> = DEFAULT_REDACTED_FIELDS
+            .iter()
+            .map(normalize_redaction_field)
+            .collect();
         let mut custom_fields: Vec<String> = custom_fields
             .into_iter()
             .map(Into::into)
@@ -335,7 +350,14 @@ impl RedactionConfig {
             .collect();
         custom_fields.sort();
         custom_fields.dedup();
-        fields.extend(custom_fields.iter().map(normalize_redaction_field));
+        for field in &custom_fields {
+            let normalized = normalize_redaction_field(field);
+            // An empty name would suffix-match, and so erase, every field.
+            if normalized.is_empty() {
+                bail!("invalid redaction field name {field:?}: it must contain a letter or digit")
+            }
+            fields.insert(normalized);
+        }
         let terminal_literals = terminal_literals
             .into_iter()
             .map(Into::into)
@@ -366,21 +388,70 @@ impl RedactionConfig {
         }
     }
 
-    fn redact_event(&self, kind: &str, payload: &mut serde_json::Value) {
+    fn has_text_rules(&self) -> bool {
+        !self.terminal_literals.is_empty() || !self.terminal_regexes.is_empty()
+    }
+
+    fn redact_text(&self, text: &str) -> String {
+        let mut redacted = String::with_capacity(text.len());
+        let mut copied = 0;
+        for (start, end) in literal_spans(text, &self.terminal_literals) {
+            redacted.push_str(&text[copied..start]);
+            redacted.push_str(REDACTED);
+            copied = end;
+        }
+        redacted.push_str(&text[copied..]);
+        for pattern in &self.terminal_regexes {
+            redacted = pattern.replace_all(&redacted, REDACTED).into_owned();
+        }
+        redacted
+    }
+
+    /// Apply the literal and regex rules to every string value in `value`.
+    fn redact_strings(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = self.redact_text(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.redact_strings(item);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                for (_, child) in object {
+                    self.redact_strings(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Redact a recorded command line: values of secret-named flags,
+    /// assignments and headers, then the literal and regex rules.
+    fn redact_command(&self, command: &[String]) -> Vec<String> {
+        redact_command_fields(command, &|name| field_is_secret(name, &self.fields))
+            .iter()
+            .map(|argument| self.redact_text(argument))
+            .collect()
+    }
+
+    /// `native_stdout` marks a trace whose stdout is also normalized by a
+    /// native adapter, so its raw JSON lines carry the same structured fields.
+    fn redact_event(&self, kind: &str, payload: &mut serde_json::Value, native_stdout: bool) {
         redact_structured_fields(payload, &self.fields);
-        if matches!(
-            kind,
-            "process.stdout" | "process.stderr" | "process.terminal"
-        ) && let Some(text) = payload.get("text").and_then(serde_json::Value::as_str)
+        if kind == "session.start"
+            && let Some(command) = payload.get("command").and_then(string_items)
         {
-            let mut redacted = text.to_owned();
-            for literal in &self.terminal_literals {
-                redacted = redacted.replace(literal, "[REDACTED]");
-            }
-            for pattern in &self.terminal_regexes {
-                redacted = pattern.replace_all(&redacted, "[REDACTED]").into_owned();
-            }
+            payload["command"] = serde_json::json!(self.redact_command(&command));
+        }
+        if native_stdout
+            && kind == "process.stdout"
+            && let Some(text) = payload.get("text").and_then(serde_json::Value::as_str)
+            && let Some(redacted) = redact_structured_lines(text, &self.fields)
+        {
             payload["text"] = serde_json::Value::String(redacted);
+        }
+        if self.has_text_rules() {
+            self.redact_strings(payload);
         }
     }
 }
@@ -389,21 +460,209 @@ fn normalize_redaction_field(field: impl AsRef<str>) -> String {
     field
         .as_ref()
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn field_is_secret<'a>(name: &str, fields: impl IntoIterator<Item = &'a String>) -> bool {
+    let normalized = normalize_redaction_field(name);
+    fields
+        .into_iter()
+        .any(|sensitive| normalized == *sensitive || normalized.ends_with(sensitive.as_str()))
+}
+
+/// Whether a payload key, flag, or header name is secret under the default
+/// field list ([`DEFAULT_REDACTED_FIELDS`]).
+pub fn is_secret_field_name(name: &str) -> bool {
+    let normalized = normalize_redaction_field(name);
+    DEFAULT_REDACTED_FIELDS
+        .iter()
+        .any(|sensitive| normalized == *sensitive || normalized.ends_with(sensitive))
+}
+
+/// Redact secret values from an argument or header list using the default
+/// field list: `--api-key=VALUE`, `--token VALUE`, `API_KEY=VALUE` and
+/// `Authorization: VALUE`. Names and non-secret arguments are preserved.
+pub fn redact_command_secrets(command: &[String]) -> Vec<String> {
+    redact_command_fields(command, &is_secret_field_name)
+}
+
+fn redact_command_fields(command: &[String], is_secret: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let is_name = |name: &str| !name.contains(char::is_whitespace) && is_secret(name);
+    let mut value_follows = false;
+    command
+        .iter()
+        .map(|argument| {
+            // `--token VALUE`: the value is the next argument unless that is a flag.
+            if std::mem::take(&mut value_follows) && !argument.starts_with('-') {
+                return REDACTED.to_owned();
+            }
+            for separator in ['=', ':'] {
+                if let Some((name, value)) = argument.split_once(separator)
+                    && !value.trim().is_empty()
+                    && is_name(name)
+                {
+                    let space = if value.starts_with(' ') { " " } else { "" };
+                    return format!("{name}{separator}{space}{REDACTED}");
+                }
+            }
+            value_follows = argument.starts_with('-') && is_name(argument);
+            argument.clone()
+        })
+        .collect()
+}
+
+fn string_items(value: &serde_json::Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Redact secret fields inside JSON-object lines of raw terminal text. Lines
+/// that are not JSON objects, or contain no secret field, keep their exact
+/// bytes; `None` means nothing changed.
+fn redact_structured_lines(text: &str, fields: &HashSet<String>) -> Option<String> {
+    let mut changed = false;
+    let mut output = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let redacted = body
+            .trim_start()
+            .starts_with('{')
+            .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
+            .flatten()
+            .and_then(|original| {
+                let mut value = original.clone();
+                redact_structured_fields(&mut value, fields);
+                (value != original).then(|| value.to_string())
+            });
+        match redacted {
+            Some(redacted) => {
+                changed = true;
+                output.push_str(&redacted);
+                output.push_str(&line[body.len()..]);
+            }
+            None => output.push_str(line),
+        }
+    }
+    changed.then_some(output)
+}
+
+/// Carry-over buffer that keeps redaction correct when captured terminal
+/// output arrives in arbitrary chunks. It never rewrites text: it only delays
+/// it, releasing each piece at a point no literal rule can straddle (and, when
+/// regex or structured-line rules are active, only at line ends), so the
+/// per-event redaction in [`TraceWriter::append_input`] sees secrets whole.
+/// With no rules configured it is a pass-through.
+#[derive(Clone, Debug)]
+pub struct TerminalRedactionBuffer {
+    literals: Vec<String>,
+    hold_lines: bool,
+    held: String,
+    held_bytes: usize,
+}
+
+impl TerminalRedactionBuffer {
+    /// Add decoded text plus the number of captured bytes it accounts for.
+    /// Returns the text that is now safe to journal, with its byte length.
+    pub fn push(&mut self, text: &str, byte_length: usize) -> Option<(String, usize)> {
+        self.held.push_str(text);
+        self.held_bytes += byte_length;
+        let cut = self.safe_cut();
+        self.release(cut)
+    }
+
+    /// Release everything still held once the stream has ended.
+    pub fn finish(&mut self) -> Option<(String, usize)> {
+        self.release(self.held.len())
+    }
+
+    fn release(&mut self, cut: usize) -> Option<(String, usize)> {
+        if cut == 0 {
+            return None;
+        }
+        let rest = self.held.split_off(cut);
+        let text = std::mem::replace(&mut self.held, rest);
+        let byte_length = if self.held.is_empty() {
+            self.held_bytes
+        } else {
+            self.held_bytes.min(text.len())
+        };
+        self.held_bytes -= byte_length;
+        Some((text, byte_length))
+    }
+
+    fn safe_cut(&self) -> usize {
+        let text = self.held.as_str();
+        let within_bound = |cut: usize| text.len() - cut <= MAX_HELD_LINE_BYTES;
+        if self.hold_lines {
+            let line_end = text.rfind('\n').map_or(0, |index| index + 1);
+            let cut = self.literal_safe_cut(line_end);
+            if within_bound(cut) {
+                return cut;
+            }
+        }
+        // An over-long line is released rather than held without bound.
+        let cut = self.literal_safe_cut(text.len());
+        if within_bound(cut) { cut } else { text.len() }
+    }
+
+    /// Latest point at or before `limit` that no literal occurrence, complete
+    /// or still arriving, extends across.
+    fn literal_safe_cut(&self, limit: usize) -> usize {
+        let text = self.held.as_str();
+        let mut cut = limit;
+        for literal in &self.literals {
+            // A literal that could still be completed by later output.
+            let earliest = text.len().saturating_sub(literal.len() - 1);
+            if let Some(start) = (earliest..cut).find(|&start| {
+                text.is_char_boundary(start)
+                    && literal.as_bytes().starts_with(&text.as_bytes()[start..])
+            }) {
+                cut = start;
+            }
+        }
+        // A complete occurrence the cut would split in two.
+        literal_spans(text, &self.literals)
+            .into_iter()
+            .find(|(start, end)| *start < cut && cut < *end)
+            .map_or(cut, |(start, _)| start)
+    }
+}
+
+/// Byte ranges of `text` covered by an occurrence of any literal. Overlapping
+/// occurrences are merged, so the result does not depend on rule order and a
+/// range never ends inside a secret.
+fn literal_spans(text: &str, literals: &[String]) -> Vec<(usize, usize)> {
+    let mut occurrences = Vec::new();
+    for literal in literals {
+        let mut from = 0;
+        while let Some(found) = text[from..].find(literal.as_str()) {
+            let start = from + found;
+            occurrences.push((start, start + literal.len()));
+            from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    occurrences.sort_unstable();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in occurrences {
+        match spans.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => spans.push((start, end)),
+        }
+    }
+    spans
 }
 
 fn redact_structured_fields(value: &mut serde_json::Value, fields: &HashSet<String>) {
     match value {
         serde_json::Value::Object(object) => {
             for (key, child) in object {
-                let normalized = normalize_redaction_field(key);
-                if fields
-                    .iter()
-                    .any(|sensitive| normalized == *sensitive || normalized.ends_with(sensitive))
-                {
-                    *child = serde_json::Value::String("[REDACTED]".into());
+                if field_is_secret(key, fields) {
+                    *child = serde_json::Value::String(REDACTED.into());
                 } else {
                     redact_structured_fields(child, fields);
                 }
@@ -421,8 +680,14 @@ fn redact_structured_fields(value: &mut serde_json::Value, fields: &HashSet<Stri
 pub struct TraceWriter {
     root: PathBuf,
     manifest: TraceManifest,
-    journal: BufWriter<File>,
+    journal: File,
     sequence: u64,
+    /// Journal length after the last fully written frame.
+    committed_bytes: u64,
+    /// Set while the journal may hold bytes past `committed_bytes`.
+    dirty: bool,
+    /// Events lost to journal write failures; surfaced as a manifest diagnostic.
+    dropped_events: u64,
     redaction: RedactionConfig,
     encryption_key: Option<EncryptionKey>,
 }
@@ -505,7 +770,7 @@ impl TraceWriter {
             "causal-links".into(),
             "structured-redaction".into(),
         ];
-        if !redaction.terminal_literals.is_empty() || !redaction.terminal_regexes.is_empty() {
+        if redaction.has_text_rules() {
             capabilities.push("terminal-redaction".into());
         }
         let trace_id = Uuid::now_v7().to_string();
@@ -520,8 +785,10 @@ impl TraceWriter {
             format_version: FORMAT_VERSION,
             trace_id,
             tenant_id: tenant_id.to_owned(),
-            name: name.filter(|value| !value.trim().is_empty()),
-            command,
+            name: name
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| redaction.redact_text(&value)),
+            command: redaction.redact_command(&command),
             started_at: Utc::now(),
             ended_at: None,
             exit_code: None,
@@ -542,8 +809,11 @@ impl TraceWriter {
         Ok(Self {
             root,
             manifest,
-            journal: BufWriter::new(journal),
+            journal,
             sequence: 0,
+            committed_bytes: 0,
+            dirty: false,
+            dropped_events: 0,
             redaction,
             encryption_key,
         })
@@ -574,6 +844,20 @@ impl TraceWriter {
         write_manifest(&self.root, &self.manifest, self.encryption_key.as_ref())
     }
 
+    /// Carry-over buffer for one captured output stream of `kind`
+    /// (`process.stdout`, `process.stderr` or `process.terminal`). Feed it the
+    /// decoded chunks and journal what it releases, so the redaction rules
+    /// also catch secrets split across reads.
+    pub fn terminal_redaction_buffer(&self, kind: &str) -> TerminalRedactionBuffer {
+        TerminalRedactionBuffer {
+            literals: self.redaction.terminal_literals.clone(),
+            hold_lines: !self.redaction.terminal_regexes.is_empty()
+                || (kind == "process.stdout" && self.manifest.adapter.is_some()),
+            held: String::new(),
+            held_bytes: 0,
+        }
+    }
+
     pub fn append(
         &mut self,
         kind: &str,
@@ -592,7 +876,11 @@ impl TraceWriter {
         if input.kind.trim().is_empty() {
             bail!("event kind cannot be empty")
         }
-        self.redaction.redact_event(&input.kind, &mut input.payload);
+        self.redaction.redact_event(
+            &input.kind,
+            &mut input.payload,
+            self.manifest.adapter.is_some(),
+        );
         let timestamp = input
             .timestamp
             .as_deref()
@@ -618,15 +906,55 @@ impl TraceWriter {
             duration_ms: input.duration_ms,
             links: input.links,
         };
+        // Encode first so an oversized or unencryptable event never touches
+        // the journal, then commit the frame with a single write.
+        let mut frame = Vec::new();
         write_frame(
-            &mut self.journal,
+            &mut frame,
             &event,
             self.encryption_key.as_ref(),
             &self.manifest.trace_id,
         )?;
-        self.journal.flush()?;
+        if let Err(error) = self.commit_frame(&frame) {
+            self.dropped_events += 1;
+            return Err(error);
+        }
         self.sequence = event.sequence;
         Ok(event)
+    }
+
+    /// Append one encoded frame, or leave the journal exactly as it was. A
+    /// failed write (disk full, quota) is rolled back to the last complete
+    /// frame so later appends neither bury a torn frame nor reuse a sequence.
+    fn commit_frame(&mut self, frame: &[u8]) -> Result<()> {
+        self.restore_committed()?;
+        self.dirty = true;
+        if let Err(error) = self.journal.write_all(frame) {
+            // If the rollback fails too the writer stays dirty, and every
+            // later append or finish retries it before touching the journal.
+            let _ = self.restore_committed();
+            return Err(error).context("failed to write trace journal frame");
+        }
+        self.committed_bytes += frame.len() as u64;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn restore_committed(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.journal
+            .set_len(self.committed_bytes)
+            .and_then(|()| self.journal.seek(SeekFrom::Start(self.committed_bytes)))
+            .context("trace journal is unusable: cannot discard a partially written frame")?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Number of events that could not be journaled because a write failed.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events
     }
 
     pub fn finish(self, exit_code: i32) -> Result<TraceManifest> {
@@ -634,8 +962,8 @@ impl TraceWriter {
     }
 
     pub fn finish_termination(mut self, termination: ProcessTermination) -> Result<TraceManifest> {
-        self.journal.flush()?;
-        self.journal.get_ref().sync_all()?;
+        self.restore_committed()?;
+        self.journal.sync_all()?;
         drop(self.journal);
         finalize_active_journal(
             &self.root,
@@ -643,6 +971,7 @@ impl TraceWriter {
             self.sequence,
             termination,
             self.encryption_key.as_ref(),
+            self.dropped_events,
         )
     }
 }
@@ -752,6 +1081,7 @@ pub fn recover_interrupted_trace(
         events.len() as u64,
         ProcessTermination::interrupted(),
         encryption_key.as_ref(),
+        0,
     )
 }
 
@@ -761,6 +1091,7 @@ fn finalize_active_journal(
     event_count: u64,
     termination: ProcessTermination,
     encryption_key: Option<&EncryptionKey>,
+    dropped_events: u64,
 ) -> Result<TraceManifest> {
     let active = root.join("events").join(ACTIVE_JOURNAL);
     let final_path = root.join("events").join(FINAL_JOURNAL);
@@ -777,6 +1108,17 @@ fn finalize_active_journal(
         encryption_key,
         &manifest.trace_id,
     )?);
+    if dropped_events > 0 {
+        manifest.diagnostics.push(TraceDiagnostic {
+            severity: DiagnosticSeverity::Warning,
+            code: "journal.write_failed".into(),
+            message: format!(
+                "{dropped_events} event(s) were not recorded because the journal could not be written"
+            ),
+            event_id: None,
+            sequence: None,
+        });
+    }
     manifest.ended_at = Some(Utc::now());
     manifest.exit_code = Some(termination.shell_exit_code());
     manifest.termination = Some(termination);
@@ -795,15 +1137,20 @@ fn finalize_active_journal(
 }
 
 pub fn validate_events(events: &[TraceEvent]) -> Vec<TraceDiagnostic> {
-    const KNOWN: [&str; 10] = [
+    // The kinds first-party producers emit: the demo, the SDK helpers and the native adapters.
+    const KNOWN: [&str; 14] = [
         "agent.spawn",
+        "agent.turn",
         "agent.result",
         "agent.delegation",
         "agent.join",
+        "agent.message",
         "model.request",
         "model.response",
         "tool.invocation",
         "tool.result",
+        "tool.execution",
+        "tool.error",
         "approval.request",
         "approval.decision",
     ];
@@ -865,17 +1212,57 @@ pub fn validate_events(events: &[TraceEvent]) -> Vec<TraceDiagnostic> {
             ));
         }
     }
-    for (start, finish) in [
-        ("agent.spawn", "agent.result"),
-        ("model.request", "model.response"),
-        ("tool.invocation", "tool.result"),
-        ("approval.request", "approval.decision"),
-        ("agent.delegation", "agent.join"),
-    ] {
-        validate_pair(events, start, finish, &mut diagnostics);
+    for lifecycle in &LIFECYCLES {
+        validate_pair(events, lifecycle, &mut diagnostics);
     }
     diagnostics
 }
+
+struct Lifecycle {
+    starts: &'static [&'static str],
+    finish: &'static str,
+    /// Whether a finish with no recorded start is an evidence gap.
+    start_required: bool,
+    /// Whether a start that never finishes is an evidence gap.
+    finish_required: bool,
+}
+
+/// Lifecycles as first-party producers emit them. `model.response` and `tool.result` are also
+/// recorded as self-contained calls (like `tool.execution`), and an agent's `agent.spawn` or
+/// `agent.turn` may stay open or be closed by `agent.join`, so only the remaining directions
+/// count as incomplete.
+const LIFECYCLES: [Lifecycle; 5] = [
+    Lifecycle {
+        starts: &["agent.spawn", "agent.turn"],
+        finish: "agent.result",
+        start_required: true,
+        finish_required: false,
+    },
+    Lifecycle {
+        starts: &["model.request"],
+        finish: "model.response",
+        start_required: false,
+        finish_required: true,
+    },
+    Lifecycle {
+        starts: &["tool.invocation"],
+        finish: "tool.result",
+        start_required: false,
+        finish_required: true,
+    },
+    Lifecycle {
+        starts: &["approval.request"],
+        finish: "approval.decision",
+        start_required: true,
+        finish_required: true,
+    },
+    Lifecycle {
+        starts: &["agent.delegation"],
+        finish: "agent.join",
+        start_required: true,
+        finish_required: true,
+    },
+];
 
 fn diagnostic(event: &TraceEvent, code: &str, message: String) -> TraceDiagnostic {
     TraceDiagnostic {
@@ -889,13 +1276,14 @@ fn diagnostic(event: &TraceEvent, code: &str, message: String) -> TraceDiagnosti
 
 fn validate_pair(
     events: &[TraceEvent],
-    start_kind: &str,
-    finish_kind: &str,
+    lifecycle: &Lifecycle,
     diagnostics: &mut Vec<TraceDiagnostic>,
 ) {
+    let start_kind = lifecycle.starts[0];
+    let finish_kind = lifecycle.finish;
     let starts: Vec<_> = events
         .iter()
-        .filter(|event| event.kind == start_kind)
+        .filter(|event| lifecycle.starts.contains(&event.kind.as_str()))
         .collect();
     let finishes: Vec<_> = events
         .iter()
@@ -918,6 +1306,7 @@ fn validate_pair(
         }
     }
     let mut matched_starts = HashSet::new();
+    let mut matched_correlations = HashSet::new();
     for finish in finishes {
         let antecedent = if !finish.correlation_id.is_empty() {
             by_correlation.get(finish.correlation_id.as_str()).copied()
@@ -929,16 +1318,23 @@ fn validate_pair(
                 .copied()
         };
         let Some(start) = antecedent else {
-            diagnostics.push(diagnostic(
-                finish,
-                "missing_lifecycle_start",
-                format!("{finish_kind} has no matching {start_kind}"),
-            ));
+            if lifecycle.start_required {
+                diagnostics.push(diagnostic(
+                    finish,
+                    "missing_lifecycle_start",
+                    format!("{finish_kind} has no matching {start_kind}"),
+                ));
+            }
             continue;
         };
         matched_starts.insert(start.event_id.as_str());
+        if !start.correlation_id.is_empty() {
+            // Several records of one call (a hook and the call itself) share its correlation.
+            matched_correlations.insert(start.correlation_id.as_str());
+        }
         let causally_linked = finish.parent_event_id == start.event_id
             || finish.links.iter().any(|link| link == &start.event_id)
+            || (!finish.span_id.is_empty() && finish.span_id == start.span_id)
             || (!finish.parent_span_id.is_empty()
                 && (finish.parent_span_id == start.span_id
                     || finish.parent_span_id == start.parent_span_id))
@@ -951,12 +1347,17 @@ fn validate_pair(
             ));
         }
     }
+    if !lifecycle.finish_required {
+        return;
+    }
     for start in starts {
-        if !matched_starts.contains(start.event_id.as_str()) {
+        if !matched_starts.contains(start.event_id.as_str())
+            && !matched_correlations.contains(start.correlation_id.as_str())
+        {
             diagnostics.push(diagnostic(
                 start,
                 "missing_lifecycle_finish",
-                format!("{start_kind} has no matching {finish_kind}"),
+                format!("{} has no matching {finish_kind}", start.kind),
             ));
         }
     }
@@ -1328,6 +1729,10 @@ pub fn reencrypt_finalized_trace(
     if journal.path != format!("events/{FINAL_JOURNAL}") {
         bail!("trace uses a non-canonical journal path")
     }
+    // Re-sealing writes a fresh digest and count for whatever decoded, so a
+    // source that fails verification must never reach that step.
+    verify_journal_digest(root, &manifest)?;
+    verify_event_structure(&manifest, &events)?;
     ensure_no_unencrypted_auxiliary_files(root)?;
 
     let parent = root.parent().context("trace path has no parent")?;
@@ -1871,6 +2276,74 @@ mod tests {
     }
 
     #[test]
+    fn first_party_one_shot_kinds_are_clean_but_real_gaps_are_still_reported() {
+        let input = |kind: &str, status: &str, correlation: &str| EventInput {
+            kind: kind.into(),
+            actor_id: "researcher".into(),
+            correlation_id: correlation.into(),
+            status: status.into(),
+            payload: serde_json::json!({}),
+            ..EventInput::default()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let clean = temp.path().join("one-shot.atrace");
+        let mut writer = TraceWriter::create(&clean, vec!["agent".into()]).unwrap();
+        // What the README SDK example, the demo and the adapters emit without a counterpart.
+        for (kind, status, correlation) in [
+            ("agent.spawn", "running", ""),
+            ("agent.turn", "running", ""),
+            ("model.response", "ok", ""),
+            ("tool.execution", "ok", ""),
+            ("tool.error", "error", ""),
+            ("agent.message", "ok", ""),
+            ("tool.result", "ok", "call-1"),
+            ("tool.invocation", "running", "call-2"),
+            ("tool.invocation", "running", "call-2"),
+            ("tool.result", "error", "call-2"),
+        ] {
+            writer
+                .append_input(input(kind, status, correlation))
+                .unwrap();
+        }
+        let manifest = writer.finish(0).unwrap();
+        assert!(
+            manifest.diagnostics.is_empty(),
+            "{:?}",
+            manifest.diagnostics
+        );
+
+        let gaps = temp.path().join("gaps.atrace");
+        let mut writer = TraceWriter::create(&gaps, vec!["agent".into()]).unwrap();
+        for (kind, status, correlation) in [
+            ("tool.invocation", "running", "call-3"),
+            ("model.request", "running", "turn-1"),
+            ("approval.decision", "approved", "approval-1"),
+            ("agent.result", "ok", "session-1"),
+            ("tool.execution", "mystery", ""),
+        ] {
+            writer
+                .append_input(input(kind, status, correlation))
+                .unwrap();
+        }
+        let manifest = writer.finish(0).unwrap();
+        let found: Vec<_> = manifest
+            .diagnostics
+            .iter()
+            .map(|item| (item.code.as_str(), item.sequence.unwrap()))
+            .collect();
+        assert_eq!(found.len(), 5, "{found:?}");
+        for expected in [
+            ("missing_lifecycle_finish", 1),
+            ("missing_lifecycle_finish", 2),
+            ("missing_lifecycle_start", 3),
+            ("missing_lifecycle_start", 4),
+            ("invalid_status", 5),
+        ] {
+            assert!(found.contains(&expected), "{expected:?} not in {found:?}");
+        }
+    }
+
+    #[test]
     fn paginated_event_reads_are_sequence_based_and_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("page.atrace");
@@ -2066,6 +2539,56 @@ mod tests {
     }
 
     #[test]
+    fn failed_append_rolls_back_so_later_appends_stay_contiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("failed-append.atrace");
+        let active = root.join("events").join(ACTIVE_JOURNAL);
+        let mut writer = TraceWriter::create(&root, vec!["agent".into()]).unwrap();
+        writer
+            .append("first", "test", serde_json::json!({}))
+            .unwrap();
+        let committed = fs::metadata(&active).unwrap().len();
+
+        // A read-only handle fails both the write and the rollback, like a
+        // journal that became unwritable mid-run.
+        let writable = std::mem::replace(&mut writer.journal, File::open(&active).unwrap());
+        for _ in 0..2 {
+            let error = writer
+                .append("lost", "test", serde_json::json!({}))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("trace journal"), "{error:#}");
+        }
+        assert_eq!(fs::metadata(&active).unwrap().len(), committed);
+
+        // Once the journal is writable again a torn frame left by the failed
+        // write is discarded before the next frame is appended.
+        writer.journal = writable;
+        writer.journal.write_all(&[0xff, 0xff, 0x00]).unwrap();
+        writer.dirty = true;
+        let second = writer
+            .append("second", "test", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(second.sequence, 2);
+        assert_eq!(writer.dropped_events(), 2);
+
+        let manifest = writer.finish(0).unwrap();
+        assert_eq!(manifest.journal.as_ref().unwrap().event_count, 2);
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "journal.write_failed")
+        );
+        verify(&root).unwrap();
+        let kinds: Vec<_> = read_events(&root)
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.sequence, event.kind))
+            .collect();
+        assert_eq!(kinds, [(1, "first".into()), (2, "second".into())]);
+    }
+
+    #[test]
     fn encrypted_truncation_is_detected_even_when_the_public_manifest_is_rewritten() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("truncated.atrace");
@@ -2225,6 +2748,330 @@ mod tests {
         let manifest_text = fs::read_to_string(protected_root.join("manifest.json")).unwrap();
         assert!(!manifest_text.contains("literal-secret"));
         assert!(!manifest_text.contains("token=[A-Za-z0-9-]+"));
+    }
+
+    fn text_rules(literals: &[&str], regexes: &[&str]) -> RedactionConfig {
+        RedactionConfig::new(
+            std::iter::empty::<String>(),
+            literals.iter().copied(),
+            regexes.iter().copied(),
+        )
+        .unwrap()
+    }
+
+    /// Journal `chunks` the way the recorder does and return the stored text.
+    fn journal_chunks(redaction: RedactionConfig, kind: &str, chunks: &[&str]) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("chunks.atrace");
+        let mut writer = TraceWriter::create_named_with_redaction(
+            &root,
+            vec!["command".into()],
+            None,
+            redaction,
+        )
+        .unwrap();
+        let mut buffer = writer.terminal_redaction_buffer(kind);
+        let mut released = Vec::new();
+        for chunk in chunks {
+            released.extend(buffer.push(chunk, chunk.len()));
+        }
+        released.extend(buffer.finish());
+        let total: usize = released.iter().map(|(_, bytes)| bytes).sum();
+        assert_eq!(total, chunks.iter().map(|chunk| chunk.len()).sum::<usize>());
+        for (text, byte_length) in released {
+            writer
+                .append(
+                    kind,
+                    "command",
+                    serde_json::json!({"text": text, "byte_length": byte_length}),
+                )
+                .unwrap();
+        }
+        writer.finish(0).unwrap();
+        read_events(&root)
+            .unwrap()
+            .iter()
+            .map(|event| event.payload()["text"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn terminal_rules_redact_secrets_split_across_chunks() {
+        let rules = || text_rules(&["SUPERSECRETVALUE"], &["sk-[a-z0-9]+"]);
+        assert_eq!(
+            journal_chunks(
+                rules(),
+                "process.stdout",
+                &[
+                    "SUPERSECRET",
+                    "VALUE\nsk-abc",
+                    "def123\nSUPERSEC",
+                    "RET",
+                    "VALUE sk-",
+                    "zz9\n"
+                ]
+            ),
+            "[REDACTED]\n[REDACTED]\n[REDACTED] [REDACTED]\n"
+        );
+        // An unfinished prefix is not a secret and is flushed at stream end.
+        assert_eq!(
+            journal_chunks(rules(), "process.stderr", &["ok SUPERSEC"]),
+            "ok SUPERSEC"
+        );
+        // Overlapping literals are redacted as one span however they arrive.
+        assert_eq!(
+            journal_chunks(
+                text_rules(&["abc", "cde"], &[]),
+                "process.stdout",
+                &["xabc", "de!"]
+            ),
+            "x[REDACTED]!"
+        );
+        assert_eq!(
+            journal_chunks(
+                text_rules(&["pässwört"], &[]),
+                "process.terminal",
+                &["a pä", "sswö", "rt b"]
+            ),
+            "a [REDACTED] b"
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_only_holds_back_what_a_rule_could_still_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = TraceWriter::create(temp.path().join("plain.atrace"), vec![]).unwrap();
+        let mut buffer = plain.terminal_redaction_buffer("process.stdout");
+        assert_eq!(buffer.push("partial", 7), Some(("partial".into(), 7)));
+        assert_eq!(buffer.push("", 2), None);
+        assert_eq!(buffer.finish(), None);
+
+        let literal = TraceWriter::create_named_with_redaction(
+            temp.path().join("literal.atrace"),
+            vec![],
+            None,
+            text_rules(&["hunter2"], &[]),
+        )
+        .unwrap();
+        let mut buffer = literal.terminal_redaction_buffer("process.stdout");
+        assert_eq!(buffer.push("prompt> hun", 11), Some(("prompt> ".into(), 8)));
+        assert_eq!(buffer.push("gry\n", 4), Some(("hungry\n".into(), 7)));
+
+        let regex = TraceWriter::create_named_with_redaction(
+            temp.path().join("regex.atrace"),
+            vec![],
+            None,
+            text_rules(&[], &["x+"]),
+        )
+        .unwrap();
+        let mut buffer = regex.terminal_redaction_buffer("process.stdout");
+        assert_eq!(buffer.push("one\ntwo", 7), Some(("one\n".into(), 4)));
+        // A line that never ends is eventually released instead of growing.
+        let long = "y".repeat(MAX_HELD_LINE_BYTES);
+        let (text, _) = buffer.push(&long, long.len()).unwrap();
+        assert_eq!(text.len(), MAX_HELD_LINE_BYTES + 3);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn chunked_terminal_redaction_matches_unchunked(
+            pieces in proptest::collection::vec("(ab|abc|cab|b|c|x|\n){0,6}", 0..8)
+        ) {
+            let chunks: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            let whole = pieces.concat();
+            let rules = || text_rules(&["abc", "cab", "bb"], &[]);
+            proptest::prop_assert_eq!(
+                journal_chunks(rules(), "process.stdout", &chunks),
+                journal_chunks(rules(), "process.stdout", &[whole.as_str()])
+            );
+        }
+    }
+
+    #[test]
+    fn text_rules_apply_to_every_string_of_every_event_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("payloads.atrace");
+        let mut writer = TraceWriter::create_named_with_redaction(
+            &root,
+            vec!["agent".into()],
+            None,
+            text_rules(&["LITERAL-SECRET"], &["id-[0-9]+"]),
+        )
+        .unwrap();
+        writer
+            .append(
+                "provider.event",
+                "adapter.claude.v1",
+                serde_json::json!({
+                    "native": {"result": "used LITERAL-SECRET", "items": ["id-42", {"note": "LITERAL-SECRET id-7"}]},
+                    "count": 3
+                }),
+            )
+            .unwrap();
+        writer.finish(0).unwrap();
+        let payload = read_events(&root).unwrap()[0].payload();
+        assert_eq!(payload["native"]["result"], "used [REDACTED]");
+        assert_eq!(payload["native"]["items"][0], "[REDACTED]");
+        assert_eq!(
+            payload["native"]["items"][1]["note"],
+            "[REDACTED] [REDACTED]"
+        );
+        assert_eq!(payload["count"], 3);
+    }
+
+    #[test]
+    fn adapter_traces_redact_secret_fields_in_the_raw_stdout_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("native.atrace");
+        let mut writer = TraceWriter::create(&root, vec!["agent".into()]).unwrap();
+        let line = r#"{"type":"tool_use","input":{"api_key":"sk-RAW","region":"eu"}}"#;
+        let untouched = "{\"type\": \"init\"}\r\nplain text token=visible\n";
+        let text = format!("{untouched}{line}\r\n");
+        // Without an adapter, terminal text stays raw.
+        writer
+            .append(
+                "process.stdout",
+                "command",
+                serde_json::json!({"text": text}),
+            )
+            .unwrap();
+        writer
+            .set_adapter(AdapterProvenance {
+                provider: "claude".into(),
+                schema_version: 1,
+                transport: "stdout-jsonl".into(),
+                completeness: "provider-native-best-effort".into(),
+            })
+            .unwrap();
+        writer
+            .append(
+                "process.stdout",
+                "command",
+                serde_json::json!({"text": text}),
+            )
+            .unwrap();
+        writer.finish(0).unwrap();
+        let events = read_events(&root).unwrap();
+        assert_eq!(events[0].payload()["text"], text);
+        assert_eq!(
+            events[1].payload()["text"],
+            format!(
+                "{untouched}{}\r\n",
+                r#"{"input":{"api_key":"[REDACTED]","region":"eu"},"type":"tool_use"}"#
+            )
+        );
+    }
+
+    #[test]
+    fn custom_field_names_that_normalize_to_nothing_are_rejected() {
+        for name in ["---", "@@@", "_ _"] {
+            let error = RedactionConfig::new(
+                [name],
+                std::iter::empty::<String>(),
+                std::iter::empty::<String>(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("redaction field"), "{error}");
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("unicode-field.atrace");
+        let redaction = RedactionConfig::new(
+            ["密码"],
+            std::iter::empty::<String>(),
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+        let mut writer =
+            TraceWriter::create_named_with_redaction(&root, vec!["agent".into()], None, redaction)
+                .unwrap();
+        writer
+            .append(
+                "tool.execution",
+                "sdk",
+                serde_json::json!({"密码": "hunter2", "user_密码": "hunter3", "safe": "keep me"}),
+            )
+            .unwrap();
+        writer.finish(0).unwrap();
+        let payload = read_events(&root).unwrap()[0].payload();
+        assert_eq!(payload["密码"], "[REDACTED]");
+        assert_eq!(payload["user_密码"], "[REDACTED]");
+        assert_eq!(payload["safe"], "keep me");
+    }
+
+    #[test]
+    fn recorded_command_and_name_are_redacted_in_the_manifest_and_session_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("argv.atrace");
+        let command: Vec<String> = [
+            "agent",
+            "--api-key=sk-KEYED",
+            "--token",
+            "tok-SEPARATE",
+            "--password",
+            "--verbose",
+            "OPENAI_API_KEY=sk-ENV",
+            "-H",
+            "Authorization: Bearer hdr-SECRET",
+            "--header=X-Api-Key:hdr-TIGHT",
+            "--max-tokens",
+            "4096",
+            "https://example.test/path",
+            "say LITERAL-SECRET",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let expected = [
+            "agent",
+            "--api-key=[REDACTED]",
+            "--token",
+            "[REDACTED]",
+            "--password",
+            "--verbose",
+            "OPENAI_API_KEY=[REDACTED]",
+            "-H",
+            "Authorization: [REDACTED]",
+            "--header=X-Api-Key:[REDACTED]",
+            "--max-tokens",
+            "4096",
+            "https://example.test/path",
+            "say [REDACTED]",
+        ];
+        let mut writer = TraceWriter::create_named_with_redaction(
+            &root,
+            command.clone(),
+            Some("run LITERAL-SECRET".into()),
+            text_rules(&["LITERAL-SECRET"], &[]),
+        )
+        .unwrap();
+        writer
+            .append(
+                "session.start",
+                "premier",
+                serde_json::json!({"command": command, "cwd": "/work"}),
+            )
+            .unwrap();
+        let manifest = writer.finish(0).unwrap();
+        assert_eq!(manifest.command, expected);
+        assert_eq!(manifest.name.as_deref(), Some("run [REDACTED]"));
+        let manifest_text = fs::read_to_string(root.join("manifest.json")).unwrap();
+        for secret in [
+            "sk-KEYED",
+            "tok-SEPARATE",
+            "sk-ENV",
+            "hdr-SECRET",
+            "hdr-TIGHT",
+        ] {
+            assert!(!manifest_text.contains(secret), "{secret} persisted");
+        }
+        let payload = read_events(&root).unwrap()[0].payload();
+        assert_eq!(payload["command"], serde_json::json!(expected));
+        assert_eq!(payload["cwd"], "/work");
+        assert_eq!(
+            redact_command_secrets(&command)[..13],
+            expected[..13],
+            "default field list covers the same flags without custom rules"
+        );
     }
 
     #[test]

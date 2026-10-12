@@ -160,3 +160,25 @@ describe('architecture inference', () => {
     expect(segments[1]).toMatchObject({ startMs: 5_000, endMs: 5_100 });
   });
 });
+
+function largeJournal(count: number): TraceEvent[] {
+  const origin = Date.parse('2026-07-13T12:00:00.000Z');
+  return Array.from({ length: count }, (_, index) => ({
+    event_id: `big-${index}`, trace_id: 'big', sequence: index + 1,
+    timestamp: new Date(origin + index * 10).toISOString(), kind: 'process.stdout', source: 'recorder', payload_json: '{"text":"x"}',
+    actor_id: index % 2 ? 'worker' : 'root', actor_type: 'process', parent_event_id: '', span_id: '', parent_span_id: '',
+    correlation_id: '', status: 'ok', duration_ms: index === count - 1 ? 500 : 0, links: []
+  }));
+}
+
+it('infers architecture for journals larger than the argument-spread limit', () => {
+  // Math.min(...values) throws a RangeError above roughly 125k arguments.
+  const journal = largeJournal(140_000);
+  const model = inferArchitecture(journal);
+  expect(model.scope.eventCount).toBe(140_000);
+  expect(model.actors.map((actor) => actor.id).sort()).toEqual(['root', 'worker']);
+  const origin = Date.parse('2026-07-13T12:00:00.000Z');
+  expect(model.scope.startMs).toBe(origin);
+  expect(model.scope.endMs).toBe(origin + 139_999 * 10 + 500);
+  expect(model.actors.find((actor) => actor.id === 'worker')?.window?.endMs).toBe(origin + 139_999 * 10 + 500);
+}, 60_000);
