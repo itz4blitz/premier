@@ -109,17 +109,14 @@ fn idle_time(path: &Path) -> Option<Duration> {
 /// while the recorder runs, otherwise `abandoned` with the recover command.
 pub fn unfinalized_integrity(trace: &Path, manifest: &TraceManifest) -> Option<IntegrityReport> {
     Some(match unfinalized_state(trace, manifest)? {
-        UnfinalizedState::Recording => IntegrityReport {
-            status: IntegrityStatus::Live,
-            detail: None,
-        },
-        state @ UnfinalizedState::Abandoned { .. } => IntegrityReport {
-            status: IntegrityStatus::Abandoned,
-            detail: Some(format!(
+        UnfinalizedState::Recording => IntegrityReport::new(IntegrityStatus::Live, None),
+        state @ UnfinalizedState::Abandoned { .. } => IntegrityReport::new(
+            IntegrityStatus::Abandoned,
+            Some(format!(
                 "The recorder is no longer running. Run `{}` to finalize this trace.",
                 state.recover_command(trace)
             )),
-        },
+        ),
     })
 }
 

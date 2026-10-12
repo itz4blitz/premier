@@ -6,6 +6,17 @@ export interface JournalFile {
 
 /** `abandoned`: no finalized journal and the recorder is gone; `premier recover` finalizes it. */
 export type IntegrityStatus = 'live' | 'abandoned' | 'verified' | 'invalid';
+/** What a verified trace is protected by. Only `signed` resists a deliberate rewrite. */
+export type IntegrityProtection = 'digest_only' | 'sealed' | 'signed';
+
+/** Format v2 tamper evidence recorded in the manifest at finalization. */
+export interface ManifestSeal {
+  chain_head: string;
+  event_count: number;
+  recovered?: boolean;
+  digest: string;
+  signature?: { algorithm: string; public_key: string; signature: string };
+}
 
 export interface ProcessTermination {
   kind: 'exit' | 'signal' | 'interrupted';
@@ -38,6 +49,10 @@ export interface TraceManifest {
   artifact?: string;
   integrity?: IntegrityStatus;
   integrity_detail?: string | null;
+  integrity_protection?: IntegrityProtection;
+  /** Fingerprint of the signing key stored in the trace; identifies the signer without vouching for it. */
+  integrity_signer?: string;
+  seal?: ManifestSeal;
   /** Structured recorder termination metadata (available on newer artifacts). */
   termination?: ProcessTermination;
   /** Advisory semantic validation findings; unknown/custom event kinds remain valid. */
@@ -68,6 +83,8 @@ export interface TraceEvent {
   status: string;
   duration_ms: number;
   links: string[];
+  /** Hash of the previous event's canonical bytes (format v2). */
+  prev_hash?: string;
 }
 
 /**

@@ -377,7 +377,11 @@ fn records_and_verifies_a_real_command() {
         "{}",
         String::from_utf8_lossy(&verified.stderr)
     );
-    assert!(String::from_utf8_lossy(&verified.stdout).contains("verified"));
+    // No signing key was configured, so the trace is only self-consistent.
+    assert!(
+        String::from_utf8_lossy(&verified.stdout)
+            .contains("consistent: chain and seal valid, unsigned")
+    );
 }
 
 #[test]

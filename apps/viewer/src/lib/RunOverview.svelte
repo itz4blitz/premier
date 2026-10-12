@@ -1,6 +1,6 @@
 <script lang="ts">
   import { isAbandoned, type TraceEvent, type TraceManifest } from './types';
-  import { actorInventory, countByCategory, runHealth } from './analysis';
+  import { actorInventory, countByCategory, integrityProtectionLabel, runHealth } from './analysis';
 
   let { trace, events, compact = false }: {
     trace: TraceManifest;
@@ -20,7 +20,7 @@
   );
   let evidenceLabel = $derived(errors ? `${errors} issue${errors === 1 ? '' : 's'}` : `${events.length} event${events.length === 1 ? '' : 's'}`);
   let evidenceDetail = $derived(
-    `${events.length} captured · ${models} model${models === 1 ? '' : 's'} · ${tools} tool${tools === 1 ? '' : 's'}${trace.integrity === 'verified' ? ' · verified' : trace.integrity === 'invalid' ? ' · integrity failed' : trace.integrity === 'abandoned' ? ' · abandoned' : trace.integrity === 'live' ? ' · live' : ''}`
+    `${events.length} captured · ${models} model${models === 1 ? '' : 's'} · ${tools} tool${tools === 1 ? '' : 's'}${trace.integrity === 'verified' ? ` · ${integrityProtectionLabel(trace)}` : trace.integrity === 'invalid' ? ' · integrity failed' : trace.integrity === 'abandoned' ? ' · abandoned' : trace.integrity === 'live' ? ' · live' : ''}`
   );
   let abandoned = $derived(isAbandoned(trace));
   let abandonedDetail = $derived(trace.integrity_detail?.trim() || 'The recorder stopped before finalizing this trace. Run premier recover to finalize it.');

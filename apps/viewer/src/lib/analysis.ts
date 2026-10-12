@@ -154,6 +154,14 @@ export function actorInventory(events: TraceEvent[]): ActorInventory {
   return inventory;
 }
 
+/** How a trace that passed verification is protected. An unsigned trace is never presented as proof. */
+export function integrityProtectionLabel(trace: TraceManifest): string {
+  if (trace.integrity_protection === 'signed') return trace.integrity_signer ? `signed by ${trace.integrity_signer}` : 'signed';
+  if (trace.integrity_protection === 'sealed') return 'unsigned, self-consistent only';
+  if (trace.integrity_protection === 'digest_only') return 'unsigned, v1 digest only';
+  return 'integrity verified';
+}
+
 export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth {
   if (trace.integrity === 'invalid') {
     return {
@@ -186,7 +194,7 @@ export function runHealth(trace: TraceManifest, events: TraceEvent[]): RunHealth
   if (errorCount) return { label: 'Needs attention', tone: 'warning', detail: `${errorCount} recorded error${errorCount === 1 ? '' : 's'} despite a clean exit` };
   if (pendingCount) return { label: 'Awaiting approval', tone: 'warning', detail: `${pendingCount} pending decision${pendingCount === 1 ? '' : 's'}` };
   if (trace.ended_at === null || trace.integrity === 'live') return { label: 'Running', tone: 'running', detail: 'Trace is still receiving evidence' };
-  const verified = trace.integrity === 'verified' ? ' · integrity verified' : '';
+  const verified = trace.integrity === 'verified' ? ` · ${integrityProtectionLabel(trace)}` : '';
   return { label: 'Passed', tone: 'success', detail: `Clean exit with no recorded errors${verified}` };
 }
 

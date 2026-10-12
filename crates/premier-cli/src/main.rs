@@ -14,7 +14,7 @@ use premier_cli::{
 use premier_trace::{
     EventInput, ProcessTermination, RECORDER_LEASE, RecoveryOptions, RedactionConfig,
     TerminationKind, TraceWriter, decode_utf8_chunk, finish_utf8, prepare_trace_output,
-    read_events, read_manifest, recover_interrupted_trace, verify,
+    read_events, read_manifest, recover_interrupted_trace, verify, verify_trace,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -99,6 +99,10 @@ enum Commands {
         /// --redact-regex rule matches.
         #[arg(long)]
         redact_known_secrets: bool,
+        /// Ed25519 private key file (from `premier keygen`) used to sign the
+        /// trace when it is finalized.
+        #[arg(long, value_name = "PATH", env = premier_trace::SIGN_KEY_FILE_ENV)]
+        sign_key: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -133,8 +137,27 @@ enum Commands {
         #[arg(long, default_value = "premier-emit")]
         source: String,
     },
-    /// Verify a finalized trace's digest, framing, event count, and identity.
-    Verify { trace: PathBuf },
+    /// Verify a finalized trace's digest, event chain, manifest seal, and signature.
+    /// Without a signature a trace is only internally consistent (docs/trace-format.md).
+    Verify {
+        trace: PathBuf,
+        /// Require a valid signature by this Ed25519 public key (64 hex
+        /// characters, or a file containing them).
+        #[arg(long, value_name = "PATH-OR-HEX")]
+        public_key: Option<String>,
+    },
+    /// Generate an Ed25519 signing key: writes the private key (mode 0600) and
+    /// `<output>.pub`, and prints the public key.
+    Keygen {
+        /// Private key file to create. Must not already exist.
+        output: PathBuf,
+    },
+    /// Sign (or re-sign) the manifest seal of an already finalized trace.
+    Sign {
+        trace: PathBuf,
+        #[arg(long, value_name = "PATH", env = premier_trace::SIGN_KEY_FILE_ENV)]
+        sign_key: PathBuf,
+    },
     /// Safely finalize an abandoned active trace, discarding only a torn trailing frame.
     Recover {
         trace: PathBuf,
@@ -156,6 +179,9 @@ enum Commands {
         trace: PathBuf,
         #[arg(long, value_name = "PATH")]
         new_key_file: PathBuf,
+        /// Re-sign the re-sealed trace. Without a key an existing signature is dropped.
+        #[arg(long, value_name = "PATH", env = premier_trace::SIGN_KEY_FILE_ENV)]
+        sign_key: Option<PathBuf>,
     },
     /// Filter local trace evidence without starting the viewer.
     Query {
@@ -293,11 +319,13 @@ async fn main() -> Result<()> {
             redact_regexes,
             no_default_secret_patterns,
             redact_known_secrets,
+            sign_key,
             command,
         } => {
             let redaction = RedactionConfig::new(redact_fields, redact_literals, redact_regexes)?
                 .default_secret_patterns(!no_default_secret_patterns)
                 .known_secrets_in_terminal(redact_known_secrets);
+            let sign_key = load_signing_key(sign_key.as_deref())?;
             record(RecordOptions {
                 output,
                 name,
@@ -309,6 +337,7 @@ async fn main() -> Result<()> {
                 viewer_dir,
                 bind,
                 redaction,
+                sign_key,
             })
             .await
         }
@@ -337,19 +366,26 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Commands::Verify { trace } => {
+        Commands::Verify { trace, public_key } => {
             if let Ok(manifest) = read_manifest(&trace)
                 && let Some(state) = unfinalized_state(&trace, &manifest)
             {
                 bail!("trace is not finalized ({})", state.describe(&trace))
             }
-            let mut manifest = verify(&trace)?;
+            let trusted_key = public_key
+                .as_deref()
+                .map(premier_trace::PublicKey::from_hex_or_file)
+                .transpose()?;
+            let verified = verify_trace(&trace, trusted_key.as_ref())
+                .with_context(|| format!("invalid: {} failed verification", trace.display()))?;
+            let (outcome, note) = verification_outcome(&verified);
+            let mut manifest = verified.manifest;
             if manifest.diagnostics.is_empty() {
                 manifest.diagnostics =
                     premier_trace::validate_events(&premier_trace::read_events(&trace)?);
             }
             println!(
-                "verified {} ({} events, {} semantic diagnostics)",
+                "{outcome} {} ({} events, {} semantic diagnostics)",
                 manifest.trace_id,
                 manifest
                     .journal
@@ -357,6 +393,9 @@ async fn main() -> Result<()> {
                     .map_or(0, |journal| journal.event_count),
                 manifest.diagnostics.len(),
             );
+            if let Some(note) = note {
+                println!("note: {note}");
+            }
             for diagnostic in &manifest.diagnostics {
                 println!(
                     "warning {} at sequence {}: {}",
@@ -403,21 +442,43 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Commands::Keygen { output } => keygen(&output),
+        Commands::Sign { trace, sign_key } => {
+            let key = premier_trace::SigningKey::from_file(&sign_key)
+                .with_context(|| format!("cannot load signing key {}", sign_key.display()))?;
+            let manifest = premier_trace::sign_finalized_trace(&trace, &key)?;
+            println!(
+                "signed {} with key {}",
+                manifest.trace_id,
+                key.public_key().fingerprint()
+            );
+            Ok(())
+        }
         Commands::Claim { trace, tenant } => {
+            let was_signed = is_signed(read_manifest(&trace).ok().as_ref());
             let manifest = premier_trace::claim_local_trace(&trace, &tenant)?;
             println!(
                 "claimed {} for tenant {}",
                 manifest.trace_id, manifest.tenant_id
             );
+            report_resealed_signature(was_signed, &manifest);
             Ok(())
         }
         Commands::Encrypt {
             trace,
             new_key_file,
+            sign_key,
         } => {
             let key = premier_trace::EncryptionKey::from_file(&new_key_file)?;
-            let manifest = premier_trace::reencrypt_finalized_trace(&trace, key)?;
+            let sign_key = load_signing_key(sign_key.as_deref())?;
+            let was_signed = is_signed(read_manifest(&trace).ok().as_ref());
+            let manifest = premier_trace::reencrypt_finalized_trace_with_signing_key(
+                &trace,
+                key,
+                sign_key.as_ref(),
+            )?;
             println!("encrypted {} ({})", manifest.trace_id, trace.display());
+            report_resealed_signature(was_signed, &manifest);
             Ok(())
         }
         Commands::Query {
@@ -547,6 +608,98 @@ fn single_trace_scope(trace: &std::path::Path) -> Result<(PathBuf, std::ffi::OsS
         .context("trace path has no directory name")?
         .to_owned();
     Ok((trace_parent_dir(&trace), only_artifact))
+}
+
+fn load_signing_key(path: Option<&std::path::Path>) -> Result<Option<premier_trace::SigningKey>> {
+    path.map(|path| {
+        premier_trace::SigningKey::from_file(path)
+            .with_context(|| format!("cannot load signing key {}", path.display()))
+    })
+    .transpose()
+}
+
+/// Create a signing key pair. The private key file is created exclusively
+/// with owner-only permissions; the public half is safe to share.
+fn keygen(output: &std::path::Path) -> Result<()> {
+    let key = premier_trace::SigningKey::generate();
+    let public = key.public_key();
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(output)
+        .with_context(|| format!("cannot create private key file {}", output.display()))?;
+    writeln!(file, "{}", key.to_hex())?;
+    file.sync_all()?;
+    let mut public_path = output.as_os_str().to_owned();
+    public_path.push(".pub");
+    let public_path = PathBuf::from(public_path);
+    fs::write(&public_path, format!("{}\n", public.to_hex()))
+        .with_context(|| format!("cannot write public key file {}", public_path.display()))?;
+    println!(
+        "wrote private signing key to {} (owner-only); keep it secret",
+        output.display()
+    );
+    println!("wrote public key to {}", public_path.display());
+    println!("public key: {}", public.to_hex());
+    println!("fingerprint: {}", public.fingerprint());
+    Ok(())
+}
+
+/// Leading words and caveat of a successful `premier verify`. Only a
+/// signature by a key the caller supplied is called verified; everything else
+/// is described as what it is.
+fn verification_outcome(verified: &premier_trace::VerifiedTrace) -> (String, Option<&'static str>) {
+    let fingerprint = verified
+        .signer
+        .as_ref()
+        .map(|key| key.fingerprint())
+        .unwrap_or_default();
+    match verified.protection {
+        premier_trace::Protection::Signed if verified.trusted_signer => (
+            format!("verified: chain and seal valid, signed by the supplied key {fingerprint}:"),
+            None,
+        ),
+        premier_trace::Protection::Signed => (
+            format!("consistent: chain and seal valid, signed by an unknown key {fingerprint}:"),
+            Some(
+                "the signature is valid for the key stored in the trace itself, which says nothing about who signed it; pass --public-key with a key you trust",
+            ),
+        ),
+        premier_trace::Protection::Sealed => (
+            "consistent: chain and seal valid, unsigned:".into(),
+            Some(
+                "an unsigned trace is only internally consistent. That catches accidental or careless changes; anyone who can write to the trace can rebuild the chain and seal. Sign traces (premier keygen, record --sign-key, premier sign) for tamper evidence",
+            ),
+        ),
+        premier_trace::Protection::DigestOnly => (
+            "consistent (v1: digest only):".into(),
+            Some(
+                "version 1 traces have no event chain, seal or signature; the journal only matches a digest stored in the same unsigned manifest",
+            ),
+        ),
+    }
+}
+
+fn is_signed(manifest: Option<&premier_trace::TraceManifest>) -> bool {
+    manifest
+        .and_then(|manifest| manifest.seal.as_ref())
+        .is_some_and(|seal| seal.signature.is_some())
+}
+
+/// Say what happened to the signature of a trace whose manifest was re-sealed.
+fn report_resealed_signature(was_signed: bool, manifest: &premier_trace::TraceManifest) {
+    match (was_signed, is_signed(Some(manifest))) {
+        (_, true) => println!("re-sealed and signed with the configured signing key"),
+        (true, false) => println!(
+            "warning: the previous signature covered the old manifest and was dropped; re-sign with `premier sign`"
+        ),
+        (false, false) => {}
+    }
 }
 
 /// Gate evidence-reading commands on the same checks as `premier verify`.
@@ -1236,6 +1389,7 @@ struct RecordOptions {
     viewer_dir: Option<PathBuf>,
     bind: SocketAddr,
     redaction: RedactionConfig,
+    sign_key: Option<premier_trace::SigningKey>,
 }
 
 async fn record(options: RecordOptions) -> Result<()> {
@@ -1250,6 +1404,7 @@ async fn record(options: RecordOptions) -> Result<()> {
         viewer_dir,
         bind,
         redaction,
+        sign_key,
     } = options;
     #[cfg(not(unix))]
     if pty {
@@ -1280,6 +1435,9 @@ async fn record(options: RecordOptions) -> Result<()> {
         &tenant,
         redaction,
     )?;
+    if let Some(key) = sign_key {
+        trace_writer.set_signing_key(key);
+    }
     if let Some(provider) = native_provider {
         trace_writer.set_adapter(premier_trace::AdapterProvenance {
             provider: provider.id().into(),

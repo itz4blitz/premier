@@ -65,3 +65,16 @@ it('tells the reader an abandoned recording needs premier recover', () => {
   expect(screen.getByRole('status')).toHaveTextContent('Abandoned — run premier recover');
   expect(screen.getByRole('status')).toHaveTextContent('premier recover /traces/a.atrace');
 });
+
+it('states whether a verified trace is signed, and by which key, in the evidence detail', () => {
+  const events = [event(1, 'root', 'process', 'process.exit')];
+  const signed = render(RunOverview, {
+    props: { trace: { ...trace, integrity: 'verified', integrity_protection: 'signed', integrity_signer: 'sha256:abc123' }, events }
+  });
+  expect(signed.container.querySelector('.evidence small')).toHaveTextContent('signed by sha256:abc123');
+  signed.unmount();
+  const unsigned = render(RunOverview, {
+    props: { trace: { ...trace, integrity: 'verified', integrity_protection: 'sealed' }, events }
+  });
+  expect(unsigned.container.querySelector('.evidence small')).toHaveTextContent('unsigned, self-consistent only');
+});

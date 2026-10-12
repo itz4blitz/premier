@@ -11,9 +11,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use premier_trace::{
-    ACTIVE_JOURNAL, EventInput, FINAL_JOURNAL, IntegrityReport, IntegrityStatus, TraceEvent,
-    TraceManifest, TraceWriter, assess_integrity, read_active_events_after, read_events,
-    read_events_page, read_manifest, validate_events, verify_event_structure,
+    ACTIVE_JOURNAL, EventInput, FINAL_JOURNAL, IntegrityReport, IntegrityStatus, Protection,
+    TraceEvent, TraceManifest, TraceWriter, assess_integrity, read_active_events_after,
+    read_events, read_events_page, read_manifest, validate_events, verify_decoded_events,
     verify_journal_digest,
 };
 use rust_embed::RustEmbed;
@@ -271,24 +271,20 @@ fn compute_trace_snapshot(path: &Path) -> Result<TraceSnapshot> {
         .ok()
         .map(|events| summarize_trace(&manifest, events));
     let integrity = if manifest.journal.is_none() {
-        IntegrityReport {
-            status: IntegrityStatus::Live,
-            detail: None,
-        }
+        IntegrityReport::new(IntegrityStatus::Live, None)
     } else {
         let verified = verify_journal_digest(path, &manifest).and_then(|()| match &events {
-            Ok(events) => verify_event_structure(&manifest, events),
+            Ok(events) => verify_decoded_events(&manifest, events),
             Err(error) => Err(anyhow::anyhow!("{error}")),
         });
         match verified {
-            Ok(()) => IntegrityReport {
+            Ok(seal) => IntegrityReport {
                 status: IntegrityStatus::Verified,
                 detail: None,
+                protection: Some(seal.protection),
+                signer: seal.signer.map(|key| key.fingerprint()),
             },
-            Err(error) => IntegrityReport {
-                status: IntegrityStatus::Invalid,
-                detail: Some(error.to_string()),
-            },
+            Err(error) => IntegrityReport::new(IntegrityStatus::Invalid, Some(error.to_string())),
         }
     };
     Ok(TraceSnapshot {
@@ -376,6 +372,12 @@ struct TraceListEntry {
     integrity: IntegrityStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     integrity_detail: Option<String>,
+    /// What a verified trace is protected by: `digest_only`, `sealed` or `signed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity_protection: Option<Protection>,
+    /// Fingerprint of the signing key embedded in a signed trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity_signer: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -386,6 +388,12 @@ struct TraceDetail {
     integrity: IntegrityStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     integrity_detail: Option<String>,
+    /// What a verified trace is protected by: `digest_only`, `sealed` or `signed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity_protection: Option<Protection>,
+    /// Fingerprint of the signing key embedded in a signed trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity_signer: Option<String>,
 }
 
 fn integrity_fields(path: &Path) -> (String, IntegrityReport) {
@@ -1410,6 +1418,8 @@ fn list_traces_blocking(
                     artifact,
                     integrity: snapshot.integrity.status,
                     integrity_detail: snapshot.integrity.detail,
+                    integrity_protection: snapshot.integrity.protection,
+                    integrity_signer: snapshot.integrity.signer,
                 });
             }
             Err(error)
@@ -1491,6 +1501,7 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
             capabilities: Vec::new(),
             redaction: None,
             adapter: None,
+            seal: None,
             encryption: None,
         },
         summary: None,
@@ -1500,6 +1511,8 @@ fn damaged_trace_entry(path: &Path, error: &anyhow::Error) -> TraceListEntry {
             "invalid manifest: {}",
             integrity.detail.unwrap_or_else(|| error.to_string())
         )),
+        integrity_protection: None,
+        integrity_signer: None,
     }
 }
 
@@ -1572,6 +1585,8 @@ fn trace_detail(path: &Path, snapshot: TraceSnapshot) -> TraceDetail {
             .to_owned(),
         integrity: snapshot.integrity.status,
         integrity_detail: snapshot.integrity.detail,
+        integrity_protection: snapshot.integrity.protection,
+        integrity_signer: snapshot.integrity.signer,
     }
 }
 
@@ -1811,6 +1826,7 @@ mod tests {
             status: status.into(),
             duration_ms: 0,
             links: Vec::new(),
+            prev_hash: String::new(),
         }
     }
 
@@ -2474,6 +2490,81 @@ mod tests {
         let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
         assert_eq!(detail_json["integrity"], "invalid");
         assert_eq!(detail_json["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn list_and_detail_expose_seal_protection_and_signer() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace_dir = temp.path().join("traces");
+        let key = premier_trace::SigningKey::generate();
+        let mut signed =
+            TraceWriter::create_named(trace_dir.join("signed.atrace"), vec!["agent".into()], None)
+                .unwrap();
+        signed.set_signing_key(key.clone());
+        let signed_id = signed.trace_id().to_owned();
+        signed.finish(0).unwrap();
+        let unsigned = trace_dir.join("unsigned.atrace");
+        let unsigned_id = TraceWriter::create(&unsigned, vec!["agent".into()])
+            .unwrap()
+            .finish(0)
+            .unwrap()
+            .trace_id;
+        let viewer = temp.path().join("viewer");
+        fs::create_dir_all(&viewer).unwrap();
+        fs::write(viewer.join("index.html"), "viewer").unwrap();
+        let app = app(trace_dir, Some(viewer), AuthPolicy::default());
+        let get = async |uri: String| -> serde_json::Value {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap()
+        };
+
+        let list = get("/api/traces".into()).await;
+        let entry = |trace_id: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["trace_id"] == trace_id)
+                .unwrap()
+                .clone()
+        };
+        let signed_entry = entry(&signed_id);
+        assert_eq!(signed_entry["integrity"], "verified");
+        assert_eq!(signed_entry["integrity_protection"], "signed");
+        assert_eq!(
+            signed_entry["integrity_signer"],
+            key.public_key().fingerprint()
+        );
+        let unsigned_entry = entry(&unsigned_id);
+        assert_eq!(unsigned_entry["integrity"], "verified");
+        assert_eq!(unsigned_entry["integrity_protection"], "sealed");
+        assert!(unsigned_entry.get("integrity_signer").is_none());
+
+        let detail = get(format!("/api/traces/{signed_id}")).await;
+        assert_eq!(detail["integrity_protection"], "signed");
+        assert_eq!(detail["integrity_signer"], key.public_key().fingerprint());
+
+        // A sealed manifest field changed behind the server's back.
+        let path = unsigned.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["name"] = "renamed after sealing".into();
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        let detail = get(format!("/api/traces/{unsigned_id}")).await;
+        assert_eq!(detail["integrity"], "invalid");
+        assert!(
+            detail["integrity_detail"]
+                .as_str()
+                .unwrap()
+                .contains("manifest seal mismatch"),
+            "{detail}"
+        );
+        assert!(detail.get("integrity_protection").is_none());
     }
 
     #[tokio::test]

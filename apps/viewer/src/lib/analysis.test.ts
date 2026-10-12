@@ -90,6 +90,9 @@ describe('agent trace analysis', () => {
       exit_code: 0, journal: null, integrity: 'verified'
     };
     expect(runHealth(base, [])).toMatchObject({ label: 'Passed', detail: expect.stringContaining('integrity verified') });
+    expect(runHealth({ ...base, integrity_protection: 'sealed' }, []).detail).toContain('unsigned, self-consistent only');
+    expect(runHealth({ ...base, integrity_protection: 'digest_only' }, []).detail).toContain('unsigned, v1 digest only');
+    expect(runHealth({ ...base, integrity_protection: 'signed', integrity_signer: 'sha256:abc123' }, []).detail).toContain('signed by sha256:abc123');
     expect(runHealth({ ...base, ended_at: null, integrity: 'live' }, [])).toMatchObject({ label: 'Running' });
     expect(runHealth(base, [event(1, 'policy', 'approval.decision', 'denied')])).toMatchObject({ label: 'Blocked' });
     expect(runHealth(base, [event(1, 'policy', 'approval.request', 'pending')])).toMatchObject({ label: 'Awaiting approval' });

@@ -1,11 +1,16 @@
 mod crypto;
 mod integrity;
 mod output;
+mod seal;
 mod utf8;
 
 pub use crypto::{EncryptionKey, KEY_FILE_ENV};
 pub use integrity::{IntegrityReport, IntegrityStatus, assess_integrity};
 pub use output::prepare_trace_output;
+pub use seal::{
+    ManifestSeal, ManifestSignature, Protection, PublicKey, SIGN_KEY_FILE_ENV, SealStatus,
+    SigningKey, verify_tamper_evidence,
+};
 pub use utf8::{decode_utf8_chunk, finish_utf8};
 
 use anyhow::{Context, Result, bail};
@@ -21,7 +26,11 @@ use std::sync::LazyLock;
 use std::time::{Duration as StdDuration, SystemTime};
 use uuid::Uuid;
 
-pub const FORMAT_VERSION: u32 = 1;
+/// Version written by this build. Version 2 adds the event hash chain, the
+/// manifest seal and the optional signature (`docs/trace-format.md`).
+pub const FORMAT_VERSION: u32 = 2;
+/// Oldest version still read and verified (digest only).
+pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const LOCAL_TENANT: &str = "local";
 pub const RECORDER_LEASE: &str = "recorder.lease";
 /// Append-in-progress journal file name inside a trace's `events/` directory.
@@ -65,6 +74,11 @@ pub struct TraceEvent {
     pub duration_ms: u64,
     #[prost(string, repeated, tag = "16")]
     pub links: Vec<String>,
+    /// Hash of the previous event's canonical bytes (hex), or the trace's
+    /// genesis value on the first event. Empty in version 1 journals.
+    #[prost(string, tag = "17")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prev_hash: String,
 }
 
 impl TraceEvent {
@@ -231,6 +245,10 @@ pub struct TraceManifest {
     pub redaction: Option<RedactionProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<AdapterProvenance>,
+    /// Chain head, seal digest and optional signature, written at
+    /// finalization from format version 2 on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<ManifestSeal>,
     /// Public encryption envelope. When present, sensitive manifest fields and
     /// every event frame are XChaCha20-Poly1305 ciphertext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,6 +277,10 @@ struct PrivateManifest {
     capabilities: Vec<String>,
     redaction: Option<RedactionProvenance>,
     adapter: Option<AdapterProvenance>,
+    /// The seal hashes plaintext fields and names the signer, so it stays
+    /// inside the ciphertext. Absent in version 1 envelopes.
+    #[serde(default)]
+    seal: Option<ManifestSeal>,
 }
 
 fn default_tenant_id() -> String {
@@ -1035,6 +1057,11 @@ pub struct TraceWriter {
     dropped_events: u64,
     redaction: RedactionConfig,
     encryption_key: Option<EncryptionKey>,
+    /// Hash the next event chains from: the genesis value, then the hash of
+    /// the last committed event.
+    chain_head: String,
+    /// Signs the manifest seal at finalization when configured.
+    signing_key: Option<SigningKey>,
 }
 
 impl TraceWriter {
@@ -1098,6 +1125,7 @@ impl TraceWriter {
         {
             bail!("tenant id must be 1-128 ASCII letters, digits, '.', '_' or '-'")
         }
+        let signing_key = seal::signing_key_from_environment()?;
         let root = root.as_ref().to_path_buf();
         if root.exists() {
             bail!("trace path already exists: {}", root.display());
@@ -1143,6 +1171,7 @@ impl TraceWriter {
             capabilities,
             redaction: Some(redaction.provenance()),
             adapter: None,
+            seal: None,
             encryption: encryption_key.as_ref().map(|_| EncryptionMetadata {
                 algorithm: "XChaCha20-Poly1305".into(),
                 key_id: master_key.as_ref().expect("master key exists").key_id(),
@@ -1151,6 +1180,7 @@ impl TraceWriter {
         };
         write_manifest(&root, &manifest, encryption_key.as_ref())?;
         let journal = private_new_file(&root.join("events").join(ACTIVE_JOURNAL))?;
+        let chain_head = seal::chain_genesis(&manifest.trace_id);
         Ok(Self {
             root,
             manifest,
@@ -1161,11 +1191,19 @@ impl TraceWriter {
             dropped_events: 0,
             redaction,
             encryption_key,
+            chain_head,
+            signing_key,
         })
     }
 
     pub fn trace_id(&self) -> &str {
         &self.manifest.trace_id
+    }
+
+    /// Sign the manifest seal with `key` when the trace is finalized,
+    /// overriding any key configured through `PREMIER_SIGN_KEY_FILE`.
+    pub fn set_signing_key(&mut self, key: SigningKey) {
+        self.signing_key = Some(key);
     }
 
     /// Advertise an optional recorder feature in the portable manifest.
@@ -1251,6 +1289,7 @@ impl TraceWriter {
             status: input.status,
             duration_ms: input.duration_ms,
             links: input.links,
+            prev_hash: self.chain_head.clone(),
         };
         // Encode first so an oversized or unencryptable event never touches
         // the journal, then commit the frame with a single write.
@@ -1266,6 +1305,7 @@ impl TraceWriter {
             return Err(error);
         }
         self.sequence = event.sequence;
+        self.chain_head = seal::event_hash(&event);
         Ok(event)
     }
 
@@ -1318,6 +1358,8 @@ impl TraceWriter {
             termination,
             self.encryption_key.as_ref(),
             self.dropped_events,
+            self.signing_key.as_ref(),
+            false,
         )
     }
 }
@@ -1371,6 +1413,16 @@ pub fn recover_interrupted_trace(
             bail!("active journal event sequence is not contiguous")
         }
     }
+    // Re-derive the chain head from the complete frames. A journal whose
+    // chain is already broken was altered, so it is not sealed as recovered.
+    let chained = manifest.format_version >= 2;
+    let prev_hash = if chained {
+        seal::chain_head(&manifest.trace_id, &events)
+            .context("cannot recover: the active journal failed chain verification")?
+    } else {
+        String::new()
+    };
+    let signing_key = seal::signing_key_from_environment()?;
     let discarded_bytes = bytes.len().saturating_sub(valid_bytes);
     let recovery_event = TraceEvent {
         event_id: Uuid::now_v7().to_string(),
@@ -1393,6 +1445,7 @@ pub fn recover_interrupted_trace(
         status: "error".into(),
         duration_ms: 0,
         links: Vec::new(),
+        prev_hash,
     };
     events.push(recovery_event);
 
@@ -1428,9 +1481,12 @@ pub fn recover_interrupted_trace(
         ProcessTermination::interrupted(),
         encryption_key.as_ref(),
         0,
+        signing_key.as_ref(),
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_active_journal(
     root: &Path,
     mut manifest: TraceManifest,
@@ -1438,6 +1494,8 @@ fn finalize_active_journal(
     termination: ProcessTermination,
     encryption_key: Option<&EncryptionKey>,
     dropped_events: u64,
+    signing_key: Option<&SigningKey>,
+    recovered: bool,
 ) -> Result<TraceManifest> {
     let active = root.join("events").join(ACTIVE_JOURNAL);
     let final_path = root.join("events").join(FINAL_JOURNAL);
@@ -1449,11 +1507,12 @@ fn finalize_active_journal(
     encoder.finish()?.into_inner()?.sync_all()?;
     fs::rename(&temporary_final, &final_path)?;
 
-    manifest.diagnostics = validate_events(&read_frames(
+    let events = read_frames(
         BufReader::new(File::open(&active)?),
         encryption_key,
         &manifest.trace_id,
-    )?);
+    )?;
+    manifest.diagnostics = validate_events(&events);
     if dropped_events > 0 {
         manifest.diagnostics.push(TraceDiagnostic {
             severity: DiagnosticSeverity::Warning,
@@ -1473,6 +1532,17 @@ fn finalize_active_journal(
         sha256: sha256_file(&final_path)?,
         event_count,
     });
+    // Version 1 journals carry no chain; they finalize as digest-only traces.
+    if manifest.format_version >= 2 {
+        let chain_head = seal::chain_head(&manifest.trace_id, &events)?;
+        seal::seal_manifest(
+            &mut manifest,
+            chain_head,
+            events.len() as u64,
+            recovered,
+            signing_key,
+        )?;
+    }
     write_manifest(root, &manifest, encryption_key)?;
     fs::remove_file(active)?;
     let lease = root.join(RECORDER_LEASE);
@@ -1834,9 +1904,9 @@ fn read_manifest_with_optional_key(
 ) -> Result<TraceManifest> {
     let bytes = fs::read(root.join("manifest.json"))?;
     let mut manifest: TraceManifest = serde_json::from_slice(&bytes)?;
-    if manifest.format_version != FORMAT_VERSION {
+    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&manifest.format_version) {
         bail!(
-            "unsupported trace format version {}",
+            "unsupported trace format version {}: this build reads versions {MIN_FORMAT_VERSION} to {FORMAT_VERSION}; a newer premier is needed for later versions",
             manifest.format_version
         );
     }
@@ -1862,6 +1932,7 @@ fn read_manifest_with_optional_key(
         manifest.capabilities = private.capabilities;
         manifest.redaction = private.redaction;
         manifest.adapter = private.adapter;
+        manifest.seal = private.seal;
     }
     Ok(manifest)
 }
@@ -1909,11 +1980,70 @@ fn read_events_from_storage(
 }
 
 pub fn verify(root: impl AsRef<Path>) -> Result<TraceManifest> {
+    Ok(verify_trace(root, None)?.manifest)
+}
+
+/// Outcome of a successful [`verify_trace`].
+#[derive(Clone, Debug)]
+pub struct VerifiedTrace {
+    pub manifest: TraceManifest,
+    pub protection: Protection,
+    /// Key whose signature over the seal is valid, when the trace is signed.
+    pub signer: Option<PublicKey>,
+    /// True only when the caller supplied a key and it is the signer.
+    pub trusted_signer: bool,
+}
+
+/// Verify a finalized trace and report how strongly it is protected. With
+/// `trusted_key`, anything short of a valid signature by that key is an error.
+/// Without it, a signed trace is only known to be signed by the key embedded
+/// in its own manifest, and an unsigned one is merely self-consistent: whoever
+/// can rewrite the directory can rebuild the chain and the seal.
+pub fn verify_trace(
+    root: impl AsRef<Path>,
+    trusted_key: Option<&PublicKey>,
+) -> Result<VerifiedTrace> {
     let root = root.as_ref();
     let manifest = read_manifest(root)?;
     verify_journal_digest(root, &manifest)?;
     let events = read_events(root)?;
-    verify_event_structure(&manifest, &events)?;
+    let status = verify_decoded_events(&manifest, &events)?;
+    if let Some(trusted) = trusted_key {
+        match status.signer.as_ref() {
+            None if status.protection == Protection::DigestOnly => {
+                bail!("version 1 traces cannot carry a signature (v1: digest only)")
+            }
+            None => bail!("trace is not signed"),
+            Some(signer) if signer != trusted => bail!(
+                "trace is signed by a different key ({}), not the supplied key ({})",
+                signer.fingerprint(),
+                trusted.fingerprint()
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(VerifiedTrace {
+        manifest,
+        protection: status.protection,
+        signer: status.signer,
+        trusted_signer: trusted_key.is_some(),
+    })
+}
+
+/// Sign (or re-sign) the seal of an already finalized version 2 trace. The
+/// trace must verify first, so a signature is never added to altered evidence.
+pub fn sign_finalized_trace(
+    root: impl AsRef<Path>,
+    signing_key: &SigningKey,
+) -> Result<TraceManifest> {
+    let root = root.as_ref();
+    let mut manifest = verify(root)?;
+    if manifest.seal.is_none() {
+        bail!("version 1 traces have no seal to sign (v1: digest only)")
+    }
+    let encryption_key = required_encryption_key(&manifest)?;
+    seal::reseal_manifest(&mut manifest, Some(signing_key))?;
+    write_manifest(root, &manifest, encryption_key.as_ref())?;
     Ok(manifest)
 }
 
@@ -1938,8 +2068,17 @@ pub fn verify_journal_digest(root: impl AsRef<Path>, manifest: &TraceManifest) -
 /// manifest. Producer-controlled semantic references (`parent_event_id`,
 /// `links`) are surfaced as [`validate_events`] diagnostics instead of
 /// verification failures so a misbehaving subprocess cannot make an honest
-/// trace permanently unverifiable.
+/// trace permanently unverifiable. From format version 2 on this also checks
+/// the event hash chain, the manifest seal and any signature.
 pub fn verify_event_structure(manifest: &TraceManifest, events: &[TraceEvent]) -> Result<()> {
+    verify_decoded_events(manifest, events).map(|_| ())
+}
+
+/// [`verify_event_structure`], returning the protection level that was verified.
+pub fn verify_decoded_events(
+    manifest: &TraceManifest,
+    events: &[TraceEvent],
+) -> Result<SealStatus> {
     let journal = manifest
         .journal
         .as_ref()
@@ -1966,7 +2105,7 @@ pub fn verify_event_structure(manifest: &TraceManifest, events: &[TraceEvent]) -
             bail!("journal contains an empty or duplicate event id")
         }
     }
-    Ok(())
+    verify_tamper_evidence(manifest, events)
 }
 
 fn write_manifest(
@@ -1987,6 +2126,7 @@ fn write_manifest(
             capabilities: std::mem::take(&mut stored.capabilities),
             redaction: stored.redaction.take(),
             adapter: stored.adapter.take(),
+            seal: stored.seal.take(),
         };
         let aad = manifest_aad(&stored);
         let encrypted = key.encrypt(&serde_json::to_vec(&private)?, aad.as_bytes())?;
@@ -2044,6 +2184,12 @@ pub fn claim_local_trace(root: impl AsRef<Path>, tenant_id: &str) -> Result<Trac
     }
     let key = required_encryption_key(&manifest)?;
     manifest.tenant_id = tenant_id.to_owned();
+    // The owner is a sealed field: re-seal, re-signing only when a signing
+    // key is configured. Otherwise the previous signature is dropped.
+    seal::reseal_manifest(
+        &mut manifest,
+        seal::signing_key_from_environment()?.as_ref(),
+    )?;
     write_manifest(root, &manifest, key.as_ref())?;
     Ok(manifest)
 }
@@ -2061,9 +2207,25 @@ pub fn trace_is_encrypted(root: impl AsRef<Path>) -> Result<bool> {
 /// master key. The replacement is fully written and decrypted for verification
 /// before the original directory is renamed; any publication failure rolls the
 /// original directory back into place.
+///
+/// Events are re-encrypted unchanged, so the hash chain and its head are
+/// preserved. The journal digest and encryption envelope are sealed fields,
+/// so the seal is recomputed and an existing signature no longer applies: it
+/// is re-applied with the `PREMIER_SIGN_KEY_FILE` key when one is configured
+/// and dropped otherwise.
 pub fn reencrypt_finalized_trace(
     root: impl AsRef<Path>,
     new_master_key: EncryptionKey,
+) -> Result<TraceManifest> {
+    let signing_key = seal::signing_key_from_environment()?;
+    reencrypt_finalized_trace_with_signing_key(root, new_master_key, signing_key.as_ref())
+}
+
+/// [`reencrypt_finalized_trace`] with an explicit signing key choice.
+pub fn reencrypt_finalized_trace_with_signing_key(
+    root: impl AsRef<Path>,
+    new_master_key: EncryptionKey,
+    signing_key: Option<&SigningKey>,
 ) -> Result<TraceManifest> {
     let root = root.as_ref();
     let mut manifest = read_manifest(root)?;
@@ -2121,10 +2283,13 @@ pub fn reencrypt_finalized_trace(
         key_id: new_master_key.key_id(),
         private_manifest: String::new(),
     });
+    seal::reseal_manifest(&mut manifest, signing_key)?;
     write_manifest(&staging, &manifest, Some(&derived))?;
     let verified_manifest = read_manifest_with_key(&staging, &new_master_key)?;
     let verified_events = read_events_with_key(&staging, &new_master_key)?;
-    if verified_events != events {
+    if verified_events != events
+        || verify_event_structure(&verified_manifest, &verified_events).is_err()
+    {
         fs::remove_dir_all(&staging)?;
         bail!("encrypted trace verification changed event evidence")
     }
@@ -2761,6 +2926,519 @@ mod tests {
                 .to_string()
                 .contains("digest mismatch")
         );
+    }
+
+    fn sample_trace(root: &Path, signing_key: Option<&SigningKey>) -> TraceManifest {
+        let mut writer = TraceWriter::create_named(
+            root,
+            vec!["agent".into(), "run".into()],
+            Some("sample".into()),
+        )
+        .unwrap();
+        if let Some(key) = signing_key {
+            writer.set_signing_key(key.clone());
+        }
+        for (kind, payload) in [
+            ("session.start", serde_json::json!({"cwd": "/tmp"})),
+            ("process.stdout", serde_json::json!({"text": "real"})),
+            ("session.end", serde_json::json!({"exit_code": 7})),
+        ] {
+            writer.append(kind, "test", payload).unwrap();
+        }
+        writer.finish(7).unwrap()
+    }
+
+    /// The forgery version 1 could not see: rewrite the journal, then publish
+    /// a matching digest and event count the way the recorder would.
+    fn rewrite_consistently(root: &Path, events: &[TraceEvent]) {
+        rewrite_events(root, events);
+        let mut manifest = read_manifest(root).unwrap();
+        manifest.journal.as_mut().unwrap().event_count = events.len() as u64;
+        write_manifest(root, &manifest, None).unwrap();
+    }
+
+    /// The strongest forgery open to someone with write access but no signing
+    /// key: re-chain the events and recompute digest, count, chain head and
+    /// seal. `signature` is whatever they decide to leave in the manifest.
+    fn rebuild_chain_and_seal(
+        root: &Path,
+        events: &mut [TraceEvent],
+        signature: Option<ManifestSignature>,
+    ) {
+        let mut head = seal::chain_genesis(&read_manifest(root).unwrap().trace_id);
+        for (index, event) in events.iter_mut().enumerate() {
+            event.sequence = index as u64 + 1;
+            event.prev_hash = head;
+            head = seal::event_hash(event);
+        }
+        rewrite_consistently(root, events);
+        let mut manifest = read_manifest(root).unwrap();
+        seal::seal_manifest(&mut manifest, head, events.len() as u64, false, None).unwrap();
+        manifest.seal.as_mut().unwrap().signature = signature;
+        write_manifest(root, &manifest, None).unwrap();
+    }
+
+    fn edit_manifest_json(root: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = root.join("manifest.json");
+        let mut json = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        edit(&mut json);
+        fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn consistent_journal_rewrite_is_detected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("forged.atrace");
+        sample_trace(&root, None);
+        let mut events = read_events(&root).unwrap();
+        events[1].payload_json = r#"{"text":"forged"}"#.into();
+        rewrite_consistently(&root, &events);
+
+        // The journal matches its manifest digest again, which is everything
+        // version 1 verification looked at.
+        verify_journal_digest(&root, &read_manifest(&root).unwrap()).unwrap();
+        let error = verify(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("event chain is broken at sequence 3"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_manifest_field_edit_is_detected() {
+        type Edit = fn(&mut serde_json::Value);
+        let edits: [(&str, Edit); 12] = [
+            ("name", |json| json["name"] = "forged".into()),
+            ("command", |json| {
+                json["command"] = serde_json::json!(["forged"])
+            }),
+            ("exit_code", |json| json["exit_code"] = 0.into()),
+            ("termination", |json| {
+                json["termination"]["exit_code"] = 0.into()
+            }),
+            ("started_at", |json| {
+                json["started_at"] = "2020-01-01T00:00:00Z".into()
+            }),
+            ("ended_at", |json| {
+                json["ended_at"] = "2020-01-01T00:00:00Z".into()
+            }),
+            ("tenant_id", |json| json["tenant_id"] = "acme".into()),
+            ("capabilities", |json| {
+                json["capabilities"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push("forged".into())
+            }),
+            ("adapter", |json| {
+                json["adapter"] = serde_json::json!({
+                    "provider": "forged", "schema_version": 1,
+                    "transport": "stdout-jsonl", "completeness": "complete",
+                })
+            }),
+            ("redaction", |json| {
+                json["redaction"]["terminal_literal_count"] = 9.into()
+            }),
+            ("diagnostics", |json| {
+                json["diagnostics"] = serde_json::json!([
+                    {"severity": "warning", "code": "forged", "message": "forged"}
+                ])
+            }),
+            ("seal.recovered", |json| {
+                json["seal"]["recovered"] = true.into()
+            }),
+        ];
+        for (field, edit) in edits {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("edited.atrace");
+            sample_trace(&root, None);
+            edit_manifest_json(&root, edit);
+            let error = verify(&root).unwrap_err().to_string();
+            assert!(error.contains("manifest seal mismatch"), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn reordered_inserted_and_truncated_events_are_detected() {
+        type Forgery = fn(&mut Vec<TraceEvent>);
+        let forgeries: [(&str, Forgery); 3] = [
+            ("reorder", |events| events.swap(0, 1)),
+            ("insert", |events| {
+                let mut extra = events[1].clone();
+                extra.event_id = Uuid::now_v7().to_string();
+                events.insert(1, extra);
+            }),
+            ("truncate", |events| {
+                events.pop();
+            }),
+        ];
+        for (name, forge) in forgeries {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("forged.atrace");
+            sample_trace(&root, None);
+            let mut events = read_events(&root).unwrap();
+            forge(&mut events);
+            // Renumber and republish digest and counts, so every check that
+            // predates the chain passes.
+            for (index, event) in events.iter_mut().enumerate() {
+                event.sequence = index as u64 + 1;
+            }
+            rewrite_consistently(&root, &events);
+            let mut manifest = read_manifest(&root).unwrap();
+            manifest.seal.as_mut().unwrap().event_count = events.len() as u64;
+            write_manifest(&root, &manifest, None).unwrap();
+
+            let error = verify(&root).unwrap_err().to_string();
+            assert!(error.contains("event chain"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_unsigned_trace_can_be_rebuilt_by_anyone_with_write_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("rebuilt.atrace");
+        sample_trace(&root, None);
+        let mut events = read_events(&root).unwrap();
+        events[1].payload_json = r#"{"text":"forged"}"#.into();
+        rebuild_chain_and_seal(&root, &mut events, None);
+
+        // This is the documented limit of an unsigned trace: it is reported
+        // as sealed, never as signed.
+        let verified = verify_trace(&root, None).unwrap();
+        assert_eq!(verified.protection, Protection::Sealed);
+        assert!(verified.signer.is_none());
+        assert!(!verified.trusted_signer);
+    }
+
+    #[test]
+    fn signed_trace_verifies_with_the_right_key_and_fails_with_a_wrong_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("signed.atrace");
+        let key = SigningKey::generate();
+        sample_trace(&root, Some(&key));
+
+        let verified = verify_trace(&root, Some(&key.public_key())).unwrap();
+        assert_eq!(verified.protection, Protection::Signed);
+        assert_eq!(verified.signer, Some(key.public_key()));
+        assert!(verified.trusted_signer);
+
+        let unknown = verify_trace(&root, None).unwrap();
+        assert_eq!(unknown.protection, Protection::Signed);
+        assert_eq!(unknown.signer, Some(key.public_key()));
+        assert!(!unknown.trusted_signer);
+
+        let wrong = SigningKey::generate().public_key();
+        let error = verify_trace(&root, Some(&wrong)).unwrap_err().to_string();
+        assert!(error.contains("signed by a different key"), "{error}");
+        assert!(error.contains(&key.public_key().fingerprint()), "{error}");
+
+        let unsigned = temp.path().join("unsigned.atrace");
+        sample_trace(&unsigned, None);
+        let error = verify_trace(&unsigned, Some(&wrong))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not signed"), "{error}");
+    }
+
+    #[test]
+    fn signature_breaks_on_any_manifest_or_event_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = SigningKey::generate();
+
+        // An event change with chain, digest and seal all rebuilt.
+        let root = temp.path().join("event.atrace");
+        let signature = sample_trace(&root, Some(&key)).seal.unwrap().signature;
+        let mut events = read_events(&root).unwrap();
+        events[1].payload_json = r#"{"text":"forged"}"#.into();
+        rebuild_chain_and_seal(&root, &mut events, signature.clone());
+        let error = verify(&root).unwrap_err().to_string();
+        assert!(error.contains("manifest signature is invalid"), "{error}");
+
+        // Dropping the signature instead leaves an unsigned trace, which a
+        // verifier holding the expected key rejects.
+        rebuild_chain_and_seal(&root, &mut events, None);
+        assert_eq!(
+            verify_trace(&root, None).unwrap().protection,
+            Protection::Sealed
+        );
+        let error = verify_trace(&root, Some(&key.public_key()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not signed"), "{error}");
+
+        // A manifest change with the seal recomputed.
+        let root = temp.path().join("manifest.atrace");
+        let mut manifest = sample_trace(&root, Some(&key));
+        manifest.exit_code = Some(0);
+        manifest.termination = Some(ProcessTermination::exited(0));
+        seal::reseal_manifest(&mut manifest, None).unwrap();
+        manifest.seal.as_mut().unwrap().signature = signature;
+        write_manifest(&root, &manifest, None).unwrap();
+        let error = verify(&root).unwrap_err().to_string();
+        assert!(error.contains("manifest signature is invalid"), "{error}");
+
+        // Re-signing with another key is valid for that key only.
+        let forger = SigningKey::generate();
+        seal::reseal_manifest(&mut manifest, Some(&forger)).unwrap();
+        write_manifest(&root, &manifest, None).unwrap();
+        assert_eq!(
+            verify_trace(&root, None).unwrap().signer,
+            Some(forger.public_key())
+        );
+        let error = verify_trace(&root, Some(&key.public_key()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("signed by a different key"), "{error}");
+    }
+
+    #[test]
+    fn signing_a_finalized_trace_requires_it_to_verify_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("late-signed.atrace");
+        let before = sample_trace(&root, None).seal.unwrap();
+        let key = SigningKey::generate();
+
+        let signed = sign_finalized_trace(&root, &key).unwrap().seal.unwrap();
+        assert_eq!(signed.digest, before.digest);
+        assert_eq!(signed.chain_head, before.chain_head);
+        verify_trace(&root, Some(&key.public_key())).unwrap();
+
+        let mut events = read_events(&root).unwrap();
+        events[0].payload_json = r#"{"cwd":"/forged"}"#.into();
+        rewrite_consistently(&root, &events);
+        assert!(sign_finalized_trace(&root, &key).is_err());
+    }
+
+    #[test]
+    fn v1_fixture_still_reads_and_verifies_as_digest_only() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1.atrace");
+        let manifest = read_manifest(&fixture).unwrap();
+        assert_eq!(manifest.format_version, 1);
+        assert!(manifest.seal.is_none());
+        let events = read_events(&fixture).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.prev_hash.is_empty()));
+
+        let verified = verify_trace(&fixture, None).unwrap();
+        assert_eq!(verified.protection, Protection::DigestOnly);
+        assert!(verified.signer.is_none());
+        let key = SigningKey::generate();
+        let error = verify_trace(&fixture, Some(&key.public_key()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("v1: digest only"), "{error}");
+
+        // Version 1 keeps exactly its old guarantees on a working copy.
+        let temp = tempfile::tempdir().unwrap();
+        let copy = temp.path().join("v1.atrace");
+        fs::create_dir_all(copy.join("events")).unwrap();
+        for file in ["manifest.json", "events/000001.events.pb.zst"] {
+            fs::copy(fixture.join(file), copy.join(file)).unwrap();
+        }
+        let error = sign_finalized_trace(&copy, &key).unwrap_err().to_string();
+        assert!(error.contains("v1: digest only"), "{error}");
+        OpenOptions::new()
+            .append(true)
+            .open(copy.join("events").join(FINAL_JOURNAL))
+            .unwrap()
+            .write_all(b"tampered")
+            .unwrap();
+        let error = verify(&copy).unwrap_err().to_string();
+        assert!(error.contains("digest mismatch"), "{error}");
+    }
+
+    #[test]
+    fn unknown_future_format_versions_are_rejected_with_a_clear_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("future.atrace");
+        sample_trace(&root, None);
+        edit_manifest_json(&root, |json| json["format_version"] = 3.into());
+        let error = read_manifest(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported trace format version 3"),
+            "{error}"
+        );
+        assert!(error.contains("reads versions 1 to 2"), "{error}");
+        assert!(read_events(&root).is_err());
+    }
+
+    #[test]
+    fn a_version_2_manifest_without_a_seal_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("stripped.atrace");
+        sample_trace(&root, None);
+        edit_manifest_json(&root, |json| {
+            json.as_object_mut().unwrap().remove("seal");
+        });
+        let error = verify(&root).unwrap_err().to_string();
+        assert!(error.contains("has no seal"), "{error}");
+    }
+
+    #[test]
+    fn recovery_rederives_the_chain_and_marks_the_seal_recovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("interrupted.atrace");
+        let mut writer = TraceWriter::create(&root, vec!["agent".into()]).unwrap();
+        writer
+            .append("one", "test", serde_json::Value::Null)
+            .unwrap();
+        writer
+            .append("two", "test", serde_json::Value::Null)
+            .unwrap();
+        drop(writer);
+        OpenOptions::new()
+            .append(true)
+            .open(root.join("events").join(ACTIVE_JOURNAL))
+            .unwrap()
+            .write_all(&[8, 0, 0, 0, 1, 2])
+            .unwrap();
+
+        let manifest = recover_interrupted_trace(
+            &root,
+            RecoveryOptions {
+                force: true,
+                ..RecoveryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let sealed = manifest.seal.unwrap();
+        assert!(sealed.recovered);
+        assert_eq!(sealed.event_count, 3);
+        let events = read_events(&root).unwrap();
+        assert_eq!(events[2].kind, "session.interrupted");
+        assert_eq!(events[2].prev_hash, seal::event_hash(&events[1]));
+        assert_eq!(sealed.chain_head, seal::event_hash(&events[2]));
+        assert_eq!(
+            verify_trace(&root, None).unwrap().protection,
+            Protection::Sealed
+        );
+
+        // The recovered marker is itself sealed.
+        edit_manifest_json(&root, |json| {
+            json["seal"].as_object_mut().unwrap().remove("recovered");
+        });
+        assert!(verify(&root).is_err());
+    }
+
+    #[test]
+    fn recovery_refuses_an_active_journal_whose_chain_is_broken() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("edited-live.atrace");
+        let mut writer = TraceWriter::create(&root, vec!["agent".into()]).unwrap();
+        for kind in ["one", "two", "three"] {
+            writer
+                .append(kind, "test", serde_json::Value::Null)
+                .unwrap();
+        }
+        drop(writer);
+        let active = root.join("events").join(ACTIVE_JOURNAL);
+        let mut events = read_events(&root).unwrap();
+        events[0].payload_json = r#"{"forged":true}"#.into();
+        let mut bytes = Vec::new();
+        for event in &events {
+            write_frame(&mut bytes, event, None, &event.trace_id).unwrap();
+        }
+        fs::write(&active, bytes).unwrap();
+
+        let error = recover_interrupted_trace(
+            &root,
+            RecoveryOptions {
+                force: true,
+                ..RecoveryOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("failed chain verification"), "{error}");
+        assert!(
+            error.contains("event chain is broken at sequence 2"),
+            "{error}"
+        );
+        assert!(active.exists());
+        assert!(read_manifest(&root).unwrap().journal.is_none());
+    }
+
+    #[test]
+    fn encrypted_traces_are_chained_and_sealed_inside_the_private_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("encrypted-sealed.atrace");
+        let key = EncryptionKey::from_hex(&"81".repeat(32)).unwrap();
+        let signer = SigningKey::generate();
+        let mut writer = TraceWriter::create_named_for_tenant_with_redaction_and_key(
+            &root,
+            vec!["agent".into()],
+            None,
+            "local",
+            RedactionConfig::default(),
+            key.clone(),
+        )
+        .unwrap();
+        writer.set_signing_key(signer.clone());
+        writer.append("one", "test", serde_json::json!({})).unwrap();
+        writer.append("two", "test", serde_json::json!({})).unwrap();
+        writer.finish(0).unwrap();
+
+        let public: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        assert!(public.get("seal").is_none(), "{public}");
+        assert!(!public.to_string().contains(&signer.public_key().to_hex()));
+
+        let manifest = read_manifest_with_key(&root, &key).unwrap();
+        let events = read_events_with_key(&root, &key).unwrap();
+        assert_eq!(events[1].prev_hash, seal::event_hash(&events[0]));
+        let status = verify_decoded_events(&manifest, &events).unwrap();
+        assert_eq!(status.protection, Protection::Signed);
+        assert_eq!(status.signer, Some(signer.public_key()));
+        // Dropping the last event is caught by the chain head as well as the
+        // authenticated count.
+        assert!(verify_tamper_evidence(&manifest, &events[..1]).is_err());
+    }
+
+    #[test]
+    fn encryption_preserves_the_chain_and_reseals_dropping_or_reapplying_the_signature() {
+        let temp = tempfile::tempdir().unwrap();
+        let signer = SigningKey::generate();
+        let key = EncryptionKey::from_hex(&"91".repeat(32)).unwrap();
+
+        let root = temp.path().join("dropped.atrace");
+        let before = sample_trace(&root, Some(&signer)).seal.unwrap();
+        let after = reencrypt_finalized_trace_with_signing_key(&root, key.clone(), None)
+            .unwrap()
+            .seal
+            .unwrap();
+        assert_eq!(after.chain_head, before.chain_head);
+        assert_eq!(after.event_count, before.event_count);
+        assert_ne!(after.digest, before.digest);
+        assert!(after.signature.is_none());
+        let manifest = read_manifest_with_key(&root, &key).unwrap();
+        let events = read_events_with_key(&root, &key).unwrap();
+        assert_eq!(
+            verify_decoded_events(&manifest, &events)
+                .unwrap()
+                .protection,
+            Protection::Sealed
+        );
+
+        let root = temp.path().join("resigned.atrace");
+        sample_trace(&root, Some(&signer));
+        reencrypt_finalized_trace_with_signing_key(&root, key.clone(), Some(&signer)).unwrap();
+        let manifest = read_manifest_with_key(&root, &key).unwrap();
+        let events = read_events_with_key(&root, &key).unwrap();
+        let status = verify_decoded_events(&manifest, &events).unwrap();
+        assert_eq!(status.protection, Protection::Signed);
+        assert_eq!(status.signer, Some(signer.public_key()));
+    }
+
+    #[test]
+    fn claiming_a_trace_reseals_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("claimed.atrace");
+        let before = sample_trace(&root, None).seal.unwrap();
+        let after = claim_local_trace(&root, "acme").unwrap().seal.unwrap();
+        assert_ne!(after.digest, before.digest);
+        assert_eq!(after.chain_head, before.chain_head);
+        assert_eq!(verify(&root).unwrap().tenant_id, "acme");
     }
 
     #[test]

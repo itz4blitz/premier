@@ -1,4 +1,4 @@
-use premier_trace::{TraceEvent, TraceManifest};
+use premier_trace::{PublicKey, TraceEvent, TraceManifest};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -257,8 +257,61 @@ pub fn redact_secrets_with(value: &mut Value, value_patterns: bool) -> Redaction
 pub struct PortableEvidence {
     pub format: &'static str,
     pub redaction: PortableRedaction,
+    pub source: PortableSource,
     pub manifest: Value,
     pub events: Vec<Value>,
+}
+
+/// Tamper-evidence values of the trace an export was derived from, copied
+/// from its manifest so the package states its origin.
+#[derive(Debug, Serialize)]
+pub struct PortableSource {
+    pub trace_id: String,
+    pub format_version: u32,
+    /// `digest_only` (v1), `sealed` (v2, unsigned) or `signed`.
+    pub protection: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key_fingerprint: Option<String>,
+    pub note: &'static str,
+}
+
+fn portable_source(manifest: &TraceManifest) -> PortableSource {
+    let seal = manifest.seal.as_ref();
+    let signature = seal.and_then(|seal| seal.signature.as_ref());
+    PortableSource {
+        trace_id: manifest.trace_id.clone(),
+        format_version: manifest.format_version,
+        protection: match (seal, signature) {
+            (None, _) => "digest_only",
+            (Some(_), None) => "sealed",
+            (Some(_), Some(_)) => "signed",
+        },
+        journal_sha256: manifest
+            .journal
+            .as_ref()
+            .map(|journal| journal.sha256.clone()),
+        chain_head: seal.map(|seal| seal.chain_head.clone()),
+        event_count: seal.map(|seal| seal.event_count),
+        seal: seal.map(|seal| seal.digest.clone()),
+        signature: signature.map(|signature| signature.signature.clone()),
+        public_key: signature.map(|signature| signature.public_key.clone()),
+        public_key_fingerprint: signature
+            .and_then(|signature| PublicKey::from_hex(&signature.public_key).ok())
+            .map(|key| key.fingerprint()),
+        note: "Copied from the source manifest. This redacted export is not itself covered by the seal or signature; verify the original trace with `premier verify`.",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +355,7 @@ pub fn portable_evidence_with(
         value_patterns: options.known_secrets_in_terminal,
         counts: RedactionCounts::default(),
     };
+    let source = portable_source(manifest);
     let mut manifest = serde_json::to_value(manifest).unwrap_or(Value::Null);
     structured.redact(&mut manifest);
     let events = events
@@ -355,6 +409,7 @@ pub fn portable_evidence_with(
             },
             redacted,
         },
+        source,
         manifest,
         events,
     }
@@ -667,6 +722,7 @@ mod tests {
             status: "ok".into(),
             duration_ms: 0,
             links: Vec::new(),
+            prev_hash: String::new(),
         }
     }
 

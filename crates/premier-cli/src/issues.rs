@@ -139,6 +139,7 @@ mod tests {
             status: status.into(),
             duration_ms: 0,
             links: Vec::new(),
+            prev_hash: String::new(),
         }
     }
 
